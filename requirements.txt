@@ -1,0 +1,5 @@
+# 运行时依赖（优先级见 pyproject.toml 的 dependencies）
+paramiko>=3.0
+requests>=2.25
+pyodps>=0.11
+tzdata>=2023.3; platform_system == "Windows"

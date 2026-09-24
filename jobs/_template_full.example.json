@@ -1,0 +1,92 @@
+{
+  "//总览": "sftp2ods 全字段模板：每个配置项都在这里出现一次；没写的字段都有默认值，最小配置见 _template_simple.example.json",
+  "//占位符": "${secrets.xxx} / ${bizdate} / ${bizdate_iso} / ${today} / ${today_iso}",
+
+  "job": "demo_sftp",
+  "description": "示例：SFTP 按天文件 → MaxCompute ODS（列展开宽表，pt=文件日期）",
+
+  "secrets": {
+    "sftp_password": "<SFTP 密码>",
+    "feishu_webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/xxx"
+  },
+
+  "maxcompute": {
+    "//说明": "单套凭证写这里；多套用 profiles.<名> + target.profile 切换",
+    "project": "sitindw",
+    "endpoint": "http://service.us-west-1.maxcompute.aliyun.com/api",
+    "access_key_id": "<阿里云 AK>",
+    "access_key_secret": "<阿里云 SK>"
+  },
+  "//profiles": {
+    "prod": { "project": "sitindw", "access_key_id": "<AK>", "access_key_secret": "<SK>" }
+  },
+
+  "sftp": {
+    "host": "sftp.example.com",
+    "port": 22,
+    "username": "user_xxx",
+    "auth": {
+      "//type": "password（配 password）或 key（配 key_file，可选 passphrase）",
+      "type": "password",
+      "password": "${secrets.sftp_password}"
+    },
+    "connect_timeout": 30,
+    "io_timeout": 600,
+    "retry_times": 3,
+    "retry_delay": 10
+  },
+
+  "source": {
+    "root": "/statements",
+    "//layout": "flat：目录下直接是文件（文件名里带日期）；date_dir：目录/{日期}/文件名",
+    "layout": "flat",
+    "file_regex": "settlement_report_(?P<date>\\d{8})\\.csv",
+    "//date_dir_regex": "layout=date_dir 时必填，例：(?P<date>\\d{8})（日期子目录名）",
+    "//download_dir": "文件下载目录；默认 <作业文件目录>/download/<作业名>；相对路径按作业文件所在目录算",
+    "download_dir": ""
+  },
+
+  "parse": {
+    "encoding": "utf-8-sig",
+    "//delimiter": "auto = 自动探测（Tab/逗号/分号）；也可显式写单个字符",
+    "delimiter": "auto",
+    "//on_missing_header": "error：缺任一配置列头就报错；warn：缺的列告警并按空入库（该列可再标 required:true 强制）",
+    "on_missing_header": "error",
+    "//strict_columns": "true：每行列数必须等于表头列数（防列错位）；false：允许行尾少列（按空补齐），多列仍报错",
+    "strict_columns": true,
+    "//empty_as": "空串的落库形态：null（默认，空串存 NULL）/ empty（空串原样存 ''，兼容旧 clink 表口径）",
+    "empty_as": "null",
+    "//skip_if_empty": "这些列（目标列名）值为空的行跳过不入库，例：[\"order_id\"]",
+    "skip_if_empty": [],
+    "//footer": "开启后：首列为空的合计行不写库；sum 里列会校验「合计=数据行之和」，对不上直接报错。例：{\"sum\": [\"settlement_amount\"]}",
+    "//columns说明": "每列：header=源文件列头原文；name=目标表列名；type=string/bigint/double/decimal(p,s)；comment 可选；required 可选（覆盖 on_missing_header）。空值统一存 NULL，解析失败直接报错不写 0",
+    "columns": [
+      { "header": "Tenant name", "name": "tenant_name", "type": "string", "comment": "租户名" },
+      { "header": "Order ID", "name": "order_id", "type": "string", "required": true, "comment": "订单号" },
+      { "header": "Settlement amount", "name": "settlement_amount", "type": "decimal(19,10)", "comment": "结算金额" }
+    ]
+  },
+
+  "target": {
+    "project": "sitindw",
+    "table": "ods_demo_di",
+    "comment": "示例：SFTP 报表列展开（pt=文件日期）",
+    "//allow_empty": "解析出 0 行时是否允许写空分区（默认 true：结算类文件常有零交易的一天）",
+    "allow_empty": true,
+    "//stored_as": "可选：orc / parquet / textfile ...",
+    "//lifecycle_days": "可选：表生命周期天数（正整数）"
+  },
+
+  "missing": {
+    "check": true,
+    "timezone": "Asia/Shanghai",
+    "//grace": "每天几点前源方还没生成 T-1 文件（HH:MM，如 02:30）；此刻之前跑会把预期最新再退一天防误报",
+    "grace": ""
+  },
+
+  "notify": {
+    "//webhook": "缺文件/远端目录为空时发飞书群卡片；留空则不发",
+    "webhook": "${secrets.feishu_webhook}",
+    "enabled": true
+  }
+}

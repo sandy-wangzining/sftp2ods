@@ -1,0 +1,24 @@
+name: 功能需求
+description: 新的源形态 / 新的配置能力
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: scene
+    attributes:
+      label: 场景
+      description: 哪个数据源、文件长什么样（路径规律、列、分隔符、编码、合计行……）
+    validations:
+      required: true
+  - type: textarea
+    id: current
+    attributes:
+      label: 现在的配置为什么表达不了
+      description: 贴出最接近的作业配置片段和实际文件样例
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 期望的配置形态（可选）
+      description: 你觉得配置里加什么字段比较自然

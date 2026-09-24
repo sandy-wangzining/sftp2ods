@@ -1,0 +1,82 @@
+{
+  "//说明": "Waffo 结算明细（SFTP settlements/{结算日期}/settlement_details_*.csv）→ sitindw.ods_waffo_settlement_details_di；等价于旧脚本 waffo_settlement_sync/waffo_settlement_sync.py",
+  "job": "waffo_settlement",
+  "description": "Waffo 结算明细（SFTP）→ ods_waffo_settlement_details_di（pt=结算文件日期）",
+  "secrets": {
+    "sftp_password": "<SFTP 密码>",
+    "feishu_webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/xxx"
+  },
+  "maxcompute": {
+    "project": "sitindw",
+    "endpoint": "http://service.us-west-1.maxcompute.aliyun.com/api",
+    "access_key_id": "<阿里云 AK>",
+    "access_key_secret": "<阿里云 SK>"
+  },
+  "sftp": {
+    "host": "sftp.waffo.com",
+    "port": 22,
+    "username": "waffo_xxx",
+    "auth": {
+      "type": "password",
+      "password": "${secrets.sftp_password}"
+    }
+  },
+  "source": {
+    "root": "settlements",
+    "layout": "date_dir",
+    "date_dir_regex": "(?P<date>\\d{8})",
+    "file_regex": "settlement_details_\\d+_[A-Za-z0-9_-]+_(?P<date>\\d{8})_[A-Za-z]{3}\\.csv"
+  },
+  "parse": {
+    "encoding": "utf-8-sig",
+    "delimiter": "auto",
+    "//on_missing_header": "warn：列头对不上时告警并按空入库；只有 Order Id 强制必须有（required=true）",
+    "on_missing_header": "warn",
+    "skip_if_empty": ["order_id"],
+    "columns": [
+      { "header": "Merchant Id", "name": "merchant_id", "type": "string", "comment": "Merchant Id（商户 ID）" },
+      { "header": "Sub Merchant Id", "name": "sub_merchant_id", "type": "string", "comment": "Sub Merchant Id（二级商户 ID）" },
+      { "header": "Settlement Batch Id", "name": "settlement_batch_id", "type": "string", "comment": "Settlement Batch Id（结算批次号）" },
+      { "header": "Settlement Date", "name": "settlement_date", "type": "string", "comment": "Settlement Date（结算日期原文）" },
+      { "header": "Order Id", "name": "order_id", "type": "string", "required": true, "comment": "Order Id（Waffo 订单号：支付/退款/拒付）" },
+      { "header": "Merchant Order Id", "name": "merchant_order_id", "type": "string", "comment": "Merchant Order Id（商户订单号）" },
+      { "header": "Payment Request Id", "name": "payment_request_id", "type": "string", "comment": "Payment Request Id（支付请求号）" },
+      { "header": "Original Order Id", "name": "original_order_id", "type": "string", "comment": "Original Order Id（原交易订单号）" },
+      { "header": "Order Amount", "name": "order_amount", "type": "decimal(19,10)", "comment": "Order Amount（交易金额，原币）" },
+      { "header": "Order Currency", "name": "order_currency", "type": "string", "comment": "Order Currency（交易币种）" },
+      { "header": "Order Amount (Settlement Currency)", "name": "order_amount_settle", "type": "decimal(19,10)", "comment": "Order Amount (Settlement Currency)（交易金额，结算币）" },
+      { "header": "Transaction Type", "name": "transaction_type", "type": "string", "comment": "Transaction Type（PAYMENT/REFUND/CHARGEBACK）" },
+      { "header": "Event Type", "name": "event_type", "type": "string", "comment": "Event Type（事件类型）" },
+      { "header": "Payment Method Type", "name": "payment_method_type", "type": "string", "comment": "Payment Method Type（支付方式大类）" },
+      { "header": "Payment Method", "name": "payment_method", "type": "string", "comment": "Payment Method（支付方式）" },
+      { "header": "Payment Option", "name": "payment_option", "type": "string", "comment": "Payment Option（支付子方式）" },
+      { "header": "Payment Request Datetime", "name": "payment_request_datetime", "type": "string", "comment": "Payment Request Datetime（支付请求时间原文）" },
+      { "header": "Payment Date", "name": "payment_date", "type": "string", "comment": "Payment Date（支付成功日期原文）" },
+      { "header": "Payment Time", "name": "payment_time", "type": "string", "comment": "Payment Time（支付成功时间原文）" },
+      { "header": "Product Name", "name": "product_name", "type": "string", "comment": "Product Name（产品名）" },
+      { "header": "Forex Currency Pair", "name": "forex_currency_pair", "type": "string", "comment": "Forex Currency Pair（结算汇兑币对）" },
+      { "header": "Forex Rate", "name": "forex_rate", "type": "decimal(19,10)", "comment": "Forex Rate（汇率）" },
+      { "header": "Fee Amount", "name": "fee_amount", "type": "decimal(19,10)", "comment": "Fee Amount（通道费，原币）" },
+      { "header": "Fee Amount (Settlement Currency)", "name": "fee_amount_settle", "type": "decimal(19,10)", "comment": "Fee Amount (Settlement Currency)（通道费，结算币）" },
+      { "header": "Fee Currency", "name": "fee_currency", "type": "string", "comment": "Fee Currency（通道费币种）" },
+      { "header": "Tax Amount", "name": "tax_amount", "type": "decimal(19,10)", "comment": "Tax Amount（税费，原币）" },
+      { "header": "Tax Amount (Settlement Currency)", "name": "tax_amount_settle", "type": "decimal(19,10)", "comment": "Tax Amount (Settlement Currency)（税费，结算币）" },
+      { "header": "Tax Currency", "name": "tax_currency", "type": "string", "comment": "Tax Currency（税费币种）" },
+      { "header": "Settlement Amount", "name": "settlement_amount", "type": "decimal(19,10)", "comment": "Settlement Amount（净结算额，结算币）" },
+      { "header": "Settlement Currency", "name": "settlement_currency", "type": "string", "comment": "Settlement Currency（结算币种）" },
+      { "header": "Comments", "name": "comments", "type": "string", "comment": "Comments（备注）" }
+    ]
+  },
+  "target": {
+    "project": "sitindw",
+    "table": "ods_waffo_settlement_details_di",
+    "comment": "Waffo 结算明细文件（SFTP settlement_details CSV 列展开，pt=结算文件日期）"
+  },
+  "missing": {
+    "check": true,
+    "timezone": "Asia/Shanghai"
+  },
+  "notify": {
+    "webhook": "${secrets.feishu_webhook}"
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "job": "demo_sftp",
+  "description": "示例：SFTP 平铺目录里的按天 CSV → MaxCompute 宽表",
+  "secrets": {
+    "//说明": "密钥可以集中放这里、配置里用 ${secrets.键名} 引用；也可以把密钥直接写在用到的地方",
+    "sftp_password": "<SFTP 密码>",
+    "feishu_webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/xxx"
+  },
+  "maxcompute": {
+    "project": "sitindw",
+    "endpoint": "http://service.us-west-1.maxcompute.aliyun.com/api",
+    "access_key_id": "<阿里云 AK>",
+    "access_key_secret": "<阿里云 SK>"
+  },
+  "sftp": {
+    "host": "sftp.example.com",
+    "port": 22,
+    "username": "user_xxx",
+    "auth": {
+      "type": "password",
+      "password": "${secrets.sftp_password}"
+    }
+  },
+  "source": {
+    "root": "/statements",
+    "layout": "flat",
+    "file_regex": "settlement_report_(?P<date>\\d{8})\\.csv"
+  },
+  "parse": {
+    "encoding": "utf-8-sig",
+    "delimiter": "auto",
+    "columns": [
+      { "header": "Tenant name", "name": "tenant_name", "type": "string", "comment": "租户名" },
+      { "header": "Order ID", "name": "order_id", "type": "string", "required": true },
+      { "header": "Settlement amount", "name": "settlement_amount", "type": "decimal(19,10)", "comment": "结算金额" }
+    ]
+  },
+  "target": {
+    "project": "sitindw",
+    "table": "ods_demo_di",
+    "comment": "示例：SFTP 报表列展开（pt=文件日期）"
+  },
+  "missing": {
+    "check": true,
+    "timezone": "Asia/Shanghai"
+  },
+  "notify": {
+    "webhook": "${secrets.feishu_webhook}"
+  }
+}
