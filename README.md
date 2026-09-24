@@ -1,4 +1,4 @@
-﻿# sftp2ods
+# sftp2ods
 
 [![tests](https://github.com/sandy-wangzining/sftp2ods/actions/workflows/tests.yml/badge.svg)](https://github.com/sandy-wangzining/sftp2ods/actions/workflows/tests.yml)
 [![Python](https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12-blue)](https://github.com/sandy-wangzining/sftp2ods/blob/main/pyproject.toml)
