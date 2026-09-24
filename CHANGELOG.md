@@ -3,6 +3,15 @@
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)；格式参考
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [Unreleased]
+
+### 工程
+
+- 代码统一为 `ruff format` 口径（纯排版改动，无行为变化），CI 增加 `ruff format --check`。
+- README 补充 Windows 安装与激活虚拟环境的命令，安装说明区分源码安装与 Git 安装；
+  Python 版本徽章对齐 CI（3.9 ~ 3.14）。
+- `--force` / `--dry-run` 的帮助文案措辞修正（行为不变）。
+
 ## [1.0.0] - 2026-09-24
 
 首个版本：从 `clink_settlement_sync` / `waffo_settlement_sync` 两个独立脚本抽象成

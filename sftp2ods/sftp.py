@@ -36,7 +36,9 @@ def normalize_date(value: str, source_name: str, kind: str = "文件名") -> str
     """
     text = re.sub(r"[-/.]", "", str(value or "").strip())
     if not DATE_RE.match(text):
-        raise ConfigError(f"{kind} {source_name!r} 里提取到的日期不是 8 位数字：{value!r}（检查 file_regex 的 date 捕获组）")
+        raise ConfigError(
+            f"{kind} {source_name!r} 里提取到的日期不是 8 位数字：{value!r}（检查 file_regex 的 date 捕获组）"
+        )
     try:
         import datetime as _dt
 

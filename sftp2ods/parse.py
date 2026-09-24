@@ -139,7 +139,9 @@ def validate_parse_config(parse_cfg: dict) -> None:
 
     columns_raw = parse_cfg.get("columns")
     if not isinstance(columns_raw, list) or not columns_raw:
-        raise ConfigError("parse.columns 必须是非空数组（每项形如 {\"header\": \"Order ID\", \"name\": \"order_id\", \"type\": \"string\"}）")
+        raise ConfigError(
+            'parse.columns 必须是非空数组（每项形如 {"header": "Order ID", "name": "order_id", "type": "string"}）'
+        )
     seen_headers, seen_names = {}, {}
     columns = []
     for index, item in enumerate(columns_raw):
@@ -181,10 +183,12 @@ def validate_parse_config(parse_cfg: dict) -> None:
         if len(text) != 1:
             raise ConfigError(
                 f"parse.delimiter 必须是单个字符或 auto，实际 {delimiter!r}"
-                f"（TSV 请写 \\t 表示制表符，逗号写 \",\"；自动探测写 auto）"
+                f'（TSV 请写 \\t 表示制表符，逗号写 ","；自动探测写 auto）'
             )
         if text not in KNOWN_DELIMITERS:
-            raise ConfigError(f"parse.delimiter 不支持 {delimiter!r}（可用 auto / {', '.join(repr(d) for d in KNOWN_DELIMITERS)}）")
+            raise ConfigError(
+                f"parse.delimiter 不支持 {delimiter!r}（可用 auto / {', '.join(repr(d) for d in KNOWN_DELIMITERS)}）"
+            )
 
     as_bool(parse_cfg.get("strict_columns"), default=True, field="parse.strict_columns")
 
@@ -198,7 +202,7 @@ def validate_parse_config(parse_cfg: dict) -> None:
         if isinstance(skip_raw, str):
             skip_raw = [skip_raw]
         if not isinstance(skip_raw, list) or not all(str(x or "").strip() for x in skip_raw):
-            raise ConfigError("parse.skip_if_empty 应是列名数组（如 [\"order_id\"]），空项不允许")
+            raise ConfigError('parse.skip_if_empty 应是列名数组（如 ["order_id"]），空项不允许')
         skip_names = [str(x).strip() for x in skip_raw]
         unknown = [name for name in skip_names if name.lower() not in seen_names]
         if unknown:
@@ -207,14 +211,14 @@ def validate_parse_config(parse_cfg: dict) -> None:
     footer = parse_cfg.get("footer")
     if footer is not None:
         if not isinstance(footer, dict):
-            raise ConfigError("parse.footer 必须是对象（如 {\"sum\": [\"settlement_amount\"]}）")
+            raise ConfigError('parse.footer 必须是对象（如 {"sum": ["settlement_amount"]}）')
         unknown_keys = [key for key in footer if key != "sum" and not str(key).startswith(("//", "#"))]
         if unknown_keys:
             raise ConfigError(f"parse.footer 不支持的字段：{'、'.join(map(str, unknown_keys))}（当前仅 sum）")
         sums = footer.get("sum")
         if sums is not None:
             if not isinstance(sums, list) or not all(str(x or "").strip() for x in sums):
-                raise ConfigError("parse.footer.sum 应是列名数组（如 [\"net_settlement_amount\"]）")
+                raise ConfigError('parse.footer.sum 应是列名数组（如 ["net_settlement_amount"]）')
             for name in sums:
                 name = str(name).strip()
                 if name.lower() not in seen_names:
@@ -276,7 +280,7 @@ class ParseSpec:
         if missing_required:
             raise RuntimeError(
                 f"{filename} 缺少必需列头：{'、'.join(missing_required)}；"
-                f"文件格式可能变了（可选列请在 parse.columns 里标 \"required\": false）"
+                f'文件格式可能变了（可选列请在 parse.columns 里标 "required": false）'
             )
         if missing_optional:
             log(f"  [警告] {filename} 未匹配到列头：{'、'.join(missing_optional)}（这些列按空入库）")
@@ -348,7 +352,9 @@ class ParseSpec:
                         header_pos, header_len = self.map_header(row, path.name)
                         continue
                     if len(row) > header_len:
-                        raise RuntimeError(f"{path.name} 第 {row_no} 行列数 {len(row)} 多于表头 {header_len}，字段会被截断，已中止")
+                        raise RuntimeError(
+                            f"{path.name} 第 {row_no} 行列数 {len(row)} 多于表头 {header_len}，字段会被截断，已中止"
+                        )
                     if len(row) < header_len:
                         if self.strict_columns:
                             raise RuntimeError(
@@ -359,7 +365,9 @@ class ParseSpec:
                     if self.footer_enabled and not row[header_pos[0]].strip():
                         # 首列为空 = 合计行，不入库（否则下游求和翻倍）
                         if footer is not None:
-                            raise RuntimeError(f"{path.name} 出现多行合计行（第 {footer_row_no}、{row_no} 行），格式可能变了")
+                            raise RuntimeError(
+                                f"{path.name} 出现多行合计行（第 {footer_row_no}、{row_no} 行），格式可能变了"
+                            )
                         footer, footer_row_no = row, row_no
                         continue
                     values = self.convert_row(row, header_pos, path.name, row_no)
@@ -377,9 +385,7 @@ class ParseSpec:
                 f"请在 parse.encoding 里指定源文件真实编码（如 gbk）"
             )
         except csv.Error as exc:
-            raise RuntimeError(
-                f"{path.name} 第 {row_no} 行 CSV 解析失败：{exc}；多半是引号未闭合/字段内含未转义的引号"
-            )
+            raise RuntimeError(f"{path.name} 第 {row_no} 行 CSV 解析失败：{exc}；多半是引号未闭合/字段内含未转义的引号")
         if not content:
             log(f"  警告：{path.name} 是空文件（没有任何行）")
             return
@@ -397,7 +403,9 @@ class ParseSpec:
                     except ArithmeticError:
                         raise RuntimeError(f"{path.name} 合计行金额解析失败，格式可能变了：{footer!r}")
                     if not value.is_finite():
-                        raise RuntimeError(f"{path.name} 合计行金额不是有限数（NaN/Infinity），格式可能变了：{footer!r}")
+                        raise RuntimeError(
+                            f"{path.name} 合计行金额不是有限数（NaN/Infinity），格式可能变了：{footer!r}"
+                        )
                     got.append(value)
                 if got != sums:
                     raise RuntimeError(

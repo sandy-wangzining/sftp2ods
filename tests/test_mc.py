@@ -22,9 +22,7 @@ from sftp2ods import parse as parse_mod  # noqa: E402
 def columns(*pairs):
     result = []
     for index, (name, type_text) in enumerate(pairs):
-        result.append(
-            parse_mod.Column(f"Header {index}", name, type_text, parse_mod.kind_of(type_text), comment="")
-        )
+        result.append(parse_mod.Column(f"Header {index}", name, type_text, parse_mod.kind_of(type_text), comment=""))
     return result
 
 

@@ -59,9 +59,7 @@ class World:
         self.notify_calls = []
         self.access_logs = []
         self._patches = [
-            mock.patch.object(
-                sftp_mod.SftpSource, "_connect", connect or connect_to(self.fake)
-            ),
+            mock.patch.object(sftp_mod.SftpSource, "_connect", connect or connect_to(self.fake)),
             mock.patch.object(mc_mod, "connect_odps", lambda *a, **k: self.odps),
             mock.patch.object(cli_mod, "notify", self._capture_notify),
         ]
@@ -129,7 +127,9 @@ class TestSyncHappyPath(CliTestCase):
             self.assertEqual(len(world.fake.downloaded), downloads)  # 本地文件在，不重下
 
     def test_multi_file_same_date_merged(self):
-        job = minimal_job(source={"root": "/data", "layout": "flat", "file_regex": "report_(?P<date>\\d{8})(?:_\\d)?\\.csv"})
+        job = minimal_job(
+            source={"root": "/data", "layout": "flat", "file_regex": "report_(?P<date>\\d{8})(?:_\\d)?\\.csv"}
+        )
         world = World(
             self.tmp,
             job=job,

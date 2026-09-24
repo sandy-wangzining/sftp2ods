@@ -90,7 +90,9 @@ def load_mc_credentials(profile: dict, source_label: str = "作业文件", cli_p
     )
 
 
-def connect_odps(config: dict, source_label: str, profile: dict, project: str, endpoint: str = "", cli_profile: str = ""):
+def connect_odps(
+    config: dict, source_label: str, profile: dict, project: str, endpoint: str = "", cli_profile: str = ""
+):
     """建立 MaxCompute 连接；缺 pyodps / 缺凭证时给出明确报错。"""
     if ODPS is None:
         raise SystemExit("缺少 pyodps：pip install pyodps")
@@ -171,7 +173,9 @@ def _table_schema_of(table) -> tuple[list[tuple[str, str]], list[tuple[str, str]
     schema = table.table_schema
     partition_names = [str(col.name) for col in schema.partitions]
     partitions = [(str(col.name), normalize_type(col.type)) for col in schema.partitions]
-    columns = [(str(col.name), normalize_type(col.type)) for col in schema.columns if str(col.name) not in partition_names]
+    columns = [
+        (str(col.name), normalize_type(col.type)) for col in schema.columns if str(col.name) not in partition_names
+    ]
     return columns, partitions
 
 
@@ -196,8 +200,7 @@ def verify_table_schema(table, table_name: str, columns) -> None:
     for (name, existing_type), (_, wanted_type) in zip(existing, wanted):
         if existing_type != wanted_type:
             raise SystemExit(
-                f"{table_name}.{name} 类型是 {existing_type}，配置要求 {wanted_type}；"
-                f"改配置或先 drop 重建该表"
+                f"{table_name}.{name} 类型是 {existing_type}，配置要求 {wanted_type}；改配置或先 drop 重建该表"
             )
     if [name.lower() for name, _ in partitions] != [PARTITION_COLUMN.lower()]:
         raise SystemExit(
@@ -209,8 +212,14 @@ def verify_table_schema(table, table_name: str, columns) -> None:
 
 
 def ensure_target_table(
-    o, project: str, table_name: str, columns, comment: str = "", stored_as: str = "",
-    lifecycle_days: int | None = None, timeout: int = SQL_TIMEOUT_SECONDS,
+    o,
+    project: str,
+    table_name: str,
+    columns,
+    comment: str = "",
+    stored_as: str = "",
+    lifecycle_days: int | None = None,
+    timeout: int = SQL_TIMEOUT_SECONDS,
 ):
     """表不存在则按列配置建表；存在则校验结构，返回 table 对象。"""
     ddl = build_table_ddl(project, table_name, columns, comment, stored_as, lifecycle_days)

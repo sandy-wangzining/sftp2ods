@@ -52,9 +52,7 @@ class TestTypes(OfflineTestCase):
 
 class TestValidateParseConfig(OfflineTestCase):
     def test_ok_minimal(self):
-        parse_mod.validate_parse_config(
-            parse_cfg([{"header": "A", "name": "a", "type": "string"}])
-        )
+        parse_mod.validate_parse_config(parse_cfg([{"header": "A", "name": "a", "type": "string"}]))
 
     def test_columns_required(self):
         for bad in (None, [], {}, "x"):
@@ -74,18 +72,22 @@ class TestValidateParseConfig(OfflineTestCase):
     def test_duplicate_header_and_name(self):
         with self.assertRaises(SystemExit) as ctx:
             parse_mod.validate_parse_config(
-                parse_cfg([
-                    {"header": "Order ID", "name": "a", "type": "string"},
-                    {"header": " order  id ", "name": "b", "type": "string"},
-                ])
+                parse_cfg(
+                    [
+                        {"header": "Order ID", "name": "a", "type": "string"},
+                        {"header": " order  id ", "name": "b", "type": "string"},
+                    ]
+                )
             )
         self.assertIn("重复", str(ctx.exception))
         with self.assertRaises(SystemExit):
             parse_mod.validate_parse_config(
-                parse_cfg([
-                    {"header": "A", "name": "x", "type": "string"},
-                    {"header": "B", "name": "X", "type": "string"},
-                ])
+                parse_cfg(
+                    [
+                        {"header": "A", "name": "x", "type": "string"},
+                        {"header": "B", "name": "X", "type": "string"},
+                    ]
+                )
             )
 
     def test_encoding(self):
@@ -97,13 +99,9 @@ class TestValidateParseConfig(OfflineTestCase):
 
     def test_delimiter(self):
         with self.assertRaises(SystemExit):
-            parse_mod.validate_parse_config(
-                parse_cfg([{"header": "A", "name": "a", "type": "string"}], delimiter="||")
-            )
+            parse_mod.validate_parse_config(parse_cfg([{"header": "A", "name": "a", "type": "string"}], delimiter="||"))
         with self.assertRaises(SystemExit):
-            parse_mod.validate_parse_config(
-                parse_cfg([{"header": "A", "name": "a", "type": "string"}], delimiter="|")
-            )
+            parse_mod.validate_parse_config(parse_cfg([{"header": "A", "name": "a", "type": "string"}], delimiter="|"))
 
     def test_on_missing_header(self):
         with self.assertRaises(SystemExit):
@@ -261,9 +259,7 @@ class TestIterRows(SpecTestCase):
         self.assertEqual(self.rows_of(path, s), [["o1", decimal.Decimal("1"), 2, None]])
 
     def test_extra_columns_always_error(self):
-        path = self.make_file(
-            "a.csv", csv_bytes([c["header"] for c in COLUMNS], [["o1", "1", "2", "3", "extra"]])
-        )
+        path = self.make_file("a.csv", csv_bytes([c["header"] for c in COLUMNS], [["o1", "1", "2", "3", "extra"]]))
         with self.assertRaises(RuntimeError) as ctx:
             self.rows_of(path, spec(COLUMNS, strict_columns=False))
         self.assertIn("多于表头", str(ctx.exception))

@@ -19,6 +19,7 @@ python3 -m venv venv
 ```bash
 python -m unittest discover -s tests -v   # 全部用例：不连 SFTP、不连数仓
 ruff check .                              # 代码检查（配置在 pyproject.toml，当前 0 告警）
+ruff format .                             # 统一格式（CI 会跑 ruff format --check，提交前先格式化）
 ```
 
 - 测试**必须离线可跑**：不许依赖真实 SFTP、真实 MaxCompute、本机特定的文件
@@ -57,7 +58,7 @@ ruff check .                              # 代码检查（配置在 pyproject.t
 ## 提交 PR
 
 1. 从 `main` 切分支，一个 PR 做一件事；
-2. 本地跑通 `python -m unittest discover -s tests` 与 `ruff check .`；
+2. 本地跑通 `python -m unittest discover -s tests`、`ruff check .` 与 `ruff format --check .`；
 3. PR 描述里写清：**为什么改**（复现步骤 / 影响的作业）、**怎么验证的**；
 4. 涉及行为变化或修 bug 的，同步更新 `CHANGELOG.md`；
 5. 涉及配置项/命令行参数的，同步更新 `README.md` 与 `jobs/_template_full.example.json`

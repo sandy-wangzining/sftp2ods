@@ -153,7 +153,9 @@ class TestStateFileShape(OfflineTestCase):
             path.write_text(json.dumps(legacy), encoding="utf-8")
             state = state_mod.load_state(path)
             self.assertTrue(
-                state_mod.record_of(state, ("settlement_report_20260920.csv",), 123, "ods_clink_settlement_details_di", "20260920")
+                state_mod.record_of(
+                    state, ("settlement_report_20260920.csv",), 123, "ods_clink_settlement_details_di", "20260920"
+                )
             )
 
 
