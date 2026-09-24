@@ -86,9 +86,7 @@ class WizardTestCase(OfflineTestCase):
 
     def run_wizard(self, script, out_path=None):
         ask = ScriptedAsk(script)
-        rc = init_wizard.run_init(
-            out_path=str(out_path or self.out_path), ask=ask, echo=lambda *_a, **_k: None
-        )
+        rc = init_wizard.run_init(out_path=str(out_path or self.out_path), ask=ask, echo=lambda *_a, **_k: None)
         return rc, ask
 
     def load_job(self):

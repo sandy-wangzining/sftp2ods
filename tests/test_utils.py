@@ -79,7 +79,10 @@ class TestRedact(OfflineTestCase):
 class TestSecretValues(OfflineTestCase):
     def _job(self):
         return {
-            "secrets": {"sftp_password": "topsecret-pw", "feishu_webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/hookvalue"},
+            "secrets": {
+                "sftp_password": "topsecret-pw",
+                "feishu_webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/hookvalue",
+            },
             "sftp": {"host": "h", "username": "u", "auth": {"type": "password", "password": "topsecret-pw"}},
             "maxcompute": {"project": "p", "access_key_id": "AKID12345", "access_key_secret": "SKVALUE999"},
             "notify": {"webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/hookvalue"},

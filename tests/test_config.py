@@ -89,7 +89,9 @@ class TestPlaceholders(OfflineTestCase):
 
     def test_render_job_renders_config_block(self):
         job = minimal_job()
-        rendered = config.render_job(job, {"secrets": {"ak": "AK1"}, "maxcompute": {"access_key_id": "${secrets.ak}"}}, date(2026, 9, 18))
+        rendered = config.render_job(
+            job, {"secrets": {"ak": "AK1"}, "maxcompute": {"access_key_id": "${secrets.ak}"}}, date(2026, 9, 18)
+        )
         self.assertEqual(rendered["target"]["table"], "ods_demo_di")
         del rendered
 

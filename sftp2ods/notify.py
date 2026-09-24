@@ -15,7 +15,9 @@ except ImportError:  # pragma: no cover - 未安装时告警降级为一条日�
     requests = None
 
 
-def notify(webhook: str, title: str, lines: list[str], footer: str = "", enabled: bool = True, timeout: int = 15) -> bool:
+def notify(
+    webhook: str, title: str, lines: list[str], footer: str = "", enabled: bool = True, timeout: int = 15
+) -> bool:
     """发飞书群卡片（interactive）；成功返回 True。
 
     - webhook 未配置 / enabled=False / requests 缺失 → 静默跳过并返回 False；

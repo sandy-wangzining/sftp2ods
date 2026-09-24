@@ -87,7 +87,9 @@ def env_bizdate(strict: bool = True) -> date | None:
         if not strict:
             from .utils import log
 
-            log(f"  警告：环境变量 bizdate/SKYNET_BIZDATE 的值不是合法日期：{raw!r}；只读体检（--check）不写库，按未设置继续")
+            log(
+                f"  警告：环境变量 bizdate/SKYNET_BIZDATE 的值不是合法日期：{raw!r}；只读体检（--check）不写库，按未设置继续"
+            )
             return None
         raise ConfigError(
             f"环境变量 bizdate/SKYNET_BIZDATE 的值不是合法日期：{raw!r}"

@@ -97,11 +97,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--init-out", default="", help="--init 的输出路径（默认 jobs/<作业名>.json）")
     parser.add_argument("--config", default="", help=f"可选的共享凭证文件（默认 {DEFAULT_CONFIG_PATH}，没有就不读）")
     parser.add_argument("--check", action="store_true", help="只体检：配置 + SFTP 连通 + 目标表结构（不下载）")
-    parser.add_argument("--bizdate", default="", help="只处理该日期的文件（yyyyMMdd 或 yyyy-MM-dd；默认读环境变量 bizdate）")
+    parser.add_argument(
+        "--bizdate", default="", help="只处理该日期的文件（yyyyMMdd 或 yyyy-MM-dd；默认读环境变量 bizdate）"
+    )
     parser.add_argument("--start-date", default="", help="补数/调试：起始日期（含），可与 --end-date 单独使用")
     parser.add_argument("--end-date", default="", help="补数/调试：结束日期（含）")
-    parser.add_argument("--force", action="store_true", help="忽略已上传台账，全部重写（也忽略缺文件？不——缺文件仍然拦）")
-    parser.add_argument("--dry-run", action="store_true", help="只下载并数行数，不写 MaxCompute", )
+    parser.add_argument("--force", action="store_true", help="忽略已上传台账，全部重写（缺文件核对仍然生效）")
+    parser.add_argument("--dry-run", action="store_true", help="只下载并数行数，不写 MaxCompute")
     parser.add_argument("--no-notify", action="store_true", help="缺文件/空目录时只报错，不发飞书")
     parser.add_argument("--endpoint", default="", help="MaxCompute endpoint（覆盖作业里的配置）")
     parser.add_argument("--mc-profile", default="", help="作业 maxcompute/profiles 里的 profile 名（默认 default）")
@@ -241,7 +243,9 @@ def run_check(job: dict, config: dict, args, job_path: Path, config_path: Path |
     try:
         files_by_date = source.list_files()
         sample = _pick_latest_sample(files_by_date)
-        log(f"  ✅ 连接成功：远端共 {len(files_by_date)} 个业务日期，{sum(len(v) for v in files_by_date.values()):,} 个文件")
+        log(
+            f"  ✅ 连接成功：远端共 {len(files_by_date)} 个业务日期，{sum(len(v) for v in files_by_date.values()):,} 个文件"
+        )
         if sample:
             date, item = sample
             log(f"  最新样本：{date}/{item.name}（{item.size:,} 字节）")
@@ -372,7 +376,9 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
         )
         return 1
     if check_missing and range_start and range_start <= range_end:
-        log(f"远端共 {len(all_dates)} 个日期（核对区间 {range_start} ~ {range_end} 完整），本次处理 {len(proc_dates)} 个")
+        log(
+            f"远端共 {len(all_dates)} 个日期（核对区间 {range_start} ~ {range_end} 完整），本次处理 {len(proc_dates)} 个"
+        )
     else:
         log(f"远端共 {len(all_dates)} 个日期，本次处理 {len(proc_dates)} 个")
     if not proc_dates:

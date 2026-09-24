@@ -287,7 +287,7 @@ class FakeOdps:
             marker = "pt = '"
             start = sql.find(marker)
             end = sql.find("'", start + len(marker)) if start >= 0 else -1
-            pt = sql[start + len(marker):end] if start >= 0 and end > 0 else ""
+            pt = sql[start + len(marker) : end] if start >= 0 and end > 0 else ""
             rows = self.table.written.get(f"pt={pt}", [])
             return FakeInstance(rows=[{"cnt": len(rows)}])
         return FakeInstance()

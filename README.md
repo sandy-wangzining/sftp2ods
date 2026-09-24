@@ -1,7 +1,7 @@
 # sftp2ods
 
 [![tests](https://github.com/sandy-wangzining/sftp2ods/actions/workflows/tests.yml/badge.svg)](https://github.com/sandy-wangzining/sftp2ods/actions/workflows/tests.yml)
-[![Python](https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12-blue)](https://github.com/sandy-wangzining/sftp2ods/blob/main/pyproject.toml)
+[![Python](https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)](https://github.com/sandy-wangzining/sftp2ods/blob/main/pyproject.toml)
 [![License](https://img.shields.io/badge/license-MIT-green)](https://github.com/sandy-wangzining/sftp2ods/blob/main/LICENSE)
 
 **通用 SFTP 按天文件（CSV/TSV）→ MaxCompute ODS 同步工具**：把渠道/供应商 SFTP 上
@@ -29,20 +29,23 @@
 ## 安装
 
 ```bash
-# 方式一：pip（建议放虚拟环境）
-python3 -m venv venv && ./venv/bin/pip install sftp2ods    # 发布到 PyPI 后
-./venv/bin/pip install .                                    # 或在源码目录本地安装
+# 方式一：pip（建议放虚拟环境；在源码目录执行）
+python3 -m venv venv && ./venv/bin/pip install .    # macOS / Linux
+py -3 -m venv venv; .\venv\Scripts\pip install .    # Windows（PowerShell）
 sftp2ods --version
 
-# 方式二：pipx（全局命令行工具，隔离环境）
+# 方式二：pipx（全局命令行工具，隔离环境；Windows / macOS / Linux 通用）
 pipx install .
 
 # 方式三：直接从 GitHub 安装
 pipx install "git+https://github.com/sandy-wangzining/sftp2ods.git"
 
-# 方式四：源码直接跑（不安装）
+# 方式四：源码直接跑（不安装；Windows 把 python 换成 py -3 即可）
 python -m sftp2ods --job jobs/xxx.json --check
 ```
+
+> Windows 下激活虚拟环境：`.\venv\Scripts\Activate.ps1`（PowerShell）或 `venv\Scripts\activate.bat`（cmd），
+> 激活后 `sftp2ods` 命令与上面一致。发布到 PyPI 后也可以直接 `pip install sftp2ods`。
 
 Windows / macOS / Linux 通用；Windows 会自动带上 `tzdata` 依赖（时区数据）。
 
@@ -259,6 +262,7 @@ date_dir 布局还会回退按旧的文件名键查找），已上传的日期�
 ```bash
 python -m unittest discover -s tests -v    # 239 个离线用例：不连 SFTP、不连数仓
 pip install -e ".[dev]" && ruff check .    # 代码检查（配置在 pyproject.toml，当前 0 告警）
+ruff format .                              # 统一格式（CI 另跑 ruff format --check）
 ```
 
 CI 在 ubuntu / windows / macos × Python 3.9 ~ 3.14 十八种组合上跑同一套用例

@@ -262,7 +262,9 @@ def collect_warnings(job: dict) -> list[str]:
     return warnings
 
 
-def _require_number(value, where: str, *, minimum=None, exclusive_min=None, maximum=None, integer: bool = False) -> None:
+def _require_number(
+    value, where: str, *, minimum=None, exclusive_min=None, maximum=None, integer: bool = False
+) -> None:
     """可选数值配置项的范围校验：写错在配置阶段就报，别拖到连接时才抛裸异常。"""
     if value is None or value == "":
         return
@@ -318,14 +320,16 @@ def validate_job(job: dict) -> None:
     _require_number(sftp.get("retry_delay"), "sftp.retry_delay", minimum=0)
     auth = sftp.get("auth")
     if auth is None or not isinstance(auth, dict):
-        raise SystemExit('作业配置缺少 sftp.auth（形如 {"type": "password", "password": "xxx"} 或 {"type": "key", "key_file": "~/.ssh/xxx"}）')
+        raise SystemExit(
+            '作业配置缺少 sftp.auth（形如 {"type": "password", "password": "xxx"} 或 {"type": "key", "key_file": "~/.ssh/xxx"}）'
+        )
     auth_type = str(auth.get("type") or "password").lower()
     if auth_type not in ALLOWED_SFTP_AUTH_TYPES:
         raise ConfigError(f"sftp.auth.type 不支持：{auth_type}（可用 {'/'.join(ALLOWED_SFTP_AUTH_TYPES)}）")
     if auth_type == "password" and not auth.get("password"):
-        raise ConfigError('sftp.auth.type=password 必须给 sftp.auth.password')
+        raise ConfigError("sftp.auth.type=password 必须给 sftp.auth.password")
     if auth_type == "key" and not auth.get("key_file"):
-        raise ConfigError('sftp.auth.type=key 必须给 sftp.auth.key_file（私钥路径，如 ~/.ssh/clink_sftp）')
+        raise ConfigError("sftp.auth.type=key 必须给 sftp.auth.key_file（私钥路径，如 ~/.ssh/clink_sftp）")
 
     # ---- source ----
     source = job.get("source") or {}
@@ -499,7 +503,8 @@ def build_job_summary(job: dict) -> list[str]:
         if missing.get("grace"):
             window += f"（{missing['grace']} 前再退一天）"
     return [
-        f"  作业      : {job.get('job') or '(未命名)'}" + (f" —— {job['description']}" if job.get("description") else ""),
+        f"  作业      : {job.get('job') or '(未命名)'}"
+        + (f" —— {job['description']}" if job.get("description") else ""),
         f"  SFTP      : {sftp.get('username')}@{sftp.get('host')}:{sftp.get('port') or 22}"
         f"（认证 {((sftp.get('auth') or {}).get('type') or 'password')}）",
         f"  远端      : {source.get('root')}（{layout_cn}；{source.get('file_regex')}）",
