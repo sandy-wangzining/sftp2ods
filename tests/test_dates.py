@@ -140,6 +140,13 @@ class TestPlanDates(OfflineTestCase):
         self.assertEqual(missing, [])
         self.assertEqual(proc, ["20260902", "20260903"])
 
+    def test_remote_min_after_expected(self):
+        """远端最早日期晚于预期最新（新接入的源）：核对区间为空，不算缺文件。"""
+        missing, proc, r_start, r_end = dates.plan_dates(["20260924"], expected="20260923")
+        self.assertEqual(missing, [])
+        self.assertEqual(proc, ["20260924"])
+        self.assertEqual((r_start, r_end), ("20260924", "20260923"))
+
 
 if __name__ == "__main__":
     unittest.main()

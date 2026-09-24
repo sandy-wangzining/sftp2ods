@@ -311,6 +311,12 @@ class TestCheck(CliTestCase):
                 self.assertEqual(world.check(), 0)
             self.assertTrue(any("表不存在" in line for line in world.access_logs))
 
+    def test_check_remote_newer_than_expected(self):
+        data = report([["o1", "1.00"]])
+        with World(self.tmp, files={"/data/report_20990101.csv": data}) as world:
+            self.assertEqual(world.check(), 0)
+            self.assertTrue(any("晚于预期最新" in line for line in world.access_logs))
+
     def test_check_schema_mismatch_fails(self):
         with World(self.tmp) as world:
             world.table.table_schema.columns[0].type = "bigint"

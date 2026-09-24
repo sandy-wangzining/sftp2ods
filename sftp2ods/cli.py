@@ -254,8 +254,11 @@ def run_check(job: dict, config: dict, args, job_path: Path, config_path: Path |
             if missing:
                 shown = "、".join(missing[:MISSING_SHOW_LIMIT]) + (" 等" if len(missing) > MISSING_SHOW_LIMIT else "")
                 log(f"  ⚠️ 缺文件核对未通过：{shown}（共 {len(missing)} 个；区间 {r_start} ~ {r_end}）")
-            else:
+            elif r_start and r_start <= r_end:
                 log(f"  ✅ 缺文件核对通过（{r_start} ~ {r_end} 完整）")
+            else:
+                # 远端最早日期比预期最新还晚（首次接入/源方刚开账）：核对区间为空，不算"缺文件"
+                log(f"  ✅ 缺文件核对：远端最早 {min(files_by_date)} 晚于预期最新 {expected}，无需核对")
     except SystemExit:
         raise
     except Exception as exc:  # noqa: BLE001
