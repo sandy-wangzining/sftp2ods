@@ -35,22 +35,30 @@ def load_state(path: Path) -> dict:
 def save_state(path: Path, state: dict) -> None:
     """写台账（先写临时文件再原子替换，半截文件不会覆盖好台账）。"""
     path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, path)
 
 
-def record_of(state: dict, keys, size: int, table: str, pt: str) -> bool:
+def record_of(state: dict, keys, size: int, table: str, pt: str, project: str | None = None) -> bool:
     """台账里是否存在"与本次一致"的完成记录（keys 任一命中即可，兼容旧台账的键）。
 
     keys 里放当前键与历史键（如 date_dir 布局的 "20260920/xxx.csv" 与旧的 "xxx.csv"）。
+    记录里带了 project 时也要一致：换过目标项目（如 dev → prod，表名相同）时不能拿
+    另一个项目里的上传记录跳过——否则会把整段日期静默跳成"没数据"。
+    旧脚本的台账没有 project 字段，按兼容处理（不因缺字段拒绝）。
     """
     for key in keys:
         record = state.get(key)
         if not isinstance(record, dict):
             continue
-        if record.get("table") == table and record.get("pt") == pt and record.get("size") == size:
-            return True
+        if record.get("table") != table or record.get("pt") != pt or record.get("size") != size:
+            continue
+        recorded_project = record.get("project")
+        if recorded_project and project and recorded_project != project:
+            continue
+        return True
     return False
 
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 import codecs
 import csv
 import decimal
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -218,6 +219,15 @@ def validate_parse_config(parse_cfg: dict) -> None:
                 name = str(name).strip()
                 if name.lower() not in seen_names:
                     raise ConfigError(f"parse.footer.sum 里的列不在 parse.columns 中：{name}")
+                # 合计核对把列值当数字相加：非 decimal 列（string 会 TypeError，double 会与 Decimal 混算报错）
+                # 在配置阶段就拦住，别等解析到合计行才崩
+                item = columns_raw[seen_names[name.lower()]]
+                type_text = validate_type(item.get("type"), f"parse.columns[{item.get('name')!r}].type")
+                if kind_of(type_text) != "dec":
+                    raise ConfigError(
+                        f"parse.footer.sum 的列 {name} 类型是 {item.get('type')!r}，"
+                        f"合计核对只支持 decimal 列（string/double 等请从 sum 里去掉）"
+                    )
     # 校验用不到构建结果，避免重复构造
     del columns
 
@@ -291,11 +301,17 @@ class ParseSpec:
                 continue
             try:
                 if col.kind == "dec":
-                    values.append(decimal.Decimal(raw.replace(",", "")))
+                    value = decimal.Decimal(raw.replace(",", ""))
+                    if not value.is_finite():  # NaN / Infinity 不是合法金额（写库后聚合全废）
+                        raise ArithmeticError(f"非有限数 {value}")
+                    values.append(value)
                 elif col.kind == "int":
                     values.append(int(raw.replace(",", "")))
                 else:  # float
-                    values.append(float(raw.replace(",", "")))
+                    value = float(raw.replace(",", ""))
+                    if not math.isfinite(value):  # inf / nan 同理
+                        raise ValueError(f"非有限数 {value}")
+                    values.append(value)
             except (ValueError, ArithmeticError):
                 raise RuntimeError(f"{filename} 第 {row_no} 行 {col.header} 不是合法的{_kind_cn(col.kind)}：{raw!r}")
         return values
@@ -377,9 +393,12 @@ class ParseSpec:
                 for index in self.footer_sum_indexes:
                     raw = footer[index].strip() if index < len(footer) else ""
                     try:
-                        got.append(decimal.Decimal(raw.replace(",", "")) if raw else decimal.Decimal(0))
+                        value = decimal.Decimal(raw.replace(",", "")) if raw else decimal.Decimal(0)
                     except ArithmeticError:
                         raise RuntimeError(f"{path.name} 合计行金额解析失败，格式可能变了：{footer!r}")
+                    if not value.is_finite():
+                        raise RuntimeError(f"{path.name} 合计行金额不是有限数（NaN/Infinity），格式可能变了：{footer!r}")
+                    got.append(value)
                 if got != sums:
                     raise RuntimeError(
                         f"{path.name} 合计行与数据行合计不一致（合计行={got}，数据行之和={sums}），已中止"

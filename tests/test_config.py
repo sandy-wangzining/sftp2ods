@@ -302,6 +302,12 @@ class TestResolveTargetAndDirs(OfflineTestCase):
         job["source"]["download_dir"] = "/abs/files"
         self.assertEqual(config.resolve_download_dir(job, path), Path("/abs/files"))
 
+    def test_download_dir_tilde_expanded(self):
+        job = minimal_job()
+        job["source"]["download_dir"] = "~/sftp2ods-data"
+        path = Path("/tmp/jobs/demo.json")
+        self.assertEqual(config.resolve_download_dir(job, path), Path.home() / "sftp2ods-data")
+
     def test_summary_lines(self):
         job = validated(minimal_job())
         text = "\n".join(config.build_job_summary(job))

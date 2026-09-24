@@ -284,7 +284,7 @@ def _require_number(value, where: str, *, minimum=None, exclusive_min=None, maxi
         raise ConfigError(f"{where} 不能大于 {maximum:g}，实际 {value!r}")
 
 
-def _compile_regex(value, where: str, need_date: bool) -> None:
+def _compile_regex(value, where: str, need_date: bool, hint: str = "从文件名提取业务日期") -> None:
     """校验正则：能编译；需要日期捕获组时必须带命名组 date。"""
     text = str(value or "")
     if not text:
@@ -294,7 +294,7 @@ def _compile_regex(value, where: str, need_date: bool) -> None:
     except re.error as exc:
         raise ConfigError(f"{where} 不是合法正则：{exc}")
     if need_date and "date" not in pattern.groupindex:
-        raise ConfigError(f"{where} 必须带日期命名捕获组 (?P<date>\\d{{8}})：{text!r}（平铺布局从文件名提取日期）")
+        raise ConfigError(f"{where} 必须带日期命名捕获组 (?P<date>...)：{text!r}（{hint}）")
 
 
 def validate_job(job: dict) -> None:
@@ -338,7 +338,12 @@ def validate_job(job: dict) -> None:
         raise ConfigError(f"source.layout 不支持：{layout}（可用 {'/'.join(ALLOWED_LAYOUTS)}）")
     _compile_regex(source.get("file_regex"), "source.file_regex", need_date=(layout == "flat"))
     if layout == "date_dir":
-        _compile_regex(source.get("date_dir_regex"), "source.date_dir_regex", need_date=True)
+        _compile_regex(
+            source.get("date_dir_regex"),
+            "source.date_dir_regex",
+            need_date=True,
+            hint="日期子目录名里要能提取业务日期，如 (?P<date>\\d{8})",
+        )
     if source.get("download_dir") is not None and not isinstance(source.get("download_dir"), str):
         raise ConfigError(f"source.download_dir 必须是字符串路径，实际 {type(source.get('download_dir')).__name__}")
 
@@ -468,7 +473,7 @@ def resolve_download_dir(job: dict, job_path: Path) -> Path:
     source = job.get("source") or {}
     raw = str(source.get("download_dir") or "").strip()
     if raw:
-        path = Path(raw)
+        path = Path(raw).expanduser()
         return path if path.is_absolute() else Path(job_path).parent / path
     return Path(job_path).parent / "download" / safe_job_name(job, Path(job_path))
 

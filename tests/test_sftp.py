@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import stat
 import sys
 import tempfile
 import unittest
@@ -91,6 +92,20 @@ class TestScanFlat(OfflineTestCase):
         with mock.patch.object(sftp_mod.SftpSource, "_connect", connect_to(fake)):
             files = source.list_files()
         self.assertEqual([item.name for item in files["20260920"]], ["report_20260920.csv", "report_20260920_2.csv"])
+
+    def test_symlink_file_accepted(self):
+        """有的源方用软链指向当天文件；只要不是目录、名字匹配就应视为候选。"""
+        from _helpers import FakeEntry
+
+        fake = FakeSftp()
+        link = FakeEntry("report_20260920.csv", 4)
+        link.st_mode = stat.S_IFLNK | 0o777
+        fake.tree["/data"] = [link]
+        fake.contents["/data/report_20260920.csv"] = b"a\n1\n"
+        source = flat_source()
+        with mock.patch.object(sftp_mod.SftpSource, "_connect", connect_to(fake)):
+            files = source.list_files()
+        self.assertEqual(sorted(files), ["20260920"])
 
     def test_bad_date_in_name_errors(self):
         fake = FakeSftp()
@@ -210,11 +225,15 @@ class TestConnect(OfflineTestCase):
         class SSHException(Exception):
             pass
 
+        class PasswordRequiredException(SSHException):
+            pass
+
         class AutoAddPolicy:
             pass
 
         module.AuthenticationException = AuthenticationException
         module.SSHException = SSHException
+        module.PasswordRequiredException = PasswordRequiredException
         module.AutoAddPolicy = AutoAddPolicy
         last = {}
 
@@ -229,6 +248,8 @@ class TestConnect(OfflineTestCase):
             def connect(self, **kwargs):
                 if last.get("fail_auth"):
                     raise AuthenticationException("bad password")
+                if last.get("fail_passphrase"):
+                    raise PasswordRequiredException("private key file is encrypted")
                 self.kwargs = kwargs
 
             def open_sftp(self):
@@ -255,14 +276,16 @@ class TestConnect(OfflineTestCase):
 
     def test_key_auth_kwargs(self):
         module, last = self._fake_paramiko()
-        source = flat_source(
-            sftp={"auth": {"type": "key", "key_file": "~/.ssh/some_key", "passphrase": "pp"}},
-        )
-        with mock.patch.object(sftp_mod, "paramiko", module):
-            source._connect()
+        with tempfile.TemporaryDirectory() as tmp:
+            key_file = Path(tmp) / "some_key"
+            key_file.write_text("dummy", encoding="utf-8")
+            source = flat_source(
+                sftp={"auth": {"type": "key", "key_file": str(key_file), "passphrase": "pp"}},
+            )
+            with mock.patch.object(sftp_mod, "paramiko", module):
+                source._connect()
         kwargs = last["client"].kwargs
-        self.assertIn("some_key", kwargs["key_filename"])
-        self.assertNotIn("~", kwargs["key_filename"])
+        self.assertEqual(kwargs["key_filename"], str(key_file))
         self.assertEqual(kwargs["passphrase"], "pp")
 
     def test_auth_failure_is_fatal(self):
@@ -273,6 +296,25 @@ class TestConnect(OfflineTestCase):
             with self.assertRaises(FatalSourceError) as ctx:
                 source._connect()
         self.assertIn("认证失败", str(ctx.exception))
+
+    def test_password_required_is_fatal(self):
+        module, last = self._fake_paramiko()
+        last["fail_passphrase"] = True
+        with tempfile.TemporaryDirectory() as tmp:
+            key_file = Path(tmp) / "some_key"
+            key_file.write_text("dummy", encoding="utf-8")
+            source = flat_source(sftp={"auth": {"type": "key", "key_file": str(key_file)}})
+            with mock.patch.object(sftp_mod, "paramiko", module):
+                with self.assertRaises(FatalSourceError) as ctx:
+                    source._connect()
+        self.assertIn("口令", str(ctx.exception))
+
+    def test_missing_key_file_is_fatal_without_retry(self):
+        source = flat_source(sftp={"auth": {"type": "key", "key_file": "~/definitely/not/here_xyz"}})
+        with mock.patch.object(sftp_mod, "paramiko", mock.MagicMock()):
+            with self.assertRaises(FatalSourceError) as ctx:
+                source._connect()
+        self.assertIn("私钥文件不存在", str(ctx.exception))
 
 
 if __name__ == "__main__":

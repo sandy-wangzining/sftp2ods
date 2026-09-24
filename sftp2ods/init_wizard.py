@@ -161,9 +161,7 @@ def _read_remote_sample(ask, echo, sftp_cfg: dict, source_cfg: dict) -> list[str
         try:
             source = SftpSource(sftp_cfg, source_cfg)
             files_by_date = source.list_files()
-        except SystemExit:
-            raise
-        except Exception as exc:  # noqa: BLE001
+        except (ConfigError, Exception) as exc:  # noqa: BLE001 - ConfigError 是 SystemExit 子类，需单独接
             echo(f"   连接/列目录失败：{exc}")
             return None
         if not files_by_date:
@@ -372,6 +370,11 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
     except ConfigError as exc:
         echo("")
         echo(f"配置不合法：{exc}")
+        return 1
+    except OSError as exc:
+        # 目标路径不可写（权限/磁盘满/父目录是文件）时给一句人话，而不是裸 traceback
+        echo("")
+        echo(f"写文件失败：{exc}")
         return 1
     except (KeyboardInterrupt, EOFError, ValueError):
         # stdin 被关闭（`sftp2ods --init <&-`、CI 里没接管道）时 input() 抛的是 ValueError / RuntimeError

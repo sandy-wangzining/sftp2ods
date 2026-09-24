@@ -95,8 +95,8 @@ class World:
     def sync(self, bizdate="", **kwargs):
         return cli_mod.run_sync(self.job, {}, make_args(**kwargs), self.job_path, bizdate=bizdate)
 
-    def check(self, **kwargs):
-        return cli_mod.run_check(self.job, {}, make_args(**kwargs), self.job_path)
+    def check(self, bizdate="", **kwargs):
+        return cli_mod.run_check(self.job, {}, make_args(**kwargs), self.job_path, bizdate=bizdate)
 
 
 class CliTestCase(OfflineTestCase):
@@ -171,6 +171,12 @@ class TestSyncRanges(CliTestCase):
             self.assertEqual(rc, 1)
             self.assertTrue(any("互斥" in str(line) for line in world.access_logs))
 
+    def test_start_after_end_is_rejected(self):
+        with World(self.tmp) as world:
+            rc = cli_mod.main(["--job", str(world.job_path), "--start-date", "2026-09-21", "--end-date", "2026-09-20"])
+            self.assertEqual(rc, 1)
+            self.assertTrue(any("不能早于" in str(line) for line in world.access_logs))
+
 
 class TestSyncGuards(CliTestCase):
     def test_missing_file_alerts_and_aborts(self):
@@ -231,6 +237,33 @@ class TestSyncGuards(CliTestCase):
             with mock.patch.object(mc_mod, "count_partition", return_value=0):
                 self.assertEqual(world.sync(bizdate="20260920"), 1)
             self.assertTrue(any("写后校验不一致" in str(line) for line in world.access_logs))
+
+    def test_project_change_in_ledger_forces_rewrite(self):
+        """台账里的 project 与本次不一致（如 dev→prod）→ 不能跳过，必须重写。"""
+        data = report([["o1", "1.00"]])
+        with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
+            self.assertEqual(world.sync(bizdate="20260920"), 0)
+            ledger_path = world.download_dir / state_mod.STATE_FILE_NAME
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+            ledger["report_20260920.csv"]["project"] = "other_project"
+            ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+            deletes = len(world.table.deleted)
+            self.assertEqual(world.sync(bizdate="20260920"), 0)
+            self.assertEqual(len(world.table.deleted), deletes + 1)
+
+    def test_ledger_save_failure_fails_run(self):
+        data = report([["o1", "1.00"]])
+        with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
+            with mock.patch.object(state_mod, "save_state", side_effect=OSError("disk full")):
+                self.assertEqual(world.sync(bizdate="20260920"), 1)
+            self.assertTrue(any("台账写入失败" in str(line) for line in world.access_logs))
+
+    def test_no_dates_matched_warns(self):
+        job = minimal_job()
+        job["missing"] = {"check": False}
+        with World(self.tmp, job=job, files={"/data/report_20260920.csv": report([["o1", "1.00"]])}) as world:
+            self.assertEqual(world.sync(bizdate="20260921"), 0)
+            self.assertTrue(any("没有要处理的日期" in str(line) for line in world.access_logs))
 
     def test_download_error_reports_redacted(self):
         data = report([["o1", "1.00"]])
@@ -317,6 +350,14 @@ class TestCheck(CliTestCase):
             self.assertEqual(world.check(), 0)
             self.assertTrue(any("晚于预期最新" in line for line in world.access_logs))
 
+    def test_check_with_bizdate_only_checks_that_day(self):
+        data = report([["o1", "1.00"]])
+        with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
+            self.assertEqual(world.check(bizdate="20260920"), 0)
+            self.assertTrue(any("的远端文件存在" in line for line in world.access_logs))
+            self.assertEqual(world.check(bizdate="20260919"), 0)
+            self.assertTrue(any("缺文件核对未通过" in line for line in world.access_logs))
+
     def test_check_schema_mismatch_fails(self):
         with World(self.tmp) as world:
             world.table.table_schema.columns[0].type = "bigint"
@@ -326,6 +367,9 @@ class TestCheck(CliTestCase):
 class TestMainEntry(CliTestCase):
     def test_no_job_returns_2(self):
         self.assertEqual(cli_mod.main([]), 2)
+
+    def test_negative_sql_timeout_returns_2(self):
+        self.assertEqual(cli_mod.main(["--job", "whatever.json", "--sql-timeout", "-1"]), 2)
 
     def test_happy_path(self):
         data = report([["o1", "1.00"]])

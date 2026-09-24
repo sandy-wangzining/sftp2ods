@@ -128,9 +128,20 @@ class TestValidateParseConfig(OfflineTestCase):
                 parse_cfg([{"header": "A", "name": "a", "type": "string"}], footer={"bogus": []})
             )
 
+    def test_footer_sum_must_be_decimal(self):
+        for bad_type in ("string", "bigint", "double"):
+            with self.assertRaises(SystemExit) as ctx:
+                parse_mod.validate_parse_config(
+                    parse_cfg([{"header": "A", "name": "a", "type": bad_type}], footer={"sum": ["a"]})
+                )
+            self.assertIn("decimal", str(ctx.exception))
+        parse_mod.validate_parse_config(
+            parse_cfg([{"header": "A", "name": "a", "type": "decimal(19,10)"}], footer={"sum": ["a"]})
+        )
+
     def test_footer_comment_keys_allowed(self):
         parse_mod.validate_parse_config(
-            parse_cfg([{"header": "A", "name": "a", "type": "string"}], footer={"//说明": "x", "sum": ["a"]})
+            parse_cfg([{"header": "A", "name": "a", "type": "decimal(19,10)"}], footer={"//说明": "x", "sum": ["a"]})
         )
 
 
@@ -223,6 +234,20 @@ class TestIterRows(SpecTestCase):
         path = self.make_file("a.csv", csv_bytes([c["header"] for c in COLUMNS], [["o1", "1", "1.5", "1"]]))
         with self.assertRaises(RuntimeError):
             self.rows_of(path, spec(COLUMNS))
+
+    def test_nan_decimal_rejected(self):
+        for bad in ("NaN", "Infinity", "-Infinity", "sNaN"):
+            path = self.make_file("a.csv", csv_bytes([c["header"] for c in COLUMNS], [["o1", bad, "1", "1"]]))
+            with self.assertRaises(RuntimeError) as ctx:
+                self.rows_of(path, spec(COLUMNS))
+            self.assertIn("Settlement amount", str(ctx.exception))
+
+    def test_non_finite_float_rejected(self):
+        for bad in ("inf", "-inf", "nan", "Infinity"):
+            path = self.make_file("a.csv", csv_bytes([c["header"] for c in COLUMNS], [["o1", "1", "1", bad]]))
+            with self.assertRaises(RuntimeError) as ctx:
+                self.rows_of(path, spec(COLUMNS))
+            self.assertIn("Rate", str(ctx.exception))
 
     def test_strict_columns(self):
         path = self.make_file("a.csv", csv_bytes([c["header"] for c in COLUMNS], [["o1", "1", "2"]]))

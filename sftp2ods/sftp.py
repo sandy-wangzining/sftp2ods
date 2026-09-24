@@ -79,7 +79,7 @@ class SftpSource:
         self.retry_delay = float(self.cfg.get("retry_delay") or 10)
         source = source_cfg or self.cfg.get("_source") or {}
         self.layout = str(source.get("layout") or "flat")
-        self.root = str(source.get("root") or "").rstrip("/")
+        self.root = str(source.get("root") or "").strip().rstrip("/")
         self.download_dir = Path(source.get("download_dir") or ".")
         try:
             self.file_re = re.compile(str(source.get("file_regex") or ""))
@@ -114,7 +114,12 @@ class SftpSource:
             look_for_keys=False,
         )
         if self.auth_type == "key":
-            kwargs["key_filename"] = str(Path(self.key_file).expanduser())
+            key_path = Path(self.key_file).expanduser()
+            if not key_path.is_file():
+                # 密钥文件缺失是确定性错误：重试没有意义，直接失败（别让调度白等几轮退避）
+                ssh.close()
+                raise FatalSourceError(f"私钥文件不存在：{key_path}（sftp.auth.key_file）")
+            kwargs["key_filename"] = str(key_path)
             if self.passphrase:
                 kwargs["passphrase"] = self.passphrase
         else:
@@ -127,6 +132,9 @@ class SftpSource:
             raise FatalSourceError(
                 f"SFTP 认证失败：{self.username}@{self.host}:{self.port} 的账号/密码/私钥不对（{exc}）"
             )
+        except paramiko.PasswordRequiredException as exc:
+            ssh.close()
+            raise FatalSourceError(f"私钥需要口令，但 sftp.auth.passphrase 没配或不对（{exc}）")
         except paramiko.SSHException as exc:
             ssh.close()
             raise RuntimeError(f"SFTP 连接失败：{type(exc).__name__}: {exc}")
@@ -198,7 +206,7 @@ class SftpSource:
                     log(f"  警告：列子目录失败（{entry.filename}）：{exc}")
                     continue
                 for item in children:
-                    if not stat.S_ISREG(item.st_mode or 0) or not self.file_re.fullmatch(item.filename):
+                    if stat.S_ISDIR(item.st_mode or 0) or not self.file_re.fullmatch(item.filename):
                         continue
                     path = f"{root}/{entry.filename}/{item.filename}" if root else f"{entry.filename}/{item.filename}"
                     result.setdefault(date, []).append(
@@ -206,7 +214,8 @@ class SftpSource:
                     )
         else:
             for entry in entries:
-                if not stat.S_ISREG(entry.st_mode or 0):
+                # 目录跳过；非目录（普通文件/软链）都算候选——有的源方用软链指向当天文件
+                if stat.S_ISDIR(entry.st_mode or 0):
                     continue
                 match = self.file_re.fullmatch(entry.filename)
                 if not match:

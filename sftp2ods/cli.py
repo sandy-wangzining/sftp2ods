@@ -29,6 +29,7 @@ from .config import (
     check_block_types,
     collect_warnings,
     get_mc_profile_meta,
+    job_tz_of,
     load_json_file,
     normalize_job,
     render_job,
@@ -216,11 +217,11 @@ def _pick_local(download_dir: Path, item) -> Path | None:
 
 def _pick_latest_sample(files_by_date: dict):
     """取一个"最新日期下的第一个文件"当样本（向导/体检展示用）。"""
-    if not files_by_date:
-        return None
-    date = max(files_by_date)
-    items = files_by_date[date]
-    return date, items[0] if items else None
+    for date in sorted(files_by_date, reverse=True):
+        items = files_by_date[date]
+        if items:
+            return date, items[0]
+    return None
 
 
 # =============================================================================
@@ -228,7 +229,7 @@ def _pick_latest_sample(files_by_date: dict):
 # =============================================================================
 
 
-def run_check(job: dict, config: dict, args, job_path: Path, config_path: Path | None = None) -> int:
+def run_check(job: dict, config: dict, args, job_path: Path, config_path: Path | None = None, bizdate: str = "") -> int:
     """体检：配置概要 + SFTP 真实列目录 + 目标表结构。新接一个源时先跑这个。"""
     log("== 作业概要 ==")
     for line in build_job_summary(job):
@@ -250,10 +251,13 @@ def run_check(job: dict, config: dict, args, job_path: Path, config_path: Path |
         if as_bool(missing_cfg.get("check"), default=True, field="missing.check") and files_by_date:
             tz = load_zone(str(missing_cfg.get("timezone") or DEFAULT_TZ))
             expected = expected_latest(tz, str(missing_cfg.get("grace") or ""))
-            missing, _, r_start, r_end = plan_dates(sorted(files_by_date), "", "", "", expected, True)
+            # 带 --bizdate 时只核对那一天（与正式跑一致）；否则核对接入以来的完整性
+            missing, _, r_start, r_end = plan_dates(sorted(files_by_date), bizdate, "", "", expected, True)
             if missing:
                 shown = "、".join(missing[:MISSING_SHOW_LIMIT]) + (" 等" if len(missing) > MISSING_SHOW_LIMIT else "")
                 log(f"  ⚠️ 缺文件核对未通过：{shown}（共 {len(missing)} 个；区间 {r_start} ~ {r_end}）")
+            elif bizdate:
+                log(f"  ✅ 业务日 {bizdate} 的远端文件存在")
             elif r_start and r_start <= r_end:
                 log(f"  ✅ 缺文件核对通过（{r_start} ~ {r_end} 完整）")
             else:
@@ -318,6 +322,8 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
     end = norm_date(args.end_date, "--end-date") if args.end_date else ""
     if bizdate and (start or end):
         raise ConfigError("--bizdate 与 --start-date/--end-date 互斥，请二选一")
+    if start and end and start > end:
+        raise ConfigError(f"--end-date（{end}）不能早于 --start-date（{start}）")
 
     # ---- 台账 ----
     download_dir = resolve_download_dir(job, job_path)
@@ -369,6 +375,9 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
         log(f"远端共 {len(all_dates)} 个日期（核对区间 {range_start} ~ {range_end} 完整），本次处理 {len(proc_dates)} 个")
     else:
         log(f"远端共 {len(all_dates)} 个日期，本次处理 {len(proc_dates)} 个")
+    if not proc_dates:
+        # 缺文件核对关掉时会出现"指定了业务日/区间但远端没有文件"：明确打一条，避免 rc=0 看着像做过事
+        log("⚠️ 本次没有要处理的日期（业务日/区间内远端没有匹配文件）")
 
     # ---- ② 连 MaxCompute（dry-run 跳过，纯看数不碰库）----
     table = o = None
@@ -409,7 +418,9 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
         def done(item, date=date):
             """台账 + 本地文件都齐（大小一致）→ 该文件已上传；远端文件更新过会自动重下重写。"""
             keys = (item.ledger_key,) if item.ledger_key == item.name else (item.ledger_key, item.name)
-            return state_mod.record_of(ledger, keys, item.size, table_name, date) and _pick_local(download_dir, item)
+            return state_mod.record_of(ledger, keys, item.size, table_name, date, project=project) and _pick_local(
+                download_dir, item
+            )
 
         if not args.force and all(done(item) for item in items):
             skipped += 1
@@ -472,8 +483,20 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
             return 1
         # 写入并校验成功后才记台账（失败中断后重跑会重试这个日期）
         for item in items:
-            ledger[item.ledger_key] = {"table": table_name, "pt": date, "size": item.size, "rows": file_rows[item.name]}
-        state_mod.save_state(ledger_path, ledger)
+            ledger[item.ledger_key] = {
+                "project": project,
+                "table": table_name,
+                "pt": date,
+                "size": item.size,
+                "rows": file_rows[item.name],
+            }
+        try:
+            state_mod.save_state(ledger_path, ledger)
+        except OSError as exc:
+            # 数据本身已经写好并校验过；台账写不进去只是"下次会重传"，
+            # 但既然本地状态已经异常，按失败退出让调度可见（重跑幂等）
+            log(f"❌ 台账写入失败（数据已写入 MaxCompute）：{ledger_path}（{exc}）；请检查磁盘/权限，重跑即可")
+            return 1
         uploaded += 1
         log(f"  已写入 {project}.{table_name} pt={date}，校验 {verified:,} 行")
 
@@ -501,6 +524,12 @@ def main(argv: list[str] | None = None) -> int:
         from .utils import add_log_sink
 
         add_log_sink(log_handle)
+
+    if args.sql_timeout < 0:
+        # 负数在 run_sql_with_timeout 里会被当成"0=不限制"，与用户直觉相反（想调小却等成无限）
+        log("❌ --sql-timeout 不能为负（0 表示不限制）")
+        _detach_log_sink(log_handle)
+        return 2
 
     if args.init:  # 交互式建配置：不需要 --job
         from .init_wizard import run_init
@@ -547,7 +576,7 @@ def main(argv: list[str] | None = None) -> int:
                 bizdate = from_env.strftime("%Y%m%d")
                 base_day = from_env
             else:
-                base_day = datetime.now(load_zone(DEFAULT_TZ)).date() - timedelta(days=1)
+                base_day = datetime.now(job_tz_of(job_raw)).date() - timedelta(days=1)
 
         job = render_job(job_raw, config, base_day)  # 替换 ${secrets.x}/${bizdate} 等占位符
         job = normalize_job(job)  # 补齐默认值，让配置尽量短
@@ -557,7 +586,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.check:
             try:
-                return run_check(job, config, args, job_path, config_path=config_path)
+                return run_check(job, config, args, job_path, config_path=config_path, bizdate=bizdate)
             except KeyboardInterrupt:
                 log("已中断（体检未完成），退出")
                 return 130

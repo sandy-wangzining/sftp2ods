@@ -1,4 +1,4 @@
-# sftp2ods
+﻿# sftp2ods
 
 [![tests](https://github.com/sandy-wangzining/sftp2ods/actions/workflows/tests.yml/badge.svg)](https://github.com/sandy-wangzining/sftp2ods/actions/workflows/tests.yml)
 [![Python](https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12-blue)](https://github.com/sandy-wangzining/sftp2ods/blob/main/pyproject.toml)
@@ -150,8 +150,8 @@ DWD 层：按业务口径加工/引用
 | `on_missing_header` | `error` | `error`：缺任一列头报错；`warn`：缺的列告警并按空入库 |
 | `strict_columns` | true | 每行列数必须等于表头列数（防列错位）；false 时允许行尾少列（按空补齐），多列仍报错 |
 | `empty_as` | `null` | 空串的落库形态：`null`（空串存 NULL）/ `empty`（空串原样存 `''`，兼容既有表口径，见 clink 示例） |
-| `skip_if_empty` | - | 这些列（**目标列名**）值为空的行跳过不入库（如 `["order_id"]`），跳过的行数会打日志 |
-| `footer` | - | 开启合计行处理：首列为空的合计行不写库；`{"sum": ["金额列", ...]}` 会校验「合计 = 数据行之和」，对不上报错 |
+| `skip_if_empty` | - | 这些列（**目标列名**）值为空的行跳过不入库（如 `["order_id"]`），跳过的行数会打日志（`''` 与 NULL 都算空） |
+| `footer` | - | 开启合计行处理：首列为空的合计行不写库；`{"sum": ["金额列", ...]}` 会校验「合计 = 数据行之和」，对不上报错（sum 只允许 decimal 列） |
 
 `columns` 每项：
 
@@ -257,7 +257,7 @@ date_dir 布局还会回退按旧的文件名键查找），已上传的日期�
 ## 开发与测试
 
 ```bash
-python -m unittest discover -s tests -v    # 220 个离线用例：不连 SFTP、不连数仓
+python -m unittest discover -s tests -v    # 239 个离线用例：不连 SFTP、不连数仓
 pip install -e ".[dev]" && ruff check .    # 代码检查（配置在 pyproject.toml，当前 0 告警）
 ```
 

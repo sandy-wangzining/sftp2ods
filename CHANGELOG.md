@@ -1,4 +1,4 @@
-# 变更记录
+﻿# 变更记录
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)；格式参考
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
@@ -37,5 +37,5 @@
 
 ### 工程
 
-- 220 个离线单元测试（假 SFTP + 假 MaxCompute，不访问网络/数仓）。
+- 239 个离线单元测试（假 SFTP + 假 MaxCompute，不访问网络/数仓）。
 - GitHub Actions：ubuntu/windows/macos × Python 3.9 ~ 3.14 + `ruff check`。

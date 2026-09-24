@@ -36,6 +36,11 @@ class TestState(OfflineTestCase):
         self.assertEqual(state_mod.load_state(path), state)
         self.assertFalse((self.tmp / "state.json.tmp").exists())
 
+    def test_save_creates_parent_dir(self):
+        path = self.tmp / "deep" / "dir" / ".uploaded.json"
+        state_mod.save_state(path, {"a": {"table": "t", "pt": "1", "size": 1}})
+        self.assertTrue(path.is_file())
+
     def test_corrupt(self):
         path = self.tmp / "state.json"
         path.write_text("{oops", encoding="utf-8")
@@ -54,6 +59,15 @@ class TestState(OfflineTestCase):
         self.assertFalse(state_mod.record_of(state, ("a.csv",), 3, "t", "20260920"))
         self.assertFalse(state_mod.record_of(state, ("20260920/a.csv",), 4, "t", "20260920"))
         self.assertFalse(state_mod.record_of(state, ("20260920/a.csv",), 3, "other", "20260920"))
+
+    def test_record_of_project_guard(self):
+        """换过目标项目（表名相同）时不能拿另一个项目的上传记录跳过。"""
+        state = {"a.csv": {"project": "prod", "table": "t", "pt": "20260920", "size": 3, "rows": 1}}
+        self.assertTrue(state_mod.record_of(state, ("a.csv",), 3, "t", "20260920", project="prod"))
+        self.assertFalse(state_mod.record_of(state, ("a.csv",), 3, "t", "20260920", project="dev"))
+        # 旧脚本台账没有 project 字段：兼容放行
+        legacy = {"a.csv": {"table": "t", "pt": "20260920", "size": 3, "rows": 1}}
+        self.assertTrue(state_mod.record_of(legacy, ("a.csv",), 3, "t", "20260920", project="dev"))
 
     def test_local_ready(self):
         path = self.tmp / "f.csv"
