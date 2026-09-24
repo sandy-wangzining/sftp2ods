@@ -136,6 +136,19 @@ class TestNotify(OfflineTestCase):
         with mock.patch.object(notify_mod, "requests", None):
             self.assertFalse(notify_mod.notify("https://hook", "t", ["x"]))
 
+    def test_failure_log_redacts_webhook(self):
+        """发送失败时 requests 的异常消息里带完整 URL/路径，hook id 是凭证，不能明文进日志。"""
+        hook_id = "9f8e7d6c-5b4a-3210-fedc-ba9876543210"
+        hook = f"https://open.feishu.cn/open-apis/bot/v2/hook/{hook_id}"
+        fake = FakeRequests(exc=OSError(f"Max retries exceeded with url: /open-apis/bot/v2/hook/{hook_id}"))
+        logged = []
+        with mock.patch.object(notify_mod, "requests", fake):
+            with mock.patch.object(notify_mod, "log", logged.append):
+                self.assertFalse(notify_mod.notify(hook, "t", ["x"]))
+        joined = "\n".join(str(line) for line in logged)
+        self.assertNotIn(hook_id, joined)
+        self.assertIn("/hook/***", joined)
+
 
 class TestStateFileShape(OfflineTestCase):
     def test_matches_legacy_ledger_shape(self):

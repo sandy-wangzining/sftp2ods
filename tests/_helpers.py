@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import errno
 import io
 import stat
 import time
@@ -84,10 +85,15 @@ def minimal_job(**overrides) -> dict:
 class FakeEntry:
     """listdir_attr 的元素（paramiko SFTPAttributes 的最小替身）。"""
 
-    def __init__(self, filename: str, size: int = 0, is_dir: bool = False):
+    def __init__(self, filename: str, size: int = 0, is_dir: bool = False, is_link: bool = False):
         self.filename = filename
         self.st_size = size
-        self.st_mode = (stat.S_IFDIR | 0o755) if is_dir else (stat.S_IFREG | 0o644)
+        if is_dir:
+            self.st_mode = stat.S_IFDIR | 0o755
+        elif is_link:
+            self.st_mode = stat.S_IFLNK | 0o777
+        else:
+            self.st_mode = stat.S_IFREG | 0o644
 
 
 class FakeSftp:
@@ -96,6 +102,7 @@ class FakeSftp:
     def __init__(self, tree=None, contents=None):
         self.tree = dict(tree or {})
         self.contents = dict(contents or {})
+        self.link_targets = {}  # 远端路径 -> 目标文件大小（stat 跟随软链后的真实大小）
         self.fail_downloads = 0  # 前 N 次下载失败（模拟网络抖动）
         self.fail_lists = 0  # 前 N 次列目录失败
         self.downloaded = []
@@ -104,10 +111,20 @@ class FakeSftp:
     def listdir_attr(self, path):
         if self.fail_lists > 0:
             self.fail_lists -= 1
+            # 不带 errno：模拟网络/权限类失败（sftp2ods 必须把它抛出去重试，不能当"空目录"）
             raise OSError("simulated list failure")
         if path not in self.tree:
-            raise OSError(f"no such directory: {path}")
+            # 与 paramiko 的真实行为一致：目录不存在是 ENOENT（只有这种才当"空目录"）
+            raise OSError(errno.ENOENT, "No such file", path)
         return self.tree[path]
+
+    def stat(self, path):
+        """跟随软链的 stat（paramiko SFTPClient.stat 的语义，对应 lstat 版是 listdir_attr）。"""
+        if path in self.link_targets:
+            return FakeEntry(path.rpartition("/")[2], self.link_targets[path])
+        if path in self.contents:
+            return FakeEntry(path.rpartition("/")[2], len(self.contents[path]))
+        raise OSError(errno.ENOENT, "No such file", path)
 
     def get(self, remote, local):
         self.get_calls += 1

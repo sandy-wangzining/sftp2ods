@@ -127,20 +127,53 @@ class TestValidateParseConfig(OfflineTestCase):
             )
 
     def test_footer_sum_must_be_decimal(self):
+        # 两列：首列给"合计行识别"用，sum 指向第二列（首列不能进 sum，见下一条校验）
         for bad_type in ("string", "bigint", "double"):
             with self.assertRaises(SystemExit) as ctx:
                 parse_mod.validate_parse_config(
-                    parse_cfg([{"header": "A", "name": "a", "type": bad_type}], footer={"sum": ["a"]})
+                    parse_cfg(
+                        [
+                            {"header": "A", "name": "a", "type": "string"},
+                            {"header": "B", "name": "b", "type": bad_type},
+                        ],
+                        footer={"sum": ["b"]},
+                    )
                 )
             self.assertIn("decimal", str(ctx.exception))
         parse_mod.validate_parse_config(
-            parse_cfg([{"header": "A", "name": "a", "type": "decimal(19,10)"}], footer={"sum": ["a"]})
+            parse_cfg(
+                [
+                    {"header": "A", "name": "a", "type": "string"},
+                    {"header": "B", "name": "b", "type": "decimal(19,10)"},
+                ],
+                footer={"sum": ["b"]},
+            )
         )
 
     def test_footer_comment_keys_allowed(self):
         parse_mod.validate_parse_config(
-            parse_cfg([{"header": "A", "name": "a", "type": "decimal(19,10)"}], footer={"//说明": "x", "sum": ["a"]})
+            parse_cfg(
+                [
+                    {"header": "A", "name": "a", "type": "string"},
+                    {"header": "B", "name": "b", "type": "decimal(19,10)"},
+                ],
+                footer={"//说明": "x", "sum": ["b"]},
+            )
         )
+
+    def test_footer_conflicts_with_skip_if_empty_on_first_column(self):
+        """footer 靠"首列为空"识别合计行；skip_if_empty 若也指向第一列，首列为空的数据行
+        会先被判成合计行、跳过规则永远不生效（多行时还会报"多行合计行"）——配置阶段拦下。"""
+        columns = [
+            {"header": "Order ID", "name": "order_id", "type": "string"},
+            {"header": "Status", "name": "status", "type": "string"},
+            {"header": "Amount", "name": "amount", "type": "decimal(19,10)"},
+        ]
+        with self.assertRaises(SystemExit) as ctx:
+            parse_mod.validate_parse_config(parse_cfg(columns, skip_if_empty=["order_id"], footer={"sum": ["amount"]}))
+        self.assertIn("第一列", str(ctx.exception))
+        # 跳过规则不指向首列时没冲突（正常配置）
+        parse_mod.validate_parse_config(parse_cfg(columns, skip_if_empty=["status"], footer={"sum": ["amount"]}))
 
 
 class SpecTestCase(OfflineTestCase):
@@ -424,6 +457,66 @@ class TestReadHeader(SpecTestCase):
         path = self.make_file("a.csv", b"")
         with self.assertRaises(SystemExit):
             parse_mod.read_header(path)
+
+
+class TestValueRange(SpecTestCase):
+    """取值必须落在列类型允许的范围内（超出宁可在写库前失败）。"""
+
+    def test_thousands_ok_but_euro_decimal_rejected(self):
+        """千分位逗号照常支持；欧式小数（1.234,56）报错，而不是静默缩水 1000 倍。"""
+        s = spec([{"header": "金额", "name": "amount", "type": "decimal(19,2)"}])
+        ok = self.make_file("ok.csv", csv_bytes(["金额"], [["1,234.50"]]))
+        self.assertEqual(self.rows_of(ok, s), [[decimal.Decimal("1234.50")]])
+        for raw in ("1.234,56", "1,23", "1,,2"):
+            bad = self.make_file("bad.csv", csv_bytes(["金额"], [[raw]]))
+            with self.assertRaises(RuntimeError) as ctx:
+                self.rows_of(bad, s)
+            self.assertIn("千分位", str(ctx.exception))
+
+    def test_decimal_scale_and_precision_enforced(self):
+        s = spec([{"header": "金额", "name": "amount", "type": "decimal(19,2)"}])
+        too_scale = self.make_file("s.csv", csv_bytes(["金额"], [["1.999"]]))
+        with self.assertRaises(RuntimeError) as ctx:
+            self.rows_of(too_scale, s)
+        self.assertIn("小数位", str(ctx.exception))
+        too_big = self.make_file("b.csv", csv_bytes(["金额"], [["12345678901234567890"]]))
+        with self.assertRaises(RuntimeError) as ctx:
+            self.rows_of(too_big, s)
+        self.assertIn("整数位", str(ctx.exception))
+
+    def test_bigint_range_enforced(self):
+        s = spec([{"header": "n", "name": "n", "type": "bigint"}])
+        ok = self.make_file("ok.csv", csv_bytes(["n"], [[str(2**63 - 1)]]))
+        self.assertEqual(self.rows_of(ok, s), [[2**63 - 1]])
+        bad = self.make_file("bad.csv", csv_bytes(["n"], [[str(2**63)]]))
+        with self.assertRaises(RuntimeError) as ctx:
+            self.rows_of(bad, s)
+        self.assertIn("bigint", str(ctx.exception))
+
+
+class TestFooterPrecision(SpecTestCase):
+    def test_large_amounts_not_rounded_by_default_context(self):
+        """decimal(38,10) 的大额累加不能被 decimal 默认的 28 位精度舍入（否则天天假报不一致）。"""
+        big = "1234567890123456789012345678.1234567890"
+        with decimal.localcontext() as ctx:
+            ctx.prec = 60
+            total = str(decimal.Decimal(big) * 2)
+        columns = [
+            {"header": "id", "name": "id", "type": "string"},
+            {"header": "a", "name": "a", "type": "decimal(38,10)"},
+        ]
+        path = self.make_file("big.csv", csv_bytes(["id", "a"], [["x", big], ["y", big], ["", total]]))
+        self.assertEqual(len(self.rows_of(path, spec(columns, footer={"sum": ["a"]}))), 2)
+
+
+class TestFooterConfigGuards(OfflineTestCase):
+    def test_footer_sum_cannot_include_first_column(self):
+        """合计行靠「首列为空」识别，sum 里不能有第一列（那一列取不到合计值）。"""
+        with self.assertRaises(SystemExit) as ctx:
+            parse_mod.validate_parse_config(
+                parse_cfg([{"header": "A", "name": "a", "type": "decimal(19,10)"}], footer={"sum": ["a"]})
+            )
+        self.assertIn("第一列", str(ctx.exception))
 
 
 if __name__ == "__main__":

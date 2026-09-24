@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import stat
 import sys
 import tempfile
@@ -13,7 +14,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _helpers import FakeSftp, OfflineTestCase, add_dir, add_file, connect_to  # noqa: E402
+from _helpers import FakeEntry, FakeSftp, OfflineTestCase, add_dir, add_file, connect_to  # noqa: E402
 
 from sftp2ods import sftp as sftp_mod  # noqa: E402
 from sftp2ods.utils import FatalSourceError  # noqa: E402
@@ -143,6 +144,45 @@ class TestScanDateDir(OfflineTestCase):
         with mock.patch.object(sftp_mod.SftpSource, "_connect", connect_to(fake)):
             files = source.list_files()
         self.assertEqual(files, {})
+
+    def test_subdir_transient_failure_propagates(self):
+        """子目录列失败若是瞬时错误（非"路径不存在"），必须抛出去让重试生效。
+
+        修复前 _scan 把所有 OSError 都吞成"跳过这个日期"：网络抖一下就会静默少一天数据，
+        而且 retry_call 永远看不到失败、重试形同虚设。
+        """
+        fake = FakeSftp()
+        add_dir(fake, "settlements/20260920")
+        add_file(fake, "settlements/20260920/detail_20260920_USD.csv", b"a,b\n1,2\n")
+        original = fake.listdir_attr
+
+        def flaky(path):
+            if path.endswith("20260920"):
+                raise OSError("connection reset by peer")  # 非 ENOENT 的瞬时错误
+            return original(path)
+
+        source = date_dir_source(sftp={"retry_times": 0})
+        with mock.patch.object(sftp_mod.SftpSource, "_connect", connect_to(fake)):
+            with mock.patch.object(fake, "listdir_attr", flaky):
+                with self.assertRaises(RuntimeError) as ctx:
+                    source.list_files()
+        self.assertIn("connection reset", str(ctx.exception))
+
+    def test_subdir_missing_is_skipped(self):
+        """子目录真的不存在（ENOENT）时才按"没有这一天"跳过。"""
+        fake = FakeSftp()
+        add_dir(fake, "settlements/20260920")
+        original = fake.listdir_attr
+
+        def vanished(path):
+            if path.endswith("20260920"):
+                raise OSError(errno.ENOENT, "No such file", path)
+            return original(path)
+
+        source = date_dir_source(sftp={"retry_times": 0})
+        with mock.patch.object(sftp_mod.SftpSource, "_connect", connect_to(fake)):
+            with mock.patch.object(fake, "listdir_attr", vanished):
+                self.assertEqual(source.list_files(), {})
 
 
 class TestDownload(OfflineTestCase):
@@ -315,6 +355,51 @@ class TestConnect(OfflineTestCase):
             with self.assertRaises(FatalSourceError) as ctx:
                 source._connect()
         self.assertIn("私钥文件不存在", str(ctx.exception))
+
+    def test_channel_timeout_failure_is_logged(self):
+        """get_channel 不可用时 io_timeout 会静默失效——必须留一条日志，别让配置项假装生效。"""
+        module = self._fake_paramiko()[0]
+        source = flat_source()
+        logged = []
+        with mock.patch.object(sftp_mod, "paramiko", module):
+            with mock.patch.object(FakeSftpHandle, "get_channel", side_effect=AttributeError("no get_channel")):
+                with mock.patch.object(sftp_mod, "log_once", logged.append):
+                    source._connect()
+        self.assertTrue(any("io_timeout" in str(line) for line in logged), logged)
+
+
+class TestScanSafety(OfflineTestCase):
+    """列目录的安全边界与软链大小语义。"""
+
+    def test_remote_name_with_path_separator_rejected(self):
+        """远端返回含路径分隔符 / .. 的名字必须拒绝：它会被拼进本地路径，逃出下载目录。
+
+        修复前 download_dir / "../../x.csv" 由内核解析，远端内容能写到任意本地路径。
+        """
+        fake = FakeSftp()
+        evil = "20260920/../../../PWNED.csv"
+        fake.tree["/data"] = [FakeEntry(evil, 5)]
+        fake.contents[f"/data/{evil}"] = b"pwned"
+        source = flat_source(source={"file_regex": r"(?P<date>\d{8}).*"}, sftp={"retry_times": 0})
+        with mock.patch.object(sftp_mod.SftpSource, "_connect", connect_to(fake)):
+            with self.assertRaises(FatalSourceError) as ctx:
+                source.list_files()
+        self.assertIn("不合法", str(ctx.exception))
+
+    def test_symlink_uses_target_size(self):
+        """软链在 READDIR 里的 st_size 是链接自身长度；要用 stat() 取目标真实大小。
+
+        否则下载后的大小核对必然失败（.part 留着、重试也没用），台账也永远对不上。
+        """
+        fake = FakeSftp()
+        link = "/data/report_20260920.csv"
+        fake.tree["/data"] = [FakeEntry("report_20260920.csv", size=len(link), is_link=True)]
+        fake.contents[link] = b"a,b\n1,2\n"
+        fake.link_targets[link] = len(fake.contents[link])
+        source = flat_source(sftp={"retry_times": 0})
+        with mock.patch.object(sftp_mod.SftpSource, "_connect", connect_to(fake)):
+            item = source.list_files()["20260920"][0]
+        self.assertEqual(item.size, len(b"a,b\n1,2\n"))
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -74,6 +75,35 @@ class TestRedact(OfflineTestCase):
 
     def test_plain_text_untouched(self):
         self.assertEqual(utils.redact("hello world"), "hello world")
+
+    def test_webhook_id_without_scheme(self):
+        """requests 的异常消息里 webhook 只有路径（没有 scheme），裸 hook id 也必须遮掉。"""
+        text = "Max retries exceeded with url: /open-apis/bot/v2/hook/9f8e7d6c-5b4a-3210 (Caused by ...)"
+        out = utils.redact(text)
+        self.assertNotIn("9f8e7d6c-5b4a-3210", out)
+        self.assertIn("/hook/***", out)
+
+    def test_backslash_run_is_fast(self):
+        """反斜杠串不能触发 _JSON_RE 的指数回溯（修复前 36 个反斜杠要 19 秒）。"""
+        text = "'a':'" + "\\" * 40 + "xy"
+        started = time.perf_counter()
+        out = utils.redact(text)
+        elapsed = time.perf_counter() - started
+        self.assertEqual(out, text)
+        self.assertLess(elapsed, 1.0, f"脱敏耗时 {elapsed:.1f}s，JSON 规则可能又出现回溯爆炸")
+
+    def test_long_token_like_text_is_fast(self):
+        """超长的小写字母数字串不能把脱敏拖成 O(n²)（修复前 20KB 要 10 秒以上）。
+
+        这类串（十六进制转储、无空格的日志片段）会落进 _URL_AUTH_RE 的字符类；
+        该规则没有长度上限，"://" / "@" 的预判是它保持线性的关键。
+        """
+        text = "deadbeef" * 2500  # 20KB
+        started = time.perf_counter()
+        out = utils.redact(text)
+        elapsed = time.perf_counter() - started
+        self.assertEqual(out, text)
+        self.assertLess(elapsed, 2.0, f"脱敏耗时 {elapsed:.1f}s，正则可能退化成 O(n²) 了")
 
 
 class TestSecretValues(OfflineTestCase):

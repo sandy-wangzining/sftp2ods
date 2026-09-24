@@ -166,16 +166,37 @@ class TestSyncRanges(CliTestCase):
             self.assertNotIn("pt=20260922", world.table.deleted)
 
     def test_bizdate_with_range_is_rejected(self):
+        # 参数互斥在命令行阶段就拦下：退出码 2（参数问题），不进远端流程
         with World(self.tmp) as world:
             rc = cli_mod.main(["--job", str(world.job_path), "--bizdate", "20260920", "--start-date", "2026-09-19"])
-            self.assertEqual(rc, 1)
+            self.assertEqual(rc, 2)
             self.assertTrue(any("互斥" in str(line) for line in world.access_logs))
 
     def test_start_after_end_is_rejected(self):
         with World(self.tmp) as world:
             rc = cli_mod.main(["--job", str(world.job_path), "--start-date", "2026-09-21", "--end-date", "2026-09-20"])
-            self.assertEqual(rc, 1)
+            self.assertEqual(rc, 2)
             self.assertTrue(any("不能早于" in str(line) for line in world.access_logs))
+
+    def test_malformed_date_arg_returns_2(self):
+        """日期写法不对（--start-date 2026-9-1）是参数问题：退出码 2，不是数据问题（1）。"""
+        with World(self.tmp) as world:
+            rc = cli_mod.main(["--job", str(world.job_path), "--start-date", "2026-9-1"])
+            self.assertEqual(rc, 2)
+            self.assertTrue(any("start-date" in str(line) for line in world.access_logs))
+
+    def test_range_without_overlap_fails(self):
+        """补数区间与远端完全没有交集时必须失败：以前会静默 rc=0，和"补数成功"长得一样。"""
+        files = {"/data/report_20260920.csv": report([["o1", "1.00"]])}
+        with World(self.tmp, files=files) as world:
+            self.assertEqual(world.sync(start_date="2026-01-01", end_date="2026-01-31"), 1)
+            self.assertTrue(any("没有交集" in str(line) for line in world.access_logs))
+            self.assertEqual(world.table.deleted, [])
+
+    def test_start_date_after_expected_latest_fails(self):
+        files = {"/data/report_20260920.csv": report([["o1", "1.00"]])}
+        with World(self.tmp, files=files) as world:
+            self.assertEqual(world.sync(start_date="2099-01-01"), 1)
 
 
 class TestSyncGuards(CliTestCase):
@@ -230,6 +251,35 @@ class TestSyncGuards(CliTestCase):
         with World(self.tmp, job=job, files={"/data/report_20260920.csv": data}) as world:
             self.assertEqual(world.sync(bizdate="20260920"), 1)
             self.assertEqual(world.table.deleted, [])
+
+    def test_zero_rows_does_not_wipe_existing_partition(self):
+        """源文件被截断成只剩表头时，不能把已有分区的数据静默清空（先删再填不可逆）。"""
+        data = report([["o1", "1.00"]])
+        with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
+            self.assertEqual(world.sync(bizdate="20260920"), 0)
+            self.assertEqual(len(world.table.rows_in("20260920")), 1)
+            # 源方把文件改坏成"只剩表头"（大小变了 → 台账不命中，会重跑）
+            empty = csv_bytes(HEADERS, [])
+            world.fake.contents["/data/report_20260920.csv"] = empty
+            for entry in world.fake.tree["/data"]:
+                if entry.filename == "report_20260920.csv":
+                    entry.st_size = len(empty)
+            self.assertEqual(world.sync(bizdate="20260920"), 1)
+            self.assertEqual(len(world.table.rows_in("20260920")), 1, "已有数据被清空了")
+            self.assertTrue(any("为避免清空已有数据" in str(line) for line in world.access_logs))
+
+    def test_zero_rows_force_rewrites_partition(self):
+        """确认源方真的改成零行时，--force 是显式放行开关。"""
+        data = report([["o1", "1.00"]])
+        with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
+            self.assertEqual(world.sync(bizdate="20260920"), 0)
+            empty = csv_bytes(HEADERS, [])
+            world.fake.contents["/data/report_20260920.csv"] = empty
+            for entry in world.fake.tree["/data"]:
+                if entry.filename == "report_20260920.csv":
+                    entry.st_size = len(empty)
+            self.assertEqual(world.sync(bizdate="20260920", force=True), 0)
+            self.assertEqual(world.table.rows_in("20260920"), [])
 
     def test_count_mismatch_detected(self):
         data = report([["o1", "1.00"]])
@@ -317,6 +367,36 @@ class TestSyncLedgerCompat(CliTestCase):
             self.assertIn("20260920/detail_20260920_USD.csv", world.ledger())
             self.assertTrue((world.download_dir / "20260920" / "detail_20260920_USD.csv").is_file())
 
+    def test_date_dir_legacy_flat_file_not_reused_for_other_date(self):
+        """旧目录里的平铺同名文件属于别的日期时，不能被当成本日已下载的文件写进库。
+
+        "回退按文件名找文件"只允许用于判定已上传（台账证明那个键属于这一天）；
+        下载/写库阶段必须认 日期/文件名 的当前口径，否则大小恰好相同的旧文件会被静默写成当天数据。
+        """
+        job = minimal_job()
+        job["source"] = {
+            "root": "settlements",
+            "layout": "date_dir",
+            "date_dir_regex": "(?P<date>\\d{8})",
+            "file_regex": "a\\.csv",
+        }
+        data_19 = report([["old-19", "9.99"]])
+        data_20 = report([["new-20", "9.99"]])
+        self.assertEqual(len(data_19), len(data_20), "两个文件必须等长，才构成「大小一致」的迷惑条件")
+        fake = FakeSftp()
+        add_dir(fake, "settlements/20260919")
+        add_file(fake, "settlements/20260919/a.csv", data_19)
+        add_dir(fake, "settlements/20260920")
+        add_file(fake, "settlements/20260920/a.csv", data_20)
+        with World(self.tmp, job=job, fake=fake) as world:
+            world.download_dir.mkdir(parents=True, exist_ok=True)
+            # 旧脚本遗留：平铺下载目录里躺着 20260919 的文件（台账里没有 20260920 的记录）
+            (world.download_dir / "a.csv").write_bytes(data_19)
+            self.assertEqual(world.sync(bizdate="20260920"), 0)
+            rows = world.table.rows_in("20260920")
+            self.assertEqual([r[0] for r in rows], ["new-20"], "别的日期的本地文件被当成当天数据写进了库")
+            self.assertEqual(world.fake.downloaded, ["settlements/20260920/a.csv"], "本日文件应重新下载")
+
 
 class TestSyncConnectionErrors(CliTestCase):
     def test_fatal_auth_error_redacted(self):
@@ -378,9 +458,10 @@ class TestMainEntry(CliTestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(len(world.table.rows_in("20260920")), 1)
 
-    def test_bad_bizdate_returns_1(self):
+    def test_bad_bizdate_returns_2(self):
+        # --bizdate 写法不对属于"命令行参数问题"：退出码 2，调度不需要按数据故障告警
         with World(self.tmp) as world:
-            self.assertEqual(cli_mod.main(["--job", str(world.job_path), "--bizdate", "oops"]), 1)
+            self.assertEqual(cli_mod.main(["--job", str(world.job_path), "--bizdate", "oops"]), 2)
 
     def test_bad_job_json_returns_1(self):
         path = self.tmp / "broken.json"

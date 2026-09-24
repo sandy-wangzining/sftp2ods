@@ -7,7 +7,7 @@ webhook 是凭证：日志里不出现它，抛出/回显的文本由调用方�
 
 from __future__ import annotations
 
-from .utils import log
+from .utils import log, redact
 
 try:
     import requests
@@ -43,10 +43,11 @@ def notify(
         resp = requests.post(webhook, json=card, timeout=timeout)
         data = resp.json()
     except Exception as exc:  # noqa: BLE001 - 告警失败不影响主流程
-        log(f"  警告：飞书通知发送失败：{type(exc).__name__}: {exc}")
+        # requests 的异常消息里带完整 URL，末段 hook id 就是凭证：必须脱敏后再进日志
+        log(f"  警告：飞书通知发送失败：{type(exc).__name__}: {redact(str(exc))}")
         return False
     if resp.status_code == 200 and data.get("code", data.get("StatusCode", 0)) == 0:
         log("飞书通知已发送")
         return True
-    log(f"  警告：飞书通知发送失败：HTTP {resp.status_code} {str(data)[:200]}")
+    log(f"  警告：飞书通知发送失败：HTTP {resp.status_code} {redact(str(data)[:200])}")
     return False

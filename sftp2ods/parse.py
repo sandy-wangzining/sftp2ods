@@ -35,6 +35,13 @@ KNOWN_DELIMITERS = ("\t", ",", ";")
 _DECIMAL_RE = re.compile(r"\Adecimal\s*\(\s*(\d{1,2})\s*,\s*(\d{1,2})\s*\)\Z")
 _SIMPLE_TYPES = ("string", "bigint", "double")
 MAX_DECIMAL_PRECISION = 38  # MaxCompute decimal 精度上限
+# 数字里的千分位逗号：只认「1,234」这种每三位一组的写法
+_THOUSANDS_RE = re.compile(r"\A[+-]?\d{1,3}(,\d{3})+(\.\d+)?\Z")
+BIGINT_MIN, BIGINT_MAX = -(2**63), 2**63 - 1
+# 合计累加用的精度：decimal 默认 context 只有 28 位有效数字，decimal(29..38,x) 的列累加会被
+# 静默舍入，与精确的合计行比对时产生"假不一致"（文件本身没问题却天天失败）；留出进位余量
+SUM_PRECISION = MAX_DECIMAL_PRECISION + 12
+_SUM_CONTEXT = decimal.Context(prec=SUM_PRECISION)
 
 # 配置白名单（config.collect_warnings 用；放在这里与解析字段定义同处维护）
 PARSE_KEYS = {
@@ -94,6 +101,7 @@ class Column:
 
     required：True/False 显式指定；None = 跟随 parse.on_missing_header
     （error 模式下必需、warn 模式下可选），保证"缺列怎么处理"只有一个口径。
+    precision/scale：decimal(p,s) 的 p 与 s，用于按配置校验取值（其余类型为 None）。
     """
 
     header: str
@@ -102,6 +110,8 @@ class Column:
     kind: str
     comment: str = ""
     required: bool | None = None
+    precision: int | None = None
+    scale: int | None = None
 
     def ddl_type(self) -> str:
         return self.type
@@ -117,6 +127,10 @@ def build_columns(parse_cfg: dict) -> list[Column]:
     for item in parse_cfg.get("columns") or []:
         item = item or {}
         type_text = validate_type(item.get("type"), f"parse.columns[{item.get('name')!r}].type")
+        precision = scale = None
+        match = _DECIMAL_RE.fullmatch(type_text)
+        if match:
+            precision, scale = int(match.group(1)), int(match.group(2))
         required = item.get("required")
         if required is not None:
             required = as_bool(required, default=True, field=f"parse.columns[{item.get('name')!r}].required")
@@ -128,6 +142,8 @@ def build_columns(parse_cfg: dict) -> list[Column]:
                 kind=kind_of(type_text),
                 comment=str(item.get("comment") or "").strip(),
                 required=required,
+                precision=precision,
+                scale=scale,
             )
         )
     return result
@@ -232,6 +248,21 @@ def validate_parse_config(parse_cfg: dict) -> None:
                         f"parse.footer.sum 的列 {name} 类型是 {item.get('type')!r}，"
                         f"合计核对只支持 decimal 列（string/double 等请从 sum 里去掉）"
                     )
+            if columns and columns[0].name.lower() in {str(x).strip().lower() for x in sums}:
+                raise ConfigError(
+                    f"parse.footer.sum 不能包含第一列（{columns[0].name}）：合计行靠「首列为空」识别，"
+                    f"首列本身取不到合计值"
+                )
+    if footer is not None and skip_names:
+        # footer 靠"首列为空"识别合计行；skip_if_empty 若把第一列也算进去，两边语义直接冲突：
+        # 首列为空的数据行会先被判成合计行、跳过规则永远轮不到（多行还会报"多行合计行"）
+        first_name = columns[0].name.lower()
+        if first_name in {name.lower() for name in skip_names}:
+            raise ConfigError(
+                f"parse.skip_if_empty 指定了第一列（{columns[0].name}），而 parse.footer 用「首列为空」"
+                f"识别合计行——两者冲突：首列为空的数据行会被当成合计行。请把该列从 skip_if_empty 去掉，"
+                f"或关掉 footer"
+            )
     # 校验用不到构建结果，避免重复构造
     del columns
 
@@ -304,20 +335,28 @@ class ParseSpec:
                 values.append(None)  # 空金额/数字存 NULL，不硬转 0
                 continue
             try:
+                text = strip_thousands(raw)
                 if col.kind == "dec":
-                    value = decimal.Decimal(raw.replace(",", ""))
+                    value = decimal.Decimal(text)
                     if not value.is_finite():  # NaN / Infinity 不是合法金额（写库后聚合全废）
-                        raise ArithmeticError(f"非有限数 {value}")
+                        raise ValueRangeError(f"非有限数 {value}")
+                    check_decimal_range(col, value)
                     values.append(value)
                 elif col.kind == "int":
-                    values.append(int(raw.replace(",", "")))
-                else:  # float
-                    value = float(raw.replace(",", ""))
-                    if not math.isfinite(value):  # inf / nan 同理
-                        raise ValueError(f"非有限数 {value}")
+                    value = int(text)
+                    if not BIGINT_MIN <= value <= BIGINT_MAX:
+                        raise ValueRangeError(f"超出 bigint 范围（{BIGINT_MIN} ~ {BIGINT_MAX}）")
                     values.append(value)
-            except (ValueError, ArithmeticError):
-                raise RuntimeError(f"{filename} 第 {row_no} 行 {col.header} 不是合法的{_kind_cn(col.kind)}：{raw!r}")
+                else:  # float
+                    value = float(text)
+                    if not math.isfinite(value):  # inf / nan 同理
+                        raise ValueRangeError(f"非有限数 {value}")
+                    values.append(value)
+            except (ValueError, ArithmeticError) as exc:
+                hint = f"（{exc}）" if isinstance(exc, ValueRangeError) else ""
+                raise RuntimeError(
+                    f"{filename} 第 {row_no} 行 {col.header} 不是合法的{_kind_cn(col.kind)}：{raw!r}{hint}"
+                )
         return values
 
     def row_skipped(self, values: list) -> bool:
@@ -376,7 +415,9 @@ class ParseSpec:
                         continue
                     last_data_row_no = row_no
                     for k, index in enumerate(self.footer_sum_indexes):
-                        sums[k] += values[index] or decimal.Decimal(0)
+                        # 高精度 context 累加（见 SUM_PRECISION 的说明）：默认 context 只有 28 位，
+                        # 会把大额合计静默舍入，与精确的合计行比对时产生"假不一致"
+                        sums[k] = _SUM_CONTEXT.add(sums[k], values[index] or decimal.Decimal(0))
                     stats["rows"] += 1
                     yield values
         except UnicodeDecodeError as exc:
@@ -420,6 +461,43 @@ class ParseSpec:
 
 def _kind_cn(kind: str) -> str:
     return {"dec": "数字（decimal）", "int": "整数", "float": "小数"}.get(kind, "数值")
+
+
+class ValueRangeError(ArithmeticError):
+    """取值不满足列类型约束（消息是给用户看的中文说明，会拼进最终报错）。"""
+
+
+def strip_thousands(raw: str) -> str:
+    """去掉数字里的千分位逗号；逗号不是千分位写法时直接报错。
+
+    以前是无条件 `replace(",", "")`：欧式小数（`1.234,56` 表示 1234.56）被静默读成 1.23456
+    （缩小约 1000 倍），`1,23` 被读成 123（放大 100 倍）——金额错了却完全看不出来。
+    """
+    if "," not in raw:
+        return raw
+    if not _THOUSANDS_RE.match(raw):
+        raise ValueRangeError("逗号不是千分位写法（欧式小数请先在源侧清洗，如 1.234,56 → 1234.56）")
+    return raw.replace(",", "")
+
+
+def check_decimal_range(col: Column, value: decimal.Decimal) -> None:
+    """按配置的 decimal(p,s) 校验取值：小数位 ≤ s、整数位 ≤ p-s。
+
+    超出时 MaxCompute 要么拒绝写入（此时分区已被"先删"，旧数据丢失且重跑仍失败），
+    要么按 scale 舍入（金额被静默改动）——两者都不可接受，所以在写库前报错。
+    """
+    if col.precision is None or col.scale is None:
+        return
+    _sign, digits, exponent = value.as_tuple()
+    if not isinstance(exponent, int):  # pragma: no cover - NaN/Inf 已被 is_finite 拦掉
+        return
+    frac_digits = max(-exponent, 0)
+    int_digits = 0 if value == 0 else max(len(digits) + exponent, 0)
+    integer_room = col.precision - col.scale
+    if frac_digits > col.scale:
+        raise ValueRangeError(f"小数位 {frac_digits} 位超过 {col.type} 允许的 {col.scale} 位")
+    if int_digits > integer_room:
+        raise ValueRangeError(f"整数位 {int_digits} 位超过 {col.type} 允许的 {integer_room} 位")
 
 
 # =============================================================================

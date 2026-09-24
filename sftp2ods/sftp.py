@@ -14,12 +14,13 @@
 
 from __future__ import annotations
 
+import errno
 import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path
 
-from .utils import ConfigError, FatalSourceError, log, retry_call
+from .utils import ConfigError, FatalSourceError, log, log_once, retry_call
 
 try:
     import paramiko
@@ -27,6 +28,32 @@ except ImportError:  # pragma: no cover - 未安装时给出明确指引（tests
     paramiko = None
 
 DATE_RE = re.compile(r"\A\d{8}\Z")
+
+
+def _safe_remote_name(name: str, kind: str) -> str:
+    """远端返回的目录项名必须是纯文件名：含路径分隔符 / .. 直接拒绝。
+
+    名字会被拼进本地路径（`download_dir / ledger_key`）与远端路径（`root/名字`），
+    服务端（或中间人——本工具不校验 host key）返回 "../x.csv" 这种名字时，`..` 由内核
+    解析，远端内容会被写到下载目录之外（覆盖 ~/.ssh/authorized_keys 之类），
+    也可能让本地任意文件被当成"已下载的文件"读出并推到数仓。
+    """
+    text = str(name or "")
+    if not text or text in (".", "..") or "/" in text or "\\" in text or "\x00" in text:
+        raise FatalSourceError(f"远端{kind}不合法：{name!r}（含路径分隔符或 ..）；可能是服务端异常或伪造数据，拒绝处理")
+    return text
+
+
+def _is_missing_path_error(exc: OSError) -> bool:
+    """是否是「路径不存在」类错误（ENOENT/ENOTDIR）——只有这种才当"空目录"处理。
+
+    paramiko 会把 SFTP 的 NO_SUCH_FILE 映射成 errno.ENOENT；网络抖动、连接被重置、
+    权限不足是别的 errno/异常。把它们一起吞成"空目录"有两个后果：列目录的重试彻底
+    失效（README 承诺会自动重试），且 date_dir 布局下某一天会静默地从日期集合里消失。
+    """
+    if getattr(exc, "errno", None) in (errno.ENOENT, errno.ENOTDIR):
+        return True
+    return "no such file" in str(exc).lower()
 
 
 def normalize_date(value: str, source_name: str, kind: str = "文件名") -> str:
@@ -147,8 +174,9 @@ class SftpSource:
             channel = sftp.get_channel()
             if channel is not None:
                 channel.settimeout(self.io_timeout)
-        except Exception:  # noqa: BLE001 - 设置超时失败不影响已建立的会话
-            pass
+        except Exception as exc:  # noqa: BLE001 - 设置超时失败不影响已建立的会话
+            # 不能静默：吞掉的话 io_timeout 会悄悄失效（用户以为有超时保护）。同一次运行只提示一次
+            log_once(f"  警告：无法设置 SFTP 通道超时（io_timeout 可能不生效）：{type(exc).__name__}: {exc}")
         return ssh, sftp
 
     def _run(self, desc: str, func):
@@ -186,12 +214,26 @@ class SftpSource:
         raw = self._run("列远端文件", self._scan)
         return {date: sorted(files, key=lambda item: item.name) for date, files in raw.items()}
 
+    def _entry_size(self, sftp, entry, remote_path: str) -> int:
+        """条目大小：软链在 READDIR 里的 st_size 是链接自身（= 目标路径字符串长度），
+        直接当"远端大小"用会让下载后的大小核对必然失败、台账也永远对不上；对软链用
+        stat()（跟随链接）取目标文件的真实大小。"""
+        size = int(getattr(entry, "st_size", 0) or 0)
+        if stat.S_ISLNK(getattr(entry, "st_mode", 0) or 0):
+            try:
+                size = int(sftp.stat(remote_path).st_size or 0)
+            except Exception:  # noqa: BLE001 - 取不到就退回列表值（下载后仍会核对大小）
+                pass
+        return size
+
     def _scan(self, sftp) -> dict[str, list[RemoteFile]]:
         root = self.root
         try:
             entries = sftp.listdir_attr(root or ".")
         except OSError as exc:
-            log(f"  警告：列远端目录失败（{root or '.'}）：{exc}")
+            if not _is_missing_path_error(exc):
+                raise  # 网络/权限类失败：抛给 retry_call 重试，别当成"空目录"吞掉
+            log(f"  警告：远端目录不存在（{root or '.'}）：{exc}")
             return {}
         result: dict[str, list[RemoteFile]] = {}
         if self.layout == "date_dir":
@@ -201,18 +243,22 @@ class SftpSource:
                 match = self.dir_re.fullmatch(entry.filename) if self.dir_re else None
                 if not match:
                     continue
-                date = normalize_date(match.group("date"), entry.filename, "日期目录名")
+                dir_name = _safe_remote_name(entry.filename, "日期目录")
+                date = normalize_date(match.group("date"), dir_name, "日期目录名")
                 try:
-                    children = sftp.listdir_attr(f"{root}/{entry.filename}" if root else entry.filename)
+                    children = sftp.listdir_attr(f"{root}/{dir_name}" if root else dir_name)
                 except OSError as exc:
-                    log(f"  警告：列子目录失败（{entry.filename}）：{exc}")
+                    if not _is_missing_path_error(exc):
+                        raise  # 同上：瞬时失败不能变成"这天不存在"
+                    log(f"  警告：子目录不存在（{dir_name}）：{exc}")
                     continue
                 for item in children:
                     if stat.S_ISDIR(item.st_mode or 0) or not self.file_re.fullmatch(item.filename):
                         continue
-                    path = f"{root}/{entry.filename}/{item.filename}" if root else f"{entry.filename}/{item.filename}"
+                    file_name = _safe_remote_name(item.filename, "文件名")
+                    path = f"{root}/{dir_name}/{file_name}" if root else f"{dir_name}/{file_name}"
                     result.setdefault(date, []).append(
-                        RemoteFile(date, item.filename, int(item.st_size or 0), path, f"{date}/{item.filename}")
+                        RemoteFile(date, file_name, self._entry_size(sftp, item, path), path, f"{date}/{file_name}")
                     )
         else:
             for entry in entries:
@@ -222,10 +268,11 @@ class SftpSource:
                 match = self.file_re.fullmatch(entry.filename)
                 if not match:
                     continue
-                date = normalize_date(match.group("date"), entry.filename, "文件名")
-                path = f"{root}/{entry.filename}" if root else entry.filename
+                file_name = _safe_remote_name(entry.filename, "文件名")
+                date = normalize_date(match.group("date"), file_name, "文件名")
+                path = f"{root}/{file_name}" if root else file_name
                 result.setdefault(date, []).append(
-                    RemoteFile(date, entry.filename, int(entry.st_size or 0), path, entry.filename)
+                    RemoteFile(date, file_name, self._entry_size(sftp, entry, path), path, file_name)
                 )
         return result
 

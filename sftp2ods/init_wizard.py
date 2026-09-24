@@ -376,11 +376,16 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         echo("")
         echo(f"写文件失败：{exc}")
         return 1
-    except (KeyboardInterrupt, EOFError, ValueError):
+    except (EOFError, ValueError):
         # stdin 被关闭（`sftp2ods --init <&-`、CI 里没接管道）时 input() 抛的是 ValueError / RuntimeError
         echo("")
         echo("已取消，未生成任何文件。")
         return 1
+    except KeyboardInterrupt:
+        # Ctrl+C 按 README 的退出码约定报 130，与同步流程保持一致
+        echo("")
+        echo("已取消，未生成任何文件。")
+        return 130
     except RuntimeError as exc:  # "lost sys.stdin"（没有标准输入）
         if "stdin" not in str(exc):
             raise
