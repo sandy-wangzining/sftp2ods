@@ -159,6 +159,17 @@ class TestWizardFailurePaths(WizardTestCase):
         rc = init_wizard.run_init(out_path=str(self.out_path), ask=EofAsk(), echo=lambda *_a, **_k: None)
         self.assertEqual(rc, 1)
 
+    def test_keyboard_interrupt_returns_130(self):
+        """Ctrl+C 按 README 的退出码约定报 130（与同步流程一致），不再混进"配置错"的 1。"""
+
+        class InterruptAsk:
+            def __call__(self, prompt=""):
+                raise KeyboardInterrupt()
+
+        rc = init_wizard.run_init(out_path=str(self.out_path), ask=InterruptAsk(), echo=lambda *_a, **_k: None)
+        self.assertEqual(rc, 130)
+        self.assertFalse(self.out_path.exists())
+
     def test_out_path_is_directory(self):
         with self.assertRaises(SystemExit):
             self.run_wizard(self.base_script() + self.common_tail(), out_path=self.tmp)

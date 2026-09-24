@@ -6,4 +6,4 @@
     sftp2ods --job jobs/xxx.json ...               # pip/pipx 安装后（console script）
 """
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"

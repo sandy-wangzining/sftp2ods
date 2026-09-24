@@ -119,6 +119,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _check_cli_args(args) -> str:
+    """命令行参数自身的校验（格式 / 互斥），返回错误文本（空串 = 通过）。
+
+    在运行锁、读配置、连 SFTP 之前做：README 的退出码约定里 2 = 参数问题（没做过任何
+    远端操作）。日期参数写错（如 --start-date 2026-9-1）以前会掉进运行期错误报 1，
+    调度侧按码分流时会把"命令打错"当成"数据问题"。
+    """
+    if args.sql_timeout < 0:
+        # 负数在 run_sql_with_timeout 里会被当成"0=不限制"，与用户直觉相反（想调小却等成无限）
+        return "--sql-timeout 不能为负（0 表示不限制）"
+    try:
+        bizday = parse_day_arg(args.bizdate) if args.bizdate else None
+        start = norm_date(args.start_date, "--start-date") if args.start_date else ""
+        end = norm_date(args.end_date, "--end-date") if args.end_date else ""
+    except SystemExit as exc:
+        return str(exc)
+    if bizday and (start or end):
+        return "--bizdate 与 --start-date/--end-date 互斥，请二选一"
+    if start and end and start > end:
+        return f"--end-date（{end}）不能早于 --start-date（{start}）"
+    return ""
+
+
 def _open_log_file(path_text: str):
     """打开 --log-file 指定的日志文件（追加、UTF-8、父目录自动创建）；没指定返回 None。"""
     if not path_text:
@@ -202,16 +225,23 @@ def _lifecycle_days(target_cfg: dict) -> int | None:
     return int(raw)
 
 
-def _local_candidates(download_dir: Path, item) -> list[Path]:
+def _local_candidates(download_dir: Path, item, *, allow_legacy: bool = False) -> list[Path]:
     """一个文件的本地候选路径：当前口径 + 旧脚本口径（迁移后复用旧目录里的文件）。"""
-    if item.ledger_key == item.name:
-        return [download_dir / item.name]
-    return [download_dir / item.ledger_key, download_dir / item.name]
+    paths = [download_dir / item.ledger_key]
+    if allow_legacy and item.ledger_key != item.name:
+        paths.append(download_dir / item.name)
+    return paths
 
 
-def _pick_local(download_dir: Path, item) -> Path | None:
-    """本地已有的、大小一致的文件路径（没有返回 None）。"""
-    for candidate in _local_candidates(download_dir, item):
+def _pick_local(download_dir: Path, item, *, allow_legacy: bool = False) -> Path | None:
+    """本地已有的、大小一致的文件路径（没有返回 None）。
+
+    allow_legacy 只给「判定已上传」用：旧脚本把文件平铺下载在 download_dir 下、台账键
+    是文件名，只有台账明确记着"这个键属于这一天"时才敢认那个平铺文件。
+    **下载与写库路径必须用默认值**：平铺目录里的同名文件可能属于别的日期
+    （文件名不含日期时尤其如此），大小恰好相同就会被静默当成本日数据写进库。
+    """
+    for candidate in _local_candidates(download_dir, item, allow_legacy=allow_legacy):
         if state_mod.local_ready(candidate, item.size):
             return candidate
     return None
@@ -375,6 +405,15 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
             footer,
         )
         return 1
+    if check_missing and range_start and range_end and range_start > range_end:
+        # 核对区间为空 = 用户给的日期范围与远端完全没有交集（区间下界晚于数据上界）。
+        # 此时缺文件核对会整个被跳过、也没有任何日期可处理，静默 rc=0 会让"补数日期打错"
+        # 看起来像成功；对齐"宁可失败"的红线，这里明确失败。
+        log(
+            f"❌ 【{job_name}】日期范围与远端没有交集（核对区间为空：{range_start} 晚于 {range_end}）；"
+            f"远端数据范围 {min(all_dates)} ~ {max(all_dates)}，请检查 --start-date/--end-date 是否写错"
+        )
+        return 1
     if check_missing and range_start and range_start <= range_end:
         log(
             f"远端共 {len(all_dates)} 个日期（核对区间 {range_start} ~ {range_end} 完整），本次处理 {len(proc_dates)} 个"
@@ -422,10 +461,14 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
         items = files_by_date[date]
 
         def done(item, date=date):
-            """台账 + 本地文件都齐（大小一致）→ 该文件已上传；远端文件更新过会自动重下重写。"""
+            """台账 + 本地文件都齐（大小一致）→ 该文件已上传；远端文件更新过会自动重下重写。
+
+            allow_legacy=True：允许回退到旧脚本的平铺文件——台账已经证明那个键属于这一天，
+            跳过是安全的；下载阶段绝不会这么认（见 _pick_local）。
+            """
             keys = (item.ledger_key,) if item.ledger_key == item.name else (item.ledger_key, item.name)
             return state_mod.record_of(ledger, keys, item.size, table_name, date, project=project) and _pick_local(
-                download_dir, item
+                download_dir, item, allow_legacy=True
             )
 
         if not args.force and all(done(item) for item in items):
@@ -472,6 +515,22 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
             log(f"❌ pt={date} 解析出 0 行，且 target.allow_empty=false，未写库")
             return 1
         if rows == 0:
+            # 写空分区前先看一眼现有分区：把一个本来有数据的分区覆盖成 0 行几乎总是异常
+            # （源文件被截断成只剩表头、关键列整列变空被 skip_if_empty 滤光），而"先删再填"
+            # 不可逆。零交易的正常场景下分区本来就不存在（查询得 0），不会误伤。
+            # --force 是"我知道我在干什么"的显式开关，允许绕过这层保护。
+            if not args.force:
+                try:
+                    existing = mc_mod.count_partition(o, project, table_name, date, timeout=args.sql_timeout)
+                except Exception as exc:  # noqa: BLE001 - 查询失败按写库失败处理（宁可不写）
+                    log(f"❌ pt={date} 写前查询现有分区行数失败：{_redact_job(job, exc)}")
+                    return 1
+                if existing:
+                    log(
+                        f"❌ pt={date} 本次解析出 0 行，但该分区现有 {existing:,} 行；为避免清空已有数据，"
+                        f"本次未写库。确认源方确实把这天改成了零行后，可加 --force 重写该分区"
+                    )
+                    return 1
             log(f"  警告：pt={date} 解析出 0 行，将写入空分区（源文件不该为空时请检查解析配置）")
 
         try:
@@ -531,12 +590,6 @@ def main(argv: list[str] | None = None) -> int:
 
         add_log_sink(log_handle)
 
-    if args.sql_timeout < 0:
-        # 负数在 run_sql_with_timeout 里会被当成"0=不限制"，与用户直觉相反（想调小却等成无限）
-        log("❌ --sql-timeout 不能为负（0 表示不限制）")
-        _detach_log_sink(log_handle)
-        return 2
-
     if args.init:  # 交互式建配置：不需要 --job
         from .init_wizard import run_init
 
@@ -549,6 +602,12 @@ def main(argv: list[str] | None = None) -> int:
             return run_init(args.init_out, ask=_wizard_ask, echo=log)
         finally:
             _detach_log_sink(log_handle)
+
+    problem = _check_cli_args(args)
+    if problem:
+        log(f"❌ {problem}")
+        _detach_log_sink(log_handle)
+        return 2
 
     if not args.job:
         log("请用 --job 指定作业配置文件（第一次接新源可以先用 `sftp2ods --init` 生成）")

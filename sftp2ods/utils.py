@@ -287,20 +287,30 @@ _SENSITIVE_WORDS = {
     "pw",
     "pass",
     "bearer",
+    # 会话类凭证：Set-Cookie: sid=... / session=...
+    "cookie",
+    "session",
+    "sid",
 }
 _WORD_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
 # 参数名做左边界限制（不用 \b：下划线在正则里算词字符，client_secret 会被漏掉）
-_QUERY_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])([A-Za-z0-9_.\-]{1,64})=([^&\s\"']+)")
+# 分隔符同时认 "key=value" 与 "key: value"（后者以前只认行首形态，行中部的
+# "X-Api-Key: xxx" 会漏遮）；替换时保留原分隔符
+_QUERY_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])([A-Za-z0-9_.\-]{1,64})([:=])([^&\s\"']+)")
 # 同时认单引号：异常里直接插值的 dict（f"{cfg}"）和 repr（{exc!r}）都是单引号形态
-_JSON_RE = re.compile(r"""(?i)(["']([^"']{1,64})["']\s*:\s*)(?P<q>["'])((?:\\.|(?!(?P=q))[\s\S])*)(?P=q)""")
+# `(?!\\.)` 让两个分支互斥：否则 "\x" 既能走 \\.、也能走 [\s\S]，一串反斜杠会让回溯指数爆炸
+# （实测 36 个反斜杠要 19 秒，且发生在"解析失败要打印原因"的必经路径上）
+_JSON_RE = re.compile(r"""(?i)(["']([^"']{1,64})["']\s*:\s*)(?P<q>["'])((?:\\.|(?!\\.)(?!(?P=q))[\s\S])*)(?P=q)""")
 _BEARER_RE = re.compile(r"(?i)(\b(?:bearer)\s+)[A-Za-z0-9._~+/=-]{6,}")
 _BASIC_RE = re.compile(r"(?i)(authorization:\s*basic\s+)\S{8,}")
 # URL 里的 userinfo（https://user:pass@host）
 _URL_AUTH_RE = re.compile(r"(?i)([a-z][a-z0-9+.\-]*://[^/\s:@]+):([^/\s@]+)@")
 # 请求头行：'X-Api-Key: xxx' / 'X-Api-Key=xxx' 形态
 _HEADER_RE = re.compile(r"(?im)^(\s*([A-Za-z0-9_.\-]{1,64})\s*[:=]\s*)(.+)$")
-# 飞书 webhook 形态：open.feishu.cn/open-apis/bot/v2/hook/<id>，直接按 URL 形态遮
-_WEBHOOK_RE = re.compile(r"(?i)(https?://[^\s\"']*?/hook/)[A-Za-z0-9\-_]+")
+# 飞书 webhook 形态：open.feishu.cn/open-apis/bot/v2/hook/<id>；scheme 部分可选——
+# requests 的异常消息里只带 URL 的路径（"Max retries exceeded with url: /open-apis/..."），
+# 这时靠这个规则兜底，别让 hook id 明文进日志
+_WEBHOOK_RE = re.compile(r"(?i)((?:https?://[^\s\"']*?)?/hook/)[A-Za-z0-9\-_]{4,}")
 
 
 def _is_sensitive_key(name) -> bool:
@@ -373,18 +383,18 @@ def redact(text: str) -> str:
         return f"{prefix}{quote}{redact(value)}{quote}"
 
     def _query(match: re.Match) -> str:
-        """URL 查询串里的 key=value：命中密钥词才替换值，其余原样返回。"""
+        """URL 查询串 / `key: value` 里的值：命中密钥词才替换，其余原样返回。"""
         if _is_sensitive_key(match.group(1)):
-            return f"{match.group(1)}=***"
-        value = match.group(2)
+            return f"{match.group(1)}{match.group(2)}***"
+        value = match.group(3)
         if "%" in value:
             try:
                 decoded = unquote(value)
             except Exception:  # noqa: BLE001 - 解码失败按原文处理
                 decoded = value
             if decoded != value and redact(decoded) != decoded:
-                return f"{match.group(1)}=***"
-        return f"{match.group(1)}={redact(value)}"
+                return f"{match.group(1)}{match.group(2)}***"
+        return f"{match.group(1)}{match.group(2)}{redact(value)}"
 
     def _header(match: re.Match) -> str:
         """多行文本里的一行 "Header: value"：只吃头名命中密钥词的行。"""
@@ -395,9 +405,16 @@ def redact(text: str) -> str:
     out = str(text)
     out = _BEARER_RE.sub(_bearer, out)
     out = _BASIC_RE.sub(_bearer, out)
-    out = _URL_AUTH_RE.sub(_url_auth, out)
+    # URL userinfo 规则必须同时出现 "://" 与 "@" 才可能匹配，先做一次 O(n) 预判：
+    # 它的 [a-z0-9+.\-]* 没有长度上限，在长文本（整段十六进制转储、超长 token）上会在每个
+    # 起始位置贪婪回扫，实测 20KB 就要 10 秒、40KB 要 50 秒，且 C 层正则期间 Ctrl+C 也打断不了。
+    # 其余规则都有 {1,64} 之类的长度上限（实测线性），只有这一条需要预判。
+    if "://" in out and "@" in out:
+        out = _URL_AUTH_RE.sub(_url_auth, out)
     out = _WEBHOOK_RE.sub(_webhook, out)
-    out = _JSON_RE.sub(_json, out)
+    # JSON 片段规则至少要出现引号才可能匹配；没引号的长文本（十六进制转储等）直接跳过，省一遍全量扫描
+    if '"' in out or "'" in out:
+        out = _JSON_RE.sub(_json, out)
     out = _QUERY_RE.sub(_query, out)
     # 头行规则放最后：它最宽松（只要求行首是 name: value），前面几条先处理过更精确的形态
     return _HEADER_RE.sub(_header, out)
@@ -472,6 +489,10 @@ def collect_secret_values(job: dict) -> list[str]:
                 if name in _SFTP_SECRET_KEYS or (_is_sensitive_key(name) and not name.endswith(_AUTH_STRUCT_SUFFIXES)):
                     values += [part for value in _leaf_strings(val) for part in _with_scheme_bare(value)]
         for key, val in sftp_cfg.items():
+            if str(key) == "auth":
+                # auth 块上面已按字段名精确收集过；再整体收会把 type 的值（"password"/"key"）
+                # 当成密钥，日志里正常出现的 "password" 一词会被全文遮成 ***
+                continue
             if _is_sensitive_key(str(key)):
                 values += _leaf_strings(val)
     notify_cfg = job.get("notify")
@@ -529,5 +550,5 @@ def retry_call(
             log(f"  [{desc} 第 {attempt}/{attempts - 1} 次失败] {redact(str(exc))}；{delay:g}s 后重试")
             time.sleep(delay)
             delay = min(delay * 2, max_delay)
-    # 报"重试 N-1 次"（成功那次之外又试了几次），与实际行为一致
-    raise RuntimeError(f"{desc} 重试 {attempts - 1} 次仍失败：{redact(str(last_err))}")
+    # 报"重试 N-1 次"（成功那次之外又试了几次），与实际行为一致；from last_err 保住原始异常链
+    raise RuntimeError(f"{desc} 重试 {attempts - 1} 次仍失败：{redact(str(last_err))}") from last_err
