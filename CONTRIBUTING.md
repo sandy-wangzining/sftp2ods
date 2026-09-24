@@ -19,7 +19,7 @@ python3 -m venv venv
 ```bash
 python -m unittest discover -s tests -v   # 全部用例：不连 SFTP、不连数仓
 ruff check .                              # 代码检查（配置在 pyproject.toml，当前 0 告警）
-ruff format .                             # 统一格式（CI 会跑 ruff format --check，提交前先格式化）
+ruff format .                             # 统一格式（ruff 锁版本；CI 跑 ruff format --check，提交前先格式化）
 ```
 
 - 测试**必须离线可跑**：不许依赖真实 SFTP、真实 MaxCompute、本机特定的文件

@@ -43,7 +43,9 @@ Issues = "https://github.com/sandy-wangzining/sftp2ods/issues"
 Changelog = "https://github.com/sandy-wangzining/sftp2ods/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-dev = ["ruff>=0.5"]
+# ruff 锁版本：格式化判定（ruff format --check）必须本地与 CI 完全一致，避免版本漂移造成意外失败；
+# 升级时改这里并本地跑一次 ruff format .（格式化结果有变化就一并提交）
+dev = ["ruff==0.16.8"]
 
 [tool.setuptools]
 packages = ["sftp2ods"]
