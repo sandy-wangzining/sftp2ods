@@ -2,7 +2,7 @@
 """命令行入口：体检（--check）、试跑（--dry-run）、正式同步、交互式建配置（--init）。
 
 一次运行的完整流程（run_sync）：
-    1) 解析参数 → 列远端文件 → 缺文件核对（缺了直接失败 + 飞书告警）
+    1) 解析参数 → 列远端文件 → 缺文件核对（缺了飞书告警 + 跳过缺失日期，照常同步已有文件）
     2) 逐日期：跳过已上传 → 下载（.part 校验大小）→ 解析数行数（先全量校验一遍）
     3) 写库：自动建表/校验结构 → 删分区 → Tunnel 分批写入 → count(*) 行数核对
     4) 台账记录每个文件（表/pt/大小/行数），校验通过才落账；失败中断后重跑幂等自愈
@@ -390,21 +390,26 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
     all_dates = sorted(files_by_date)
     missing, proc_dates, range_start, range_end = plan_dates(all_dates, bizdate, start, end, expected, check_missing)
     if missing:
+        # 缺文件只告警、不失败：源方产数是人/上游系统排期（节假日、结算方停产出是常态），
+        # 缺几天不等于任务失败——跳过缺失日期、照常同步已有的文件（缺失日期后面补产
+        # 出后，下次运行会自动下载写分区）。真正的异常（远端目录一个文件都没有、
+        # 日期范围与远端无交集）仍按失败处理。
         shown = "、".join(missing[:MISSING_SHOW_LIMIT]) + (" 等" if len(missing) > MISSING_SHOW_LIMIT else "")
         log(
-            f"❌ 【{job_name}】缺少文件：{shown}（共 {len(missing)} 个）；"
-            f"已有最新：{max(all_dates)}，预期到：{range_end}"
+            f"⚠️ 【{job_name}】缺少文件：{shown}（共 {len(missing)} 个）；"
+            f"已有最新：{max(all_dates)}，预期到：{range_end}；本次跳过缺失日期、继续处理已有文件"
         )
         notifier(
-            f"{job_name}：文件缺失",
+            f"{job_name}：文件缺失（已跳过继续）",
             [
                 f"**缺少日期**：{shown}（共 {len(missing)} 个）",
                 f"**当前最大**：{max(all_dates)}",
                 f"**预期到**：{range_end}",
+                "本次已跳过缺失日期、照常同步已有文件，下游任务不受影响；",
+                "缺失日期补产出后下次运行会自动同步，无需人工干预。",
             ],
             footer,
         )
-        return 1
     if check_missing and range_start and range_end and range_start > range_end:
         # 核对区间为空 = 用户给的日期范围与远端完全没有交集（区间下界晚于数据上界）。
         # 此时缺文件核对会整个被跳过、也没有任何日期可处理，静默 rc=0 会让"补数日期打错"
@@ -415,8 +420,9 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
         )
         return 1
     if check_missing and range_start and range_start <= range_end:
+        state = "完整" if not missing else "有缺失（上面已告警并跳过）"
         log(
-            f"远端共 {len(all_dates)} 个日期（核对区间 {range_start} ~ {range_end} 完整），本次处理 {len(proc_dates)} 个"
+            f"远端共 {len(all_dates)} 个日期（核对区间 {range_start} ~ {range_end} {state}），本次处理 {len(proc_dates)} 个"
         )
     else:
         log(f"远端共 {len(all_dates)} 个日期，本次处理 {len(proc_dates)} 个")
