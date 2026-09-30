@@ -36,7 +36,7 @@ JOB_KEYS = {
     "missing",
     "notify",
 }
-SFTP_KEYS = {"host", "port", "username", "auth", "connect_timeout", "io_timeout", "retry_times", "retry_delay"}
+SFTP_KEYS = {"host", "port", "username", "auth", "connect_timeout", "io_timeout", "retry_times", "retry_delay", "host_key"}
 SFTP_AUTH_KEYS = {"type", "password", "key_file", "passphrase"}
 SOURCE_KEYS = {"root", "layout", "file_regex", "date_dir_regex", "download_dir"}
 TARGET_KEYS = {"project", "table", "comment", "stored_as", "lifecycle_days", "allow_empty", "profile"}
@@ -330,6 +330,12 @@ def validate_job(job: dict) -> None:
         raise ConfigError("sftp.auth.type=password 必须给 sftp.auth.password")
     if auth_type == "key" and not auth.get("key_file"):
         raise ConfigError("sftp.auth.type=key 必须给 sftp.auth.key_file（私钥路径，如 ~/.ssh/clink_sftp）")
+    host_key = str(sftp.get("host_key") or "").strip().lower()
+    if host_key not in ("", "auto_accept"):
+        raise ConfigError(
+            f"sftp.host_key 不支持：{host_key!r}（不写 = 严格校验 ~/.ssh/known_hosts 里的主机指纹，"
+            f'防中间人；"auto_accept" = 显式降级为不校验，与 StrictHostKeyChecking=no 同口径）'
+        )
 
     # ---- source ----
     source = job.get("source") or {}

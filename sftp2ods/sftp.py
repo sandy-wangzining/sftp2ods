@@ -131,7 +131,13 @@ class SftpSource:
         if paramiko is None:
             raise ConfigError("缺少 paramiko：pip install paramiko（或 pip install -e .）")
         ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())  # 与 StrictHostKeyChecking=no 同口径
+        # 默认严格校验主机指纹（只认 ~/.ssh/known_hosts 里记录过的主机，防中间人）；
+        # sftp.host_key="auto_accept" 显式降级为旧行为（接受一切，与 StrictHostKeyChecking=no 同口径）
+        host_key = str(self.cfg.get("host_key") or "").strip().lower()
+        if host_key == "auto_accept":
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        else:
+            ssh.load_system_host_keys()
         kwargs = dict(
             hostname=self.host,
             port=self.port,
@@ -166,7 +172,15 @@ class SftpSource:
             raise FatalSourceError(f"私钥需要口令，但 sftp.auth.passphrase 没配或不对（{exc}）")
         except paramiko.SSHException as exc:
             ssh.close()
-            raise RuntimeError(f"SFTP 连接失败：{type(exc).__name__}: {exc}")
+            message = str(exc)
+            if "not found in known_hosts" in message and host_key != "auto_accept":
+                # 严格模式下最常见的第一类错误：提示怎么把主机指纹加进 known_hosts
+                message += (
+                    f"；本工具默认校验主机指纹（防中间人），请先运行："
+                    f"ssh-keyscan -p {self.port} {self.host} >> ~/.ssh/known_hosts"
+                    f"（确实要跳过校验可在 sftp 块加 \"host_key\": \"auto_accept\"）"
+                )
+            raise RuntimeError(f"SFTP 连接失败：{type(exc).__name__}: {message}")
         except OSError as exc:
             ssh.close()
             raise RuntimeError(f"SFTP 连接失败（网络）：{exc}")

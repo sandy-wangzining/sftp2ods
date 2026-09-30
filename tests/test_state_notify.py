@@ -76,6 +76,23 @@ class TestState(OfflineTestCase):
         self.assertFalse(state_mod.local_ready(path, 4))
         self.assertFalse(state_mod.local_ready(self.tmp / "nope", 0))
 
+    def test_local_ready_with_md5(self):
+        path = self.tmp / "f.csv"
+        path.write_bytes(b"123")
+        good = state_mod.md5_of(path)
+        self.assertTrue(state_mod.local_ready(path, 3, md5=good))
+        # 内容变了但大小没变：md5 兜住（旧逻辑只比大小会静默放过）
+        path.write_bytes(b"456")
+        self.assertFalse(state_mod.local_ready(path, 3, md5=good))
+        # 旧台账无 md5（空串）：退回只比大小，兼容迁移前记录
+        self.assertTrue(state_mod.local_ready(path, 3, md5=""))
+
+    def test_md5_of(self):
+        path = self.tmp / "f.csv"
+        path.write_bytes(b"123")
+        self.assertEqual(len(state_mod.md5_of(path)), 32)
+        self.assertEqual(state_mod.md5_of(self.tmp / "nope"), "")
+
 
 class FakeResponse:
     def __init__(self, status_code=200, payload=None):

@@ -158,6 +158,16 @@ class TestValidate(OfflineTestCase):
         job["sftp"]["auth"] = {"type": "key", "key_file": "~/.ssh/x"}
         validated(job)
 
+    def test_sftp_host_key_enum(self):
+        # 不写 = 严格校验；auto_accept = 显式降级；其它值报配置错
+        validated(minimal_job())
+        job = minimal_job()
+        job["sftp"]["host_key"] = "auto_accept"
+        validated(job)
+        job = minimal_job()
+        job["sftp"]["host_key"] = "trust_anything"
+        self.assert_invalid(job, "sftp.host_key")
+
     def test_source_errors(self):
         job = minimal_job()
         job["source"]["root"] = ""

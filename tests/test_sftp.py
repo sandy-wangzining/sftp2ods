@@ -285,11 +285,16 @@ class TestConnect(OfflineTestCase):
             def set_missing_host_key_policy(self, policy):
                 self.policy = policy
 
+            def load_system_host_keys(self):
+                self.system_host_keys_loaded = True
+
             def connect(self, **kwargs):
                 if last.get("fail_auth"):
                     raise AuthenticationException("bad password")
                 if last.get("fail_passphrase"):
                     raise PasswordRequiredException("private key file is encrypted")
+                if last.get("fail_ssh"):
+                    raise SSHException(last["fail_ssh"])
                 self.kwargs = kwargs
 
             def open_sftp(self):
@@ -400,6 +405,44 @@ class TestScanSafety(OfflineTestCase):
         with mock.patch.object(sftp_mod.SftpSource, "_connect", connect_to(fake)):
             item = source.list_files()["20260920"][0]
         self.assertEqual(item.size, len(b"a,b\n1,2\n"))
+
+
+class TestHostKeyPolicy(TestConnect):
+    """主机指纹校验：默认严格（只认 known_hosts），sftp.host_key=auto_accept 显式降级。"""
+
+    def test_default_is_strict_load_system_host_keys(self):
+        module, last = self._fake_paramiko()
+        with mock.patch.object(sftp_mod, "paramiko", module):
+            flat_source()._connect()
+        self.assertTrue(last["client"].system_host_keys_loaded)
+        self.assertFalse(hasattr(last["client"], "policy"))  # 不设 AutoAddPolicy
+
+    def test_auto_accept_uses_autoadd_policy(self):
+        module, last = self._fake_paramiko()
+        source = flat_source(sftp={"host_key": "auto_accept"})
+        with mock.patch.object(sftp_mod, "paramiko", module):
+            source._connect()
+        self.assertIsInstance(last["client"].policy, module.AutoAddPolicy)
+        self.assertFalse(getattr(last["client"], "system_host_keys_loaded", False))
+
+    def test_unknown_host_hint_mentions_keyscan(self):
+        """严格模式下未知主机的报错要带 ssh-keyscan 提示（否则用户不知道去哪登记指纹）。"""
+        module, last = self._fake_paramiko()
+        last["fail_ssh"] = "Server 'h' not found in known_hosts"
+        with mock.patch.object(sftp_mod, "paramiko", module):
+            with self.assertRaises(RuntimeError) as ctx:
+                flat_source()._connect()
+        self.assertIn("ssh-keyscan", str(ctx.exception))
+
+    def test_auto_accept_error_has_no_keyscan_hint(self):
+        """auto_accept 模式（显式不校验）下报错不应再提示 keyscan。"""
+        module, last = self._fake_paramiko()
+        last["fail_ssh"] = "Server 'h' not found in known_hosts"
+        source = flat_source(sftp={"host_key": "auto_accept"})
+        with mock.patch.object(sftp_mod, "paramiko", module):
+            with self.assertRaises(RuntimeError) as ctx:
+                source._connect()
+        self.assertNotIn("ssh-keyscan", str(ctx.exception))
 
 
 if __name__ == "__main__":

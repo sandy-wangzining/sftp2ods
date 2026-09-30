@@ -41,13 +41,14 @@ def save_state(path: Path, state: dict) -> None:
     os.replace(tmp, path)
 
 
-def record_of(state: dict, keys, size: int, table: str, pt: str, project: str | None = None) -> bool:
+def record_of(state: dict, keys, size: int, table: str, pt: str, project: str | None = None) -> dict | None:
     """台账里是否存在"与本次一致"的完成记录（keys 任一命中即可，兼容旧台账的键）。
 
     keys 里放当前键与历史键（如 date_dir 布局的 "20260920/xxx.csv" 与旧的 "xxx.csv"）。
     记录里带了 project 时也要一致：换过目标项目（如 dev → prod，表名相同）时不能拿
     另一个项目里的上传记录跳过——否则会把整段日期静默跳成"没数据"。
     旧脚本的台账没有 project 字段，按兼容处理（不因缺字段拒绝）。
+    返回命中的记录 dict（调用方可能需要里面的 md5），没有返回 None。
     """
     for key in keys:
         record = state.get(key)
@@ -58,14 +59,35 @@ def record_of(state: dict, keys, size: int, table: str, pt: str, project: str | 
         recorded_project = record.get("project")
         if recorded_project and project and recorded_project != project:
             continue
-        return True
-    return False
+        return record
+    return None
 
 
-def local_ready(target: Path, size: int) -> bool:
-    """本地文件已存在且大小与远端一致（不用重新下载）。"""
+def md5_of(path: Path) -> str:
+    """文件的 md5 十六进制串（流式计算，几十 MB 也只用一次读 IO）；文件不存在/读不了返回空串。"""
+    import hashlib
+
+    digest = hashlib.md5()  # noqa: S324 - 这里只做完整性校验（本地文件 vs 台账），不涉及密码学场景
+    try:
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 256), b""):
+                digest.update(chunk)
+    except OSError:
+        return ""
+    return digest.hexdigest()
+
+
+def local_ready(target: Path, size: int, md5: str = "") -> bool:
+    """本地文件已存在且大小与远端一致（不用重新下载）；md5 给定时（台账里有）再校验内容。
+
+    旧台账没有 md5 字段：md5 传空串，退回只比大小（兼容迁移前的记录）。
+    """
     target = Path(target)
-    return target.is_file() and target.stat().st_size == size
+    if not target.is_file() or target.stat().st_size != size:
+        return False
+    if md5:
+        return md5_of(target) == md5
+    return True
 
 
 def log_skip(date: str, files: list) -> None:
