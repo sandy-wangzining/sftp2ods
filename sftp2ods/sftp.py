@@ -178,7 +178,7 @@ class SftpSource:
                 message += (
                     f"；本工具默认校验主机指纹（防中间人），请先运行："
                     f"ssh-keyscan -p {self.port} {self.host} >> ~/.ssh/known_hosts"
-                    f"（确实要跳过校验可在 sftp 块加 \"host_key\": \"auto_accept\"）"
+                    f'（确实要跳过校验可在 sftp 块加 "host_key": "auto_accept"）'
                 )
             raise RuntimeError(f"SFTP 连接失败：{type(exc).__name__}: {message}")
         except OSError as exc:
