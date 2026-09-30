@@ -200,11 +200,25 @@ class TestSyncRanges(CliTestCase):
 
 
 class TestSyncGuards(CliTestCase):
-    def test_missing_file_alerts_and_aborts(self):
+    def test_missing_file_warns_and_continues(self):
+        # 缺文件只告警不失败（源方节假日/停产出是常态）：rc=0、不写缺失日期、飞书告警一次
         files = {"/data/report_20260920.csv": report([["o1", "1.00"]])}
         with World(self.tmp, files=files) as world:
-            self.assertEqual(world.sync(bizdate="20260921"), 1)
+            self.assertEqual(world.sync(bizdate="20260921"), 0)
             self.assertEqual(world.table.deleted, [])
+            self.assertEqual(len(world.notify_calls), 1)
+            self.assertIn("缺失", world.notify_calls[0]["title"])
+            self.assertIn("20260921", "\n".join(world.notify_calls[0]["lines"]))
+
+    def test_missing_file_writes_existing_dates_anyway(self):
+        # 缺 20260921，但 20 与 22 的文件要照常写入（下游任务不受影响）
+        files = {
+            "/data/report_20260920.csv": report([["o1", "1.00"]]),
+            "/data/report_20260922.csv": report([["o2", "2.00"]]),
+        }
+        with World(self.tmp, files=files) as world:
+            self.assertEqual(world.sync(), 0)
+            self.assertEqual(sorted(world.table.deleted), ["pt=20260920", "pt=20260922"])
             self.assertEqual(len(world.notify_calls), 1)
             self.assertIn("缺失", world.notify_calls[0]["title"])
             self.assertIn("20260921", "\n".join(world.notify_calls[0]["lines"]))
