@@ -289,8 +289,12 @@ class ParseSpec:
         self.footer_sum_indexes = [i for i, col in enumerate(self.columns) if col.name.lower() in sum_names]
 
     # ---------------------------------------------------------------- 表头
-    def map_header(self, header_row: list[str], filename: str) -> tuple[list[int], int]:
-        """建「规范化列名 → 下标」映射 → 每列下标（缺失 = -1），顺带校验必需列头。"""
+    def map_header(self, header_row: list[str], filename: str, stats: dict | None = None) -> tuple[list[int], int]:
+        """建「规范化列名 → 下标」映射 → 每列下标（缺失 = -1），顺带校验必需列头。
+
+        stats 传入时记录「源表头里未配置的新增列」（extra_headers）：新增列不报错、
+        照常入库（忽略其值），由 CLI 汇总发一次提醒；缺必需列仍然报错（防写错位）。
+        """
         hmap: dict[str, int] = {}
         for index, cell in enumerate(header_row):
             key = norm(cell)
@@ -320,6 +324,11 @@ class ParseSpec:
                 f"{filename} 缺少第一列（{self.columns[0].header!r}），无法识别合计行；"
                 f"parse.footer 开启时第一列必须存在"
             )
+        if stats is not None:
+            known = {norm(col.header) for col in self.columns}
+            extras = [name.strip() for name in header_row if norm(name) not in known]
+            if extras:
+                stats["extra_headers"] = extras
         return pos, len(header_row)
 
     # ---------------------------------------------------------------- 取值
@@ -388,7 +397,7 @@ class ParseSpec:
                         continue  # 空行跳过
                     content = True
                     if header_pos is None:
-                        header_pos, header_len = self.map_header(row, path.name)
+                        header_pos, header_len = self.map_header(row, path.name, stats)
                         continue
                     if len(row) > header_len:
                         raise RuntimeError(

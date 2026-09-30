@@ -457,6 +457,30 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
     # ---- ③ 逐日期：跳过已上传 → 下载 → 解析 → 写 pt → 校验 ----
     allow_empty = as_bool(target_cfg.get("allow_empty"), default=True, field="target.allow_empty")
     uploaded = skipped = total_rows = 0
+
+    # 源表头新增列：忽略其值、照常入库，但发飞书提醒（人工决定是否加列入库/改配置）。
+    # 每批新列名最多提醒一次；重复文件名不再重复通知。
+    drift_columns: set[str] = set()
+
+    def note_extra_headers(file_name: str, extras: list[str]) -> None:
+        new_cols = [name for name in extras if name not in drift_columns]
+        if not new_cols:
+            return
+        drift_columns.update(extras)
+        log(f"  ⚠️ {file_name} 表头出现未配置的新增列：{'、'.join(new_cols)}（本次忽略其值、照常入库）")
+        notifier(
+            f"{job_name}：源文件出现新增列",
+            [
+                f"**新增列**：{'、'.join(f'`{name}`' for name in new_cols)}",
+                f"**文件**：{file_name}",
+                "本次已忽略新增列、其余数据照常入库。如需入库，请手动处理：",
+                "① ODS 表加列（`ALTER TABLE ... ADD COLUMNS ...`）；",
+                '② 作业 `parse.columns` 补列定义（历史文件可能没有该列时加 `"required": false`）；',
+                "③ 补跑受影响日期（`--force` 或 `--start-date` / `--end-date`）。",
+            ],
+            footer,
+        )
+
     for date in proc_dates:
         items = files_by_date[date]
 
@@ -501,6 +525,9 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
                 file_rows[path.name] = sum(1 for _ in parse_spec.iter_rows(path, stats))
                 if stats["skipped"]:
                     log(f"  {path.name}：跳过 {stats['skipped']} 行（命中 skip_if_empty 的空键行）")
+                extras = stats.get("extra_headers") or []
+                if extras:
+                    note_extra_headers(path.name, extras)
         except SystemExit:
             raise
         except Exception as exc:  # noqa: BLE001

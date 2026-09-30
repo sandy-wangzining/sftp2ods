@@ -235,6 +235,24 @@ class TestHeaderMapping(SpecTestCase):
         s = spec(COLUMNS, on_missing_header="warn")
         self.assertEqual(self.rows_of(path, s), [["o1", None, 3, 0.5]])
 
+    def test_extra_source_headers_recorded_and_ignored(self):
+        path = self.make_file(
+            "a.csv",
+            csv_bytes(
+                ["Order ID", "Settlement amount", "Count", "Rate", "New column", "Another"],
+                [["o1", "1.5", "3", "0.25", "x", "y"]],
+            ),
+        )
+        stats = {"skipped": 0}
+        self.assertEqual(self.rows_of(path, spec(COLUMNS), stats), [["o1", decimal.Decimal("1.5"), 3, 0.25]])
+        self.assertEqual(stats["extra_headers"], ["New column", "Another"])
+
+    def test_no_extra_headers_entry_when_all_mapped(self):
+        path = self.make_file("a.csv", csv_bytes([c["header"] for c in COLUMNS], [["o1", "1.5", "3", "0.25"]]))
+        stats = {"skipped": 0}
+        self.rows_of(path, spec(COLUMNS), stats)
+        self.assertNotIn("extra_headers", stats)
+
     def test_duplicate_file_header_errors(self):
         path = self.make_file("a.csv", csv_bytes(["Order ID", "Order ID"], [["1", "2"]]))
         with self.assertRaises(RuntimeError):
