@@ -36,7 +36,17 @@ JOB_KEYS = {
     "missing",
     "notify",
 }
-SFTP_KEYS = {"host", "port", "username", "auth", "connect_timeout", "io_timeout", "retry_times", "retry_delay", "host_key"}
+SFTP_KEYS = {
+    "host",
+    "port",
+    "username",
+    "auth",
+    "connect_timeout",
+    "io_timeout",
+    "retry_times",
+    "retry_delay",
+    "host_key",
+}
 SFTP_AUTH_KEYS = {"type", "password", "key_file", "passphrase"}
 SOURCE_KEYS = {"root", "layout", "file_regex", "date_dir_regex", "download_dir"}
 TARGET_KEYS = {"project", "table", "comment", "stored_as", "lifecycle_days", "allow_empty", "profile"}
