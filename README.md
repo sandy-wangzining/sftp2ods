@@ -85,12 +85,12 @@ SFTP（按天文件）
   │  ② 缺文件核对：核对区间内每天必须至少一个文件；缺了 → 飞书告警 + 跳过缺失日期（照常同步已有文件）
   ▼
 逐日期处理：
-  │  ③ 台账命中（本地文件大小一致 + 台账记录表/pt 一致）→ 跳过；否则下载（.part → 核大小 → 改名）
+  │  ③ 台账命中（本地文件大小一致 + 台账记录表/pt 一致；新台账还带 md5 校验内容）→ 跳过；否则下载（.part → 核大小 → 改名）
   │  ④ 先完整解析一遍数行数：表头校验、列数校验、类型转换、合计行金额核对（坏文件在写库前倒下）
   ▼
 MaxCompute：宽表 + pt 分区
   │  ⑤ 自动建表/校验结构 → delete_partition → Tunnel 分批写入（每批 500 行）→ count(*) 复核
-  │  ⑥ 全部通过才写台账（表/pt/大小/行数）——失败中断后重跑会自动重试那个日期
+  │  ⑥ 全部通过才写台账（表/pt/大小/行数/md5）——失败中断后重跑会自动重试那个日期
   ▼
 DWD 层：按业务口径加工/引用
 ```
@@ -129,9 +129,10 @@ DWD 层：按业务口径加工/引用
 | `auth.type` | password | `password`（配 `password`）/ `key`（配 `key_file`，可选 `passphrase`，`~` 会展开） |
 | `connect_timeout` / `io_timeout` | 30 / 600 | 连接/通道超时（秒） |
 | `retry_times` / `retry_delay` | 3 / 10 | 列目录/下载失败后的重试次数与首次冷却（指数退避）；认证失败不重试 |
+| `host_key` | - | 主机指纹校验：不写 = **严格校验**（只认 `~/.ssh/known_hosts` 里记录过的主机，防中间人；未知主机报错并提示 `ssh-keyscan -p <port> <host> >> ~/.ssh/known_hosts`）；`"auto_accept"` = 显式降级为不校验（等价 `StrictHostKeyChecking=no`） |
 
-> 主机密钥不校验（等价 `StrictHostKeyChecking=no`），与两个结算脚本口径一致；
-> 需要校验 known_hosts 的场景请提 Issue。
+> 首次接入新源：先跑一次 `ssh-keyscan -p <port> <host> >> ~/.ssh/known_hosts` 登记指纹，
+> 然后按默认（严格）运行即可。已登记的指纹变了（服务器重建）会报错，重新 keyscan 即可。
 
 ### source（远端文件规则）
 

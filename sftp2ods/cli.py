@@ -233,16 +233,19 @@ def _local_candidates(download_dir: Path, item, *, allow_legacy: bool = False) -
     return paths
 
 
-def _pick_local(download_dir: Path, item, *, allow_legacy: bool = False) -> Path | None:
+def _pick_local(download_dir: Path, item, *, allow_legacy: bool = False, md5: str = "") -> Path | None:
     """本地已有的、大小一致的文件路径（没有返回 None）。
 
     allow_legacy 只给「判定已上传」用：旧脚本把文件平铺下载在 download_dir 下、台账键
     是文件名，只有台账明确记着"这个键属于这一天"时才敢认那个平铺文件。
     **下载与写库路径必须用默认值**：平铺目录里的同名文件可能属于别的日期
     （文件名不含日期时尤其如此），大小恰好相同就会被静默当成本日数据写进库。
+
+    md5 给定时（台账里有）同时校验内容：本地文件被误改/损坏但大小没变时，
+    跳过判断会误判"已上传"、分区永远缺这份数据——md5 兜住这类静默损坏。
     """
     for candidate in _local_candidates(download_dir, item, allow_legacy=allow_legacy):
-        if state_mod.local_ready(candidate, item.size):
+        if state_mod.local_ready(candidate, item.size, md5=md5):
             return candidate
     return None
 
@@ -495,10 +498,12 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
 
             allow_legacy=True：允许回退到旧脚本的平铺文件——台账已经证明那个键属于这一天，
             跳过是安全的；下载阶段绝不会这么认（见 _pick_local）。
+            台账里有 md5 时同时校验内容：本地文件被误改/损坏但大小没变也能发现。
             """
             keys = (item.ledger_key,) if item.ledger_key == item.name else (item.ledger_key, item.name)
-            return state_mod.record_of(ledger, keys, item.size, table_name, date, project=project) and _pick_local(
-                download_dir, item, allow_legacy=True
+            record = state_mod.record_of(ledger, keys, item.size, table_name, date, project=project)
+            return bool(record) and _pick_local(
+                download_dir, item, allow_legacy=True, md5=str((record or {}).get("md5") or "")
             )
 
         if not args.force and all(done(item) for item in items):
@@ -580,13 +585,16 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
             log(f"❌ {date} 写后校验不一致：写入 {rows:,}，查询 {verified:,}")
             return 1
         # 写入并校验成功后才记台账（失败中断后重跑会重试这个日期）
-        for item in items:
+        # 台账带 md5：下次运行时跳过判断会校验本地文件内容（防误改/静默损坏），
+        # 旧台账没有 md5 字段时按只比大小兼容处理（见 state.local_ready）
+        for item, path in zip(items, local_paths):
             ledger[item.ledger_key] = {
                 "project": project,
                 "table": table_name,
                 "pt": date,
                 "size": item.size,
                 "rows": file_rows[item.name],
+                "md5": state_mod.md5_of(path),
             }
         try:
             state_mod.save_state(ledger_path, ledger)

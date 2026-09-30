@@ -3,6 +3,23 @@
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)；格式参考
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [1.3.0] - 2026-09-30
+
+### 安全
+
+- **SFTP 主机指纹默认严格校验**（防中间人）：只认 `~/.ssh/known_hosts` 里记录过的主机；
+  未知主机报错并提示 `ssh-keyscan -p <port> <host> >> ~/.ssh/known_hosts` 登记。
+  新增 `sftp.host_key: "auto_accept"` 显式降级为旧行为（不校验，等价
+  `StrictHostKeyChecking=no`）。已把 clink/waffo 两个源的主机指纹登记进
+  wangzining 与 work 两个用户的 known_hosts，真实 --check 验证严格模式连接正常。
+
+### 修复
+
+- **台账新增 md5 字段**：写入成功后把本地文件的 md5 记进台账，下次运行的跳过判断
+  在"大小一致"之外再校验内容——本地文件被误改/损坏但大小没变时不再被静默跳过
+  （旧逻辑只比大小，会误判"已上传"、分区永远缺这份数据）。旧台账没有 md5 字段时
+  退回只比大小，兼容迁移前的记录。
+
 ## [1.2.0] - 2026-09-30
 
 ### 变更（行为调整）
