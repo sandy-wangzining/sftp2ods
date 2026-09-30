@@ -325,6 +325,45 @@ class TestSyncGuards(CliTestCase):
             self.assertNotIn("secret-pw", joined)
 
 
+class TestSyncNewColumns(CliTestCase):
+    """源文件表头新增列：不报错、照常入库，发飞书提醒（人工决定是否加列）。"""
+
+    def test_extra_columns_ingest_and_notify(self):
+        data = csv_bytes(HEADERS + ["Note"], [["o1", "1.50", "hello"]])
+        with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
+            self.assertEqual(world.sync(bizdate="20260920"), 0)
+            self.assertEqual([r[0] for r in world.table.rows_in("20260920")], ["o1"])
+            alerts = [c for c in world.notify_calls if "新增列" in c["title"]]
+            self.assertEqual(len(alerts), 1)
+            joined = "\n".join(alerts[0]["lines"])
+            self.assertIn("Note", joined)
+            self.assertIn("report_20260920.csv", joined)
+            self.assertTrue(any("新增列" in str(line) for line in world.access_logs))
+
+    def test_extra_columns_notify_once_per_column_set(self):
+        job = minimal_job(
+            source={"root": "/data", "layout": "flat", "file_regex": "report_(?P<date>\\d{8})(?:_\\d)?\\.csv"}
+        )
+        files = {
+            "/data/report_20260920.csv": csv_bytes(HEADERS + ["Note"], [["o1", "1.00", "x"]]),
+            "/data/report_20260920_2.csv": csv_bytes(HEADERS + ["Note"], [["o2", "2.00", "y"]]),
+        }
+        with World(self.tmp, job=job, files=files) as world:
+            self.assertEqual(world.sync(bizdate="20260920"), 0)
+            self.assertEqual(len(world.table.rows_in("20260920")), 2)
+            alerts = [c for c in world.notify_calls if "新增列" in c["title"]]
+            self.assertEqual(len(alerts), 1, "同一批新列名只应提醒一次")
+
+    def test_extra_columns_no_notify_flag(self):
+        data = csv_bytes(HEADERS + ["Note"], [["o1", "1.50", "hello"]])
+        with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
+            self.assertEqual(world.sync(bizdate="20260920", no_notify=True), 0)
+            self.assertEqual(len(world.table.rows_in("20260920")), 1)
+            alerts = [c for c in world.notify_calls if "新增列" in c["title"]]
+            self.assertEqual(len(alerts), 1)
+            self.assertFalse(alerts[0]["enabled"], "--no-notify 时应为关闭状态")
+
+
 class TestSyncLedgerCompat(CliTestCase):
     def test_date_dir_legacy_flat_file_and_ledger_skips(self):
         job = minimal_job()

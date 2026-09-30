@@ -61,7 +61,10 @@
       { "header": "Tax currency", "name": "tax_currency", "type": "string", "comment": "Tax currency（税币种）" },
       { "header": "Tax exchange rate", "name": "tax_exchange_rate", "type": "string", "comment": "Tax exchange rate（汇率原文）" },
       { "header": "Payout batch number", "name": "payout_batch_number", "type": "string", "comment": "Payout batch number（打款批次号）" },
-      { "header": "Description", "name": "description", "type": "string", "comment": "Description（备注）" }
+      { "header": "Description", "name": "description", "type": "string", "comment": "Description（备注）" },
+      { "header": "Order status", "name": "order_status", "type": "string", "comment": "Order status（订单状态，如 Success，20260929 起新增）", "required": false },
+      { "header": "Customer ID", "name": "customer_id", "type": "string", "comment": "Customer ID（Clink 客户号，20260929 起新增，可能为空）", "required": false },
+      { "header": "IP country", "name": "ip_country", "type": "string", "comment": "IP country（IP 国家，20260929 起新增，可能为空）", "required": false }
     ]
   },
   "target": {
