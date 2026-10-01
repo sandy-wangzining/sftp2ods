@@ -1,5 +1,5 @@
 {
-  "//说明": "Waffo 结算明细（SFTP settlements/{结算日期}/settlement_details_*.csv）→ sitindw.ods_waffo_settlement_details_di；等价于旧脚本 waffo_settlement_sync/waffo_settlement_sync.py",
+  "//说明": "Waffo 结算明细（SFTP settlements/{结算日期}/settlement_details_*.csv）→ my_project.ods_waffo_settlement_details_di；等价于旧脚本 waffo_settlement_sync/waffo_settlement_sync.py",
   "job": "waffo_settlement",
   "description": "Waffo 结算明细（SFTP）→ ods_waffo_settlement_details_di（pt=结算文件日期）",
   "secrets": {
@@ -7,7 +7,7 @@
     "feishu_webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/xxx"
   },
   "maxcompute": {
-    "project": "sitindw",
+    "project": "my_project",
     "endpoint": "http://service.us-west-1.maxcompute.aliyun.com/api",
     "access_key_id": "<阿里云 AK>",
     "access_key_secret": "<阿里云 SK>"
@@ -68,7 +68,7 @@
     ]
   },
   "target": {
-    "project": "sitindw",
+    "project": "my_project",
     "table": "ods_waffo_settlement_details_di",
     "comment": "Waffo 结算明细文件（SFTP settlement_details CSV 列展开，pt=结算文件日期）"
   },

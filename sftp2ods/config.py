@@ -527,5 +527,5 @@ def build_job_summary(job: dict) -> list[str]:
         f"  解析      : {len(columns)} 列（其中金额/小数列 {amount_count} 个）"
         f"，encoding={parse_cfg.get('encoding') or 'utf-8-sig'}，delimiter={parse_cfg.get('delimiter') or 'auto'}",
         f"  目标      : pt=文件日期（每个日期一个分区），allow_empty={target.get('allow_empty', True)}",
-        f"  缺文件检查: {'开' if missing.get('check', True) else '关'}（预期最新 = {window}）",
+        f"  缺文件核对: {'开' if missing.get('check', True) else '关'}（预期最新 = {window}）",
     ]
