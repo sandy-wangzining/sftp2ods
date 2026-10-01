@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import hashlib
 import os
 import sys
@@ -392,6 +393,31 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
     expected = expected_latest(tz, str(missing_cfg.get("grace") or "")) if check_missing else ""
     all_dates = sorted(files_by_date)
     missing, proc_dates, range_start, range_end = plan_dates(all_dates, bizdate, start, end, expected, check_missing)
+
+    # 显式点名单日（--bizdate 或调度环境变量 bizdate）却整天一个文件都没有 → 必须失败。
+    # 与下面「缺文件只告警」不同：那些场景（不传业务日=处理远端全部日期、补数区间内缺某天）
+    # 缺的是"众多日期中的某几天"，跳过它们照常同步已有文件是 1.2.0 的有意设计；
+    # 而这里是"调用方点名要的那一天整天没有"，继续 rc=0 会让调度以为成功、pt=<bizdate>
+    # 分区却根本不存在——飞书告警一旦被忽略就是静默缺数，与本家族"宁可失败不可静默丢数"冲突。
+    # --force 是"我知道这天可能没数、别拦我"的显式放行开关（与写空分区保护一致）。
+    if bizdate and check_missing and bizdate in missing and not args.force:
+        log(
+            f"❌ 【{job_name}】业务日 {bizdate} 在远端没有任何匹配文件：pt={bizdate} 分区不会产生"
+            f"（远端数据范围 {min(all_dates)} ~ {max(all_dates)}）。"
+            f"若源方当天确实不产数（如停产出），请用 missing.check=false 跳过核对，或加 --force 明确继续"
+        )
+        notifier(
+            f"{job_name}：业务日 {bizdate} 远端无文件",
+            [
+                f"**业务日**：{bizdate}",
+                f"**远端数据范围**：{min(all_dates)} ~ {max(all_dates)}",
+                "该业务日在远端没有任何匹配文件，本次以失败退出（未写任何分区）。",
+                "若源方当天确实不产数，请用 `missing.check: false` 或 `--force` 表达继续意图。",
+            ],
+            footer,
+        )
+        return 1
+
     if missing:
         # 缺文件只告警、不失败：源方产数是人/上游系统排期（节假日、结算方停产出是常态），
         # 缺几天不等于任务失败——跳过缺失日期、照常同步已有的文件（缺失日期后面补产
@@ -639,8 +665,20 @@ def main(argv: list[str] | None = None) -> int:
             log(prompt)
             return input()
 
+        def _wizard_ask_secret(prompt: str = "") -> str:
+            """密钥类提问：问题同样走 log（留痕），回答走 getpass 不回显。
+
+            不回显是为了密钥不进终端 scrollback，也不被 `script` / 录屏抄走——原来走
+            input() 时密钥明文回显在终端上。无 tty 等读不到隐藏输入的场景退回 input()。
+            """
+            log(prompt)
+            try:
+                return getpass.getpass("")
+            except Exception:  # noqa: BLE001 - 没有 tty 等场景退回普通输入
+                return input()
+
         try:
-            return run_init(args.init_out, ask=_wizard_ask, echo=log)
+            return run_init(args.init_out, ask=_wizard_ask, echo=log, ask_secret=_wizard_ask_secret)
         finally:
             _detach_log_sink(log_handle)
 

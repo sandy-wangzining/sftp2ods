@@ -29,6 +29,7 @@ from _helpers import (  # noqa: E402
 from sftp2ods import cli as cli_mod  # noqa: E402
 from sftp2ods import config  # noqa: E402
 from sftp2ods import mc as mc_mod  # noqa: E402
+from sftp2ods import parse as parse_mod  # noqa: E402
 from sftp2ods import sftp as sftp_mod  # noqa: E402
 from sftp2ods import state as state_mod  # noqa: E402
 from sftp2ods.utils import FatalSourceError, RunLock, collect_secret_values, redact_secrets  # noqa: E402
@@ -200,15 +201,58 @@ class TestSyncRanges(CliTestCase):
 
 
 class TestSyncGuards(CliTestCase):
-    def test_missing_file_warns_and_continues(self):
-        # 缺文件只告警不失败（源方节假日/停产出是常态）：rc=0、不写缺失日期、飞书告警一次
+    def test_missing_single_bizdate_fails_and_alerts(self):
+        # ①显式点名单日（--bizdate）而该日无文件：必须失败（rc=1），不能静默 rc=0 让调度以为成功。
+        #   原用例（本方法的前身 test_missing_file_warns_and_continues）断言 rc=0，是 1.2.0 旧语义；
+        #   单日边界已改为失败（见 CHANGELOG 1.4.0），故此处改为断言新行为。
         files = {"/data/report_20260920.csv": report([["o1", "1.00"]])}
         with World(self.tmp, files=files) as world:
-            self.assertEqual(world.sync(bizdate="20260921"), 0)
+            self.assertEqual(world.sync(bizdate="20260921"), 1)
             self.assertEqual(world.table.deleted, [])
+            joined = "\n".join(str(line) for line in world.access_logs)
+            self.assertIn("20260921", joined)
+            self.assertEqual(len(world.notify_calls), 1)
+            self.assertIn("20260921", world.notify_calls[0]["title"])
+
+    def test_missing_single_bizdate_force_still_continues(self):
+        # --force 是"我知道这天可能没数"的显式放行：单日缺失也不再失败（rc=0，仅告警）。
+        files = {"/data/report_20260920.csv": report([["o1", "1.00"]])}
+        with World(self.tmp, files=files) as world:
+            self.assertEqual(world.sync(bizdate="20260921", force=True), 0)
+            self.assertEqual(world.table.deleted, [])
+            self.assertTrue(any("缺少文件" in str(line) for line in world.access_logs))
+
+    def test_missing_without_bizdate_still_warns(self):
+        # ②不传业务日（处理远端全部日期）时缺某天：仍只告警不失败（回归，防改坏 1.2.0 原设计）。
+        files = {
+            "/data/report_20260920.csv": report([["o1", "1.00"]]),
+            "/data/report_20260922.csv": report([["o2", "2.00"]]),
+        }
+        with World(self.tmp, files=files) as world:
+            self.assertEqual(world.sync(), 0)
             self.assertEqual(len(world.notify_calls), 1)
             self.assertIn("缺失", world.notify_calls[0]["title"])
             self.assertIn("20260921", "\n".join(world.notify_calls[0]["lines"]))
+
+    def test_missing_in_range_still_warns(self):
+        # ③补数区间内缺某天：仍只告警、照常同步区间内已有文件（rc=0）。
+        files = {
+            "/data/report_20260920.csv": report([["o1", "1.00"]]),
+            "/data/report_20260922.csv": report([["o2", "2.00"]]),
+        }
+        with World(self.tmp, files=files) as world:
+            self.assertEqual(world.sync(start_date="2026-09-20", end_date="2026-09-22"), 0)
+            self.assertEqual(sorted(world.table.deleted), ["pt=20260920", "pt=20260922"])
+            self.assertEqual(len(world.notify_calls), 1)
+            self.assertIn("20260921", "\n".join(world.notify_calls[0]["lines"]))
+
+    def test_missing_check_false_with_single_bizdate_still_warns(self):
+        # missing.check=false 时不做核对：即使单日无文件也保持原行为（只提示、rc=0）。
+        job = minimal_job()
+        job["missing"] = {"check": False}
+        with World(self.tmp, job=job, files={"/data/report_20260920.csv": report([["o1", "1.00"]])}) as world:
+            self.assertEqual(world.sync(bizdate="20260921"), 0)
+            self.assertTrue(any("没有要处理的日期" in str(line) for line in world.access_logs))
 
     def test_missing_file_writes_existing_dates_anyway(self):
         # 缺 20260921，但 20 与 22 的文件要照常写入（下游任务不受影响）
@@ -464,6 +508,69 @@ class TestSyncConnectionErrors(CliTestCase):
             self.assertIn("***", joined)
 
 
+class TestSyncInterrupt(CliTestCase):
+    """同步主路径的 Ctrl+C 契约（README 承诺中断 → 退出码 130）。
+
+    此前只有向导（--init）路径验证过 130，run_sync 主路径没有任何用例；api2ods / feishu2ods
+    都逐码验证过 130，sftp2ods 是唯一缺口。这里用 mock 离线打断，不连真实 SFTP/MaxCompute。
+    """
+
+    def test_keyboard_interrupt_during_download_returns_130_and_writes_nothing(self):
+        """下载阶段被 Ctrl+C（最常见的中断点，发生在写库之前）：rc=130 且没有任何写库动作。
+
+        130 的核心语义是"中断不能写坏分区"——下载/解析都在写库前，所以此刻必须完全没碰库。
+        """
+        data = report([["o1", "1.00"]])
+        with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
+
+            def boom(self, item, local_path):
+                raise KeyboardInterrupt
+
+            with mock.patch.object(sftp_mod.SftpSource, "download", boom):
+                rc = cli_mod.main(["--job", str(world.job_path), "--bizdate", "20260920"])
+            self.assertEqual(rc, 130)
+            self.assertEqual(world.table.deleted, [], "中断前不应有任何删分区动作")
+            self.assertEqual(world.table.written, {}, "中断前不应写入任何分区")
+            self.assertFalse((world.download_dir / state_mod.STATE_FILE_NAME).exists(), "中断不应落台账")
+            self.assertTrue(any("已中断" in str(line) for line in world.access_logs))
+
+    def test_keyboard_interrupt_during_parse_returns_130_and_writes_nothing(self):
+        """下载完、解析阶段被 Ctrl+C：仍在写库之前，rc=130 且没有任何写库动作。"""
+        data = report([["o1", "1.00"]])
+        with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
+
+            def boom(self, path, stats=None):
+                raise KeyboardInterrupt
+
+            with mock.patch.object(parse_mod.ParseSpec, "iter_rows", boom):
+                rc = cli_mod.main(["--job", str(world.job_path), "--bizdate", "20260920"])
+            self.assertEqual(rc, 130)
+            self.assertEqual(world.table.deleted, [])
+            self.assertEqual(world.table.written, {})
+
+    def test_keyboard_interrupt_during_write_returns_130(self):
+        """写入阶段（先删再填）被 Ctrl+C：rc=130；此刻分区已被删、可能留下空/半截分区。
+
+        这是现有真实行为——README「行为与保护」第 10 条：写入阶段中断的分区可能不完整，
+        重跑同一命令会从头覆盖、幂等自愈。本用例只把真实行为钉死，不改变实现。
+        """
+        data = report([["o1", "1.00"]])
+        with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
+            calls = {"n": 0}
+            real_iter_batches = parse_mod.iter_batches
+
+            def counting(paths, spec):
+                calls["n"] += 1
+                if calls["n"] >= 2:  # 第 1 次是写前单格大小检查；第 2 次才是真正写库
+                    raise KeyboardInterrupt
+                return real_iter_batches(paths, spec)
+
+            with mock.patch.object(parse_mod, "iter_batches", counting):
+                rc = cli_mod.main(["--job", str(world.job_path), "--bizdate", "20260920"])
+            self.assertEqual(rc, 130)
+            self.assertIn("pt=20260920", world.table.deleted, "中断前已执行删分区（先删再填不可逆）")
+
+
 class TestCheck(CliTestCase):
     def test_check_ok(self):
         data = report([["o1", "1.00"]])
@@ -539,6 +646,15 @@ class TestMainEntry(CliTestCase):
             with mock.patch.dict("os.environ", {"bizdate": "20260920"}, clear=False):
                 rc = cli_mod.main(["--job", str(world.job_path)])
             self.assertEqual(rc, 0)
+
+    def test_env_bizdate_missing_day_returns_1(self):
+        # 调度（DataWorks）用环境变量 bizdate 点名某天、而该天无文件：与 --bizdate 同样失败（rc=1）。
+        # 这正是 F6 要防的"静默缺数"场景——调度看到 rc=0 会以为 pt=<bizdate> 已产出，其实没有。
+        files = {"/data/report_20260920.csv": report([["o1", "1.00"]])}
+        with World(self.tmp, files=files) as world:
+            with mock.patch.dict("os.environ", {"bizdate": "20260921"}, clear=False):
+                rc = cli_mod.main(["--job", str(world.job_path)])
+            self.assertEqual(rc, 1)
 
     def test_env_bizdate_invalid_returns_1(self):
         with World(self.tmp) as world:

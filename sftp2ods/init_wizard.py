@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import getpass
 import json
 import os
 import re
@@ -39,6 +40,18 @@ def _ask(ask, prompt: str, default: str = "") -> str:
     hint = f"（默认 {default}）" if default else ""
     answer = str(ask(f"{prompt}{hint}：") or "").strip()
     return answer or default
+
+
+def _default_ask_secret(prompt: str = "") -> str:
+    """密钥类输入：走 getpass 不回显（终端 scrollback / 录屏 / `script` 录制都拿不到明文）。
+
+    环境不支持隐藏输入（无 tty 等）时退回普通 input——不能因为读不到密钥就让向导不可用；
+    与 feishu2ods.host_key 同口径。
+    """
+    try:
+        return getpass.getpass(prompt)
+    except Exception:  # noqa: BLE001 - 没有 tty 等场景退回普通输入
+        return input(prompt)
 
 
 def _ask_choice(ask, prompt: str, choices: tuple, default: str = "0", echo=print) -> str:
@@ -200,12 +213,14 @@ def _collect_sample_headers(ask, echo, sftp_cfg: dict, source_cfg: dict) -> list
     return None
 
 
-def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = None) -> int:
+def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = None, ask_secret=None) -> int:
     """交互式生成作业配置，返回退出码（0 成功 / 1 取消）。
 
     默认输出到「当前目录/jobs/<作业名>.json」——无论是在源码目录还是 pip 安装后运行都合理。
+    ask_secret(prompt) -> str：密钥类输入默认用 getpass（不回显）；单元测试可注入假实现（离线跑）。
     """
     root = Path(workdir) if workdir else Path.cwd()
+    ask_secret = ask_secret or _default_ask_secret
     try:
         echo("=== sftp2ods 配置向导（直接回车用默认值；随时 Ctrl+C 取消）===")
         echo("")
@@ -234,14 +249,14 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         auth: dict = {}
         if auth_choice == "2":
             key_file = _ask(ask, "   私钥文件路径", "~/.ssh/id_rsa")
-            passphrase = _ask(ask, "   私钥口令（没有就留空）")
+            passphrase = _ask(ask_secret, "   私钥口令（没有就留空，输入不回显）")
             auth = {"type": "key", "key_file": key_file}
             if passphrase:
                 auth["passphrase"] = passphrase
         else:
             if auth_choice != "1":
                 echo(f"   编号 {auth_choice} 不是有效选项，按「密码」继续。")
-            password = _ask(ask, "   密码")
+            password = _ask(ask_secret, "   密码（输入不回显）")
             auth = {"type": "password", "password": password}
         sftp_cfg = {"host": host, "port": port, "username": username, "auth": auth}
 
@@ -325,11 +340,12 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         # ---------------------------------------------------------- ⑦ 告警与目标表
         echo("")
         echo("=== 告警与 MaxCompute 目标 ===")
-        webhook = _ask(ask, "⑨ 飞书告警 webhook（可留空）")
+        # webhook 是凭证（拿到就能往群里发消息），按密钥类处理、不回显
+        webhook = _ask(ask_secret, "⑨ 飞书告警 webhook（可留空，输入不回显）")
         project = _ask(ask, "⑩ MaxCompute 项目名", "my_project")
         table = _ask(ask, "   目标表名（建议 <层级>_<业务域>_<过程>_di）", f"ods_{job_name}_di")
         ak = _ask(ask, "   阿里云 AccessKeyId")
-        sk = _ask(ask, "   阿里云 AccessKeySecret")
+        sk = _ask(ask_secret, "   阿里云 AccessKeySecret（输入不回显）")
         endpoint = _ask(ask, "   endpoint", DEFAULT_ENDPOINT)
 
         # ---------------------------------------------------------- ⑧ 组装并写出

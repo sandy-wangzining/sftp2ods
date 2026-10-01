@@ -138,6 +138,10 @@ class SftpSource:
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         else:
             ssh.load_system_host_keys()
+            # 显式拒绝未知主机指纹：不能让"默认严格"依赖 paramiko 的隐式默认策略——
+            # 将来 paramiko 改默认值或重构时会静默降级为不校验主机指纹（中间人风险），
+            # 把"严格"写死在代码里，行为可预期。
+            ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
         kwargs = dict(
             hostname=self.host,
             port=self.port,

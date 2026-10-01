@@ -7,7 +7,9 @@ import argparse
 import csv
 import errno
 import io
+import shutil
 import stat
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -24,6 +26,15 @@ class OfflineTestCase(unittest.TestCase):
         patcher = mock.patch.object(time, "sleep", lambda *_args, **_kwargs: None)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # 运行锁默认落在仓库根的 .run-locks/：单测用的临时作业路径每次哈希都不同，
+        # 锁文件会无限累积（生产行为不变，这里只把锁根目录重定向到临时目录并在收尾清理）
+        from sftp2ods import cli as cli_mod
+
+        lock_root = tempfile.mkdtemp(prefix="sftp2ods-test-locks-")
+        self.addCleanup(shutil.rmtree, lock_root, ignore_errors=True)
+        lock_patcher = mock.patch.object(cli_mod, "ROOT", Path(lock_root))
+        lock_patcher.start()
+        self.addCleanup(lock_patcher.stop)
 
 
 def make_args(**overrides):
