@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import errno
+import os
 import stat
 import sys
 import tempfile
@@ -449,6 +450,39 @@ class TestHostKeyPolicy(TestConnect):
             with self.assertRaises(RuntimeError) as ctx:
                 source._connect()
         self.assertNotIn("ssh-keyscan", str(ctx.exception))
+
+
+class TestLocalPathWithin(OfflineTestCase):
+    """本地落地路径必须在下载目录内：挡 Windows 盘符相对名，但不误伤合法的冒号文件名。"""
+
+    def setUp(self):
+        super().setUp()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name) / "download"
+        self.base.mkdir()
+
+    def test_plain_and_nested_within(self):
+        self.assertEqual(sftp_mod.local_path_within(self.base, "a.csv", "a.csv"), self.base / "a.csv")
+        self.assertEqual(
+            sftp_mod.local_path_within(self.base, "20260920/a.csv", "a.csv"),
+            self.base / "20260920" / "a.csv",
+        )
+
+    def test_colon_name_is_allowed(self):
+        """远端是 POSIX，文件名带 ":" 合法：不能因为冒号就拒绝（Windows 上它仍在下载目录内）。"""
+        key = "report:20260920.csv"
+        self.assertEqual(sftp_mod.local_path_within(self.base, key, key), self.base / key)
+
+    def test_parent_traversal_rejected(self):
+        with self.assertRaises(FatalSourceError):
+            sftp_mod.local_path_within(self.base, "../escape.csv", "escape.csv")
+
+    @unittest.skipUnless(os.name == "nt", "盘符相对名只在 Windows 上会跳出下载目录")
+    def test_windows_drive_relative_rejected(self):
+        for key in ("Z:20260920.csv", "a:b.csv"):
+            with self.assertRaises(FatalSourceError):
+                sftp_mod.local_path_within(self.base, key, key)
 
 
 if __name__ == "__main__":

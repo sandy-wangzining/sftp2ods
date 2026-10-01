@@ -324,7 +324,7 @@ class TestResolveTargetAndDirs(OfflineTestCase):
         job = validated(minimal_job())
         text = "\n".join(config.build_job_summary(job))
         self.assertIn("sftp.example.com", text)
-        self.assertIn("缺文件检查", text)
+        self.assertIn("缺文件核对", text)
 
 
 if __name__ == "__main__":

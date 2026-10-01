@@ -72,7 +72,7 @@ class TestCredentials(OfflineTestCase):
 class TestDdl(OfflineTestCase):
     def build(self, **overrides):
         kwargs = dict(
-            project="sitindw",
+            project="my_project",
             table="ods_demo_di",
             columns=columns(("order_id", "string"), ("amount", "decimal(19,10)")),
             comment="示例表",
@@ -84,7 +84,7 @@ class TestDdl(OfflineTestCase):
 
     def test_basic(self):
         ddl = self.build()
-        self.assertIn("create table if not exists sitindw.ods_demo_di (", ddl)
+        self.assertIn("create table if not exists my_project.ods_demo_di (", ddl)
         self.assertIn("order_id string", ddl)
         self.assertIn("amount decimal(19,10)", ddl)
         self.assertIn("partitioned by (pt string", ddl)
@@ -158,7 +158,7 @@ class TestVerifySchema(OfflineTestCase):
                 return table
 
         o = FakeOdps()
-        got = mc_mod.ensure_target_table(o, "sitindw", "ods_demo_di", columns(("order_id", "string")))
+        got = mc_mod.ensure_target_table(o, "my_project", "ods_demo_di", columns(("order_id", "string")))
         self.assertIs(got, table)
         self.assertIn("create table if not exists", o.sql[0])
 

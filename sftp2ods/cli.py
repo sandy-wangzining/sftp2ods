@@ -2,7 +2,8 @@
 """命令行入口：体检（--check）、试跑（--dry-run）、正式同步、交互式建配置（--init）。
 
 一次运行的完整流程（run_sync）：
-    1) 解析参数 → 列远端文件 → 缺文件核对（缺了飞书告警 + 跳过缺失日期，照常同步已有文件）
+    1) 解析参数 → 列远端文件 → 缺文件核对（缺了飞书告警 + 跳过缺失日期，照常同步已有文件；
+       但显式点名单日（--bizdate/环境变量 bizdate）整天无文件时直接失败，防静默缺数）
     2) 逐日期：跳过已上传 → 下载（.part 校验大小）→ 解析数行数（先全量校验一遍）
     3) 写库：自动建表/校验结构 → 删分区 → Tunnel 分批写入 → count(*) 行数核对
     4) 台账记录每个文件（表/pt/大小/行数），校验通过才落账；失败中断后重跑幂等自愈
@@ -387,6 +388,17 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
         )
         return 1
 
+    # 每个远端文件拼出的本地落地路径必须落在下载目录内：_safe_remote_name 已挡 "/"、"\\"、".."，
+    # 但 Windows 上 "Z:xxx" 这类盘符相对名仍会让 `download_dir / 键` 跳出目录（远端是 POSIX，
+    # 文件名带 ":" 合法，不能一律禁掉）。越界直接失败，绝不把远端内容写到下载目录之外。
+    try:
+        for date_files in files_by_date.values():
+            for item in date_files:
+                sftp_mod.local_path_within(download_dir, item.ledger_key, item.name)
+    except FatalSourceError as exc:
+        log(f"❌ {_redact_job(job, exc)}")
+        return 1
+
     missing_cfg = job.get("missing") or {}
     check_missing = as_bool(missing_cfg.get("check"), default=True, field="missing.check")
     tz = load_zone(str(missing_cfg.get("timezone") or DEFAULT_TZ))
@@ -418,6 +430,32 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
         )
         return 1
 
+    # 下面两条都是"补数区间无产出就失败"，顺序要紧：先判「核对区间为空（下界晚于上界）」，它是
+    # 1.0.1 起就有的分支，且与新分支可能同时成立（如 --end-date 早于远端最早：区间无交集且无可处理
+    # 日期）——先命中它，报错文案与 1.0.1 保持一致。把它提到「缺文件」告警之前也是行为中性的：
+    # range_start > range_end 时 find_missing 恒返回空（missing == []），那条告警本来就不会触发。
+    if check_missing and range_start and range_end and range_start > range_end:
+        # 核对区间为空 = 用户给的日期范围与远端完全没有交集（区间下界晚于数据上界）。
+        # 此时缺文件核对会整个被跳过、也没有任何日期可处理，静默 rc=0 会让"补数日期打错"
+        # 看起来像成功；对齐"宁可失败"的红线，这里明确失败。
+        log(
+            f"❌ 【{job_name}】日期范围与远端没有交集（核对区间为空：{range_start} 晚于 {range_end}）；"
+            f"远端数据范围 {min(all_dates)} ~ {max(all_dates)}，请检查 --start-date/--end-date 是否写错"
+        )
+        return 1
+    if check_missing and (start or end) and not proc_dates and not args.force:
+        # 用户显式点了补数区间（--start-date/--end-date），而远端这段区间一个可处理文件都没有：
+        # 返回 0 会让人以为"补数成功"，比失败更危险（本家族红线：宁可失败不可静默丢数）。
+        # 与 1.4.0「显式单日缺文件 → 失败」同口径，--force 是"我知道这段可能没数"的显式放行开关。
+        # proc_dates 只看"远端有没有文件"，与台账无关——区间内文件都已上传时它是非空、不会误判。
+        log(
+            f"❌ 【{job_name}】补数区间在远端没有任何匹配文件"
+            f"（--start-date {start or '-'}，--end-date {end or '-'}）；"
+            f"远端数据范围 {min(all_dates)} ~ {max(all_dates)}，本区间不会有任何产出。"
+            f"若源方确实不产数、确认要空跑，请加 --force 明确继续"
+        )
+        return 1
+
     if missing:
         # 缺文件只告警、不失败：源方产数是人/上游系统排期（节假日、结算方停产出是常态），
         # 缺几天不等于任务失败——跳过缺失日期、照常同步已有的文件（缺失日期后面补产
@@ -439,15 +477,6 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
             ],
             footer,
         )
-    if check_missing and range_start and range_end and range_start > range_end:
-        # 核对区间为空 = 用户给的日期范围与远端完全没有交集（区间下界晚于数据上界）。
-        # 此时缺文件核对会整个被跳过、也没有任何日期可处理，静默 rc=0 会让"补数日期打错"
-        # 看起来像成功；对齐"宁可失败"的红线，这里明确失败。
-        log(
-            f"❌ 【{job_name}】日期范围与远端没有交集（核对区间为空：{range_start} 晚于 {range_end}）；"
-            f"远端数据范围 {min(all_dates)} ~ {max(all_dates)}，请检查 --start-date/--end-date 是否写错"
-        )
-        return 1
     if check_missing and range_start and range_start <= range_end:
         state = "完整" if not missing else "有缺失（上面已告警并跳过）"
         log(

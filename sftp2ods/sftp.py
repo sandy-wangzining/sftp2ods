@@ -44,6 +44,29 @@ def _safe_remote_name(name: str, kind: str) -> str:
     return text
 
 
+def local_path_within(base: Path, key: str, remote_name: str) -> Path:
+    """把台账键拼成本地落地路径，并确保结果落在下载目录内。
+
+    远端是 POSIX 系统，文件名里出现 ":" 是合法的（如 report:20260920.csv），不能一律禁掉；
+    但 Windows 上 "Z:xxx" 这类盘符相对名会让 `base / key` 直接跳出下载目录（写到别的盘），
+    所以拼出路径后用 resolve() 做一次包含性判断：越界就拒绝。POSIX 上 ":" 只是普通字符，
+    同一判断不会误伤正常文件名。
+    """
+    base = Path(base)
+    candidate = base / str(key)
+    try:
+        base_real = base.resolve()
+        target_real = candidate.resolve()
+    except OSError as exc:
+        raise FatalSourceError(f"无法解析本地路径 {candidate}（{exc}）") from exc
+    if target_real != base_real and base_real not in target_real.parents:
+        raise FatalSourceError(
+            f"远端文件名 {remote_name!r} 落地后的本地路径落在下载目录之外（{target_real}）；"
+            f"可能是服务端异常或伪造数据（Windows 盘符相对名等），拒绝处理"
+        )
+    return candidate
+
+
 def _is_missing_path_error(exc: OSError) -> bool:
     """是否是「路径不存在」类错误（ENOENT/ENOTDIR）——只有这种才当"空目录"处理。
 

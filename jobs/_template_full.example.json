@@ -12,13 +12,13 @@
 
   "maxcompute": {
     "//说明": "单套凭证写这里；多套用 profiles.<名> + target.profile 切换",
-    "project": "sitindw",
+    "project": "my_project",
     "endpoint": "http://service.us-west-1.maxcompute.aliyun.com/api",
     "access_key_id": "<阿里云 AK>",
     "access_key_secret": "<阿里云 SK>"
   },
   "//profiles": {
-    "prod": { "project": "sitindw", "access_key_id": "<AK>", "access_key_secret": "<SK>" }
+    "prod": { "project": "my_project", "access_key_id": "<AK>", "access_key_secret": "<SK>" }
   },
 
   "sftp": {
@@ -68,7 +68,7 @@
   },
 
   "target": {
-    "project": "sitindw",
+    "project": "my_project",
     "table": "ods_demo_di",
     "comment": "示例：SFTP 报表列展开（pt=文件日期）",
     "//allow_empty": "解析出 0 行时是否允许写空分区（默认 true：结算类文件常有零交易的一天）",

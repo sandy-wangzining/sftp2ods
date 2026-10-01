@@ -14,12 +14,14 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _helpers import OfflineTestCase, csv_bytes  # noqa: E402
+from _helpers import FakeSftp, OfflineTestCase, add_file, connect_to, csv_bytes  # noqa: E402
 
 from sftp2ods import (
     config,  # noqa: E402
     init_wizard,  # noqa: E402
 )
+from sftp2ods import sftp as sftp_mod  # noqa: E402
+from sftp2ods.utils import FatalSourceError  # noqa: E402
 
 
 class ScriptedAsk:
@@ -73,11 +75,11 @@ class WizardTestCase(OfflineTestCase):
             ("整数", ""),
             ("合计行", "n"),
             ("关键字段", "order_id"),
-            ("缺文件检查", "y"),
+            ("缺文件核对", "y"),
             ("时区", "UTC"),
             ("几点前跑", "02:30"),
             ("webhook", "https://open.feishu.cn/open-apis/bot/v2/hook/zzz"),
-            ("项目名", "sitindw"),
+            ("项目名", "my_project"),
             ("目标表名", "ods_demo_di"),
             ("AccessKeyId", "AK123"),
             ("AccessKeySecret", "SK456"),
@@ -124,7 +126,7 @@ class TestWizardHappyPath(WizardTestCase):
         self.assertEqual(job["missing"]["grace"], "02:30")
         self.assertEqual(job["notify"]["webhook"], "https://open.feishu.cn/open-apis/bot/v2/hook/zzz")
         self.assertEqual(job["target"]["table"], "ods_demo_di")
-        self.assertEqual(job["maxcompute"]["project"], "sitindw")
+        self.assertEqual(job["maxcompute"]["project"], "my_project")
 
     def test_no_sample_placeholder(self):
         script = self.base_script(sample_choice="3")
@@ -132,9 +134,9 @@ class TestWizardHappyPath(WizardTestCase):
         tail = [
             ("第一列表头", "Order ID"),
             ("合计行", "n"),
-            ("缺文件检查", "n"),
+            ("缺文件核对", "n"),
             ("webhook", ""),
-            ("项目名", "sitindw"),
+            ("项目名", "my_project"),
             ("目标表名", ""),
             ("AccessKeyId", "AK"),
             ("AccessKeySecret", "SK"),
@@ -201,7 +203,7 @@ class TestWizardSecretInput(WizardTestCase):
                 ("远端目录", "/data"),
                 ("文件名正则", "report_(?P<date>\\d{8})\\.csv"),
                 ("合计行", "n"),
-                ("缺文件检查", "n"),
+                ("缺文件核对", "n"),
             ):
                 if fragment in prompt:
                     return value
@@ -244,6 +246,37 @@ class TestWizardSecretInput(WizardTestCase):
         raw = json.loads(self.out_path.read_text(encoding="utf-8"))
         with self.assertRaises(SystemExit):
             config.validate_job(config.normalize_job(raw))
+
+
+class TestWizardRemoteSampleGuard(WizardTestCase):
+    """向导拉样本的落地路径也走"必须在 base 之内"的校验：越界名 → 拒绝、不下载。"""
+
+    def _cfgs(self):
+        sftp_cfg = {"host": "h", "port": 22, "username": "u", "auth": {"type": "password", "password": "p"}}
+        source_cfg = {"root": "/statements", "layout": "flat", "file_regex": "report_(?P<date>\\d{8})\\.csv"}
+        return sftp_cfg, source_cfg
+
+    def test_out_of_base_name_is_rejected(self):
+        fake = FakeSftp()
+        add_file(fake, "/statements/report_20260920.csv", csv_bytes(["Order ID"], [["o1"]]))
+        sftp_cfg, source_cfg = self._cfgs()
+        echoes: list = []
+        with mock.patch.object(sftp_mod.SftpSource, "_connect", connect_to(fake)):
+            # 模拟包含性校验判定越界：向导必须拒绝、且不触发下载
+            with mock.patch.object(init_wizard, "local_path_within", side_effect=FatalSourceError("越界")):
+                got = init_wizard._read_remote_sample(lambda p="": p, echoes.append, sftp_cfg, source_cfg)
+        self.assertIsNone(got)
+        self.assertTrue(any("下载失败" in str(line) for line in echoes), echoes)
+        self.assertEqual(fake.downloaded, [], "越界名不应触发下载")
+
+    def test_in_base_name_downloads_and_reads_header(self):
+        fake = FakeSftp()
+        add_file(fake, "/statements/report_20260920.csv", csv_bytes(["Order ID"], [["o1"]]))
+        sftp_cfg, source_cfg = self._cfgs()
+        with mock.patch.object(sftp_mod.SftpSource, "_connect", connect_to(fake)):
+            headers = init_wizard._read_remote_sample(lambda p="": p, lambda *_a, **_k: None, sftp_cfg, source_cfg)
+        self.assertEqual(headers, ["Order ID"])
+        self.assertEqual(fake.downloaded, ["/statements/report_20260920.csv"])
 
 
 class TestSlugAndColumns(OfflineTestCase):

@@ -200,6 +200,52 @@ class TestSyncRanges(CliTestCase):
             self.assertEqual(world.sync(start_date="2099-01-01"), 1)
 
 
+class TestSyncRangeNoOverlap(CliTestCase):
+    """显式补数区间在远端没有任何匹配文件 → 失败（1.4.1），不能静默 rc=0 像"补数成功"。"""
+
+    def test_range_outside_remote_fails_without_writing(self):
+        # 远端只有 20200101，补数区间 [2020-01-02, 2020-01-03] 完全在数据范围之外
+        files = {"/data/report_20200101.csv": report([["o1", "1.00"]])}
+        with World(self.tmp, files=files) as world:
+            self.assertEqual(world.sync(start_date="2020-01-02", end_date="2020-01-03"), 1)
+            self.assertEqual(world.table.deleted, [], "失败时不应有任何删分区动作")
+            self.assertEqual(world.table.written, {}, "失败时不应写入任何分区")
+            self.assertTrue(any("补数区间" in str(line) for line in world.access_logs))
+
+    def test_range_partial_overlap_writes_intersection(self):
+        files = {
+            "/data/report_20260920.csv": report([["o1", "1.00"]]),
+            "/data/report_20260922.csv": report([["o2", "2.00"]]),
+        }
+        with World(self.tmp, files=files) as world:
+            self.assertEqual(world.sync(start_date="2026-09-20", end_date="2026-09-22"), 0)
+            self.assertEqual(sorted(world.table.deleted), ["pt=20260920", "pt=20260922"])
+
+    def test_range_all_uploaded_does_not_false_fail(self):
+        """区间内文件都在、只是台账已上传：proc_dates 仍非空，第二次运行不能误判失败。"""
+        data = report([["o1", "1.00"]])
+        with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
+            self.assertEqual(world.sync(start_date="2026-09-20", end_date="2026-09-20"), 0)
+            deletes = len(world.table.deleted)
+            self.assertEqual(world.sync(start_date="2026-09-20", end_date="2026-09-20"), 0)
+            self.assertEqual(len(world.table.deleted), deletes, "已上传的区间被误判成失败或重写")
+
+    def test_range_outside_remote_force_succeeds(self):
+        files = {"/data/report_20200101.csv": report([["o1", "1.00"]])}
+        with World(self.tmp, files=files) as world:
+            self.assertEqual(world.sync(start_date="2020-01-02", end_date="2020-01-03", force=True), 0)
+            self.assertEqual(world.table.deleted, [])
+
+    def test_full_run_without_range_still_warns(self):
+        files = {
+            "/data/report_20260920.csv": report([["o1", "1.00"]]),
+            "/data/report_20260922.csv": report([["o2", "2.00"]]),
+        }
+        with World(self.tmp, files=files) as world:
+            self.assertEqual(world.sync(), 0)  # 不传区间：缺 20260921 仍只告警、照常同步
+            self.assertTrue(any("缺少文件" in str(line) for line in world.access_logs))
+
+
 class TestSyncGuards(CliTestCase):
     def test_missing_single_bizdate_fails_and_alerts(self):
         # ①显式点名单日（--bizdate）而该日无文件：必须失败（rc=1），不能静默 rc=0 让调度以为成功。

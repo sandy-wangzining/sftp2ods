@@ -20,7 +20,7 @@ from pathlib import Path
 
 from . import parse as parse_mod
 from .config import DEFAULT_TZ
-from .sftp import SftpSource
+from .sftp import SftpSource, local_path_within
 from .utils import ConfigError
 
 DEFAULT_ENDPOINT = "http://service.us-west-1.maxcompute.aliyun.com/api"
@@ -184,7 +184,9 @@ def _read_remote_sample(ask, echo, sftp_cfg: dict, source_cfg: dict) -> list[str
         item = sorted(files_by_date[date], key=lambda it: it.name)[0]
         echo(f"   最新文件：{date}/{item.name}（{item.size:,} 字节），下载中 ...")
         try:
-            local = source.download(item, workdir / item.name)
+            # 与主下载路径同一把锁：落地路径必须落在 base（向导的临时 workdir）之内，
+            # 免得"包含性校验"在这里成了例外（远端是 POSIX，名字带 ":" 合法，不能靠禁冒号）。
+            local = source.download(item, local_path_within(workdir, item.name, item.name))
         except Exception as exc:  # noqa: BLE001
             echo(f"   下载失败：{exc}")
             return None
@@ -326,9 +328,9 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         if skip_field:
             parse_cfg["skip_if_empty"] = [skip_field]
 
-        # ---------------------------------------------------------- ⑥ 缺文件检查
+        # ---------------------------------------------------------- ⑥ 缺文件核对
         echo("")
-        check_missing = _ask(ask, "⑧ 要做缺文件检查吗（每天必须有一个文件）？(y/n)", "y").lower().startswith("y")
+        check_missing = _ask(ask, "⑧ 要做缺文件核对吗（每天必须有一个文件）？(y/n)", "y").lower().startswith("y")
         missing_cfg: dict = {"check": check_missing}
         if check_missing:
             timezone_name = _ask(ask, "   按哪个时区的昨天核对最新文件？", DEFAULT_TZ)

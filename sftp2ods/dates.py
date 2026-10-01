@@ -5,7 +5,8 @@
 - 远端每个文件都能提取出一个"文件日期"（文件名或日期子目录），它就是该文件数据所属的业务日；
 - 写入时 pt = 文件日期，一个日期一个分区（一天多个文件合并进同一个 pt）；
 - --bizdate 只处理那一天；--start-date/--end-date 处理区间；
-- 缺文件检查：对 [核对区间] 内每一天，远端必须至少有一个匹配文件，缺了就中止并告警。
+- 缺文件核对：对 [核对区间] 内每一天，远端至少要有匹配文件；缺了只告警 + 跳过缺失日期
+  （照常同步已有文件），只有"显式点名单日（--bizdate/环境变量 bizdate）整天无文件"才失败。
 """
 
 from __future__ import annotations
@@ -146,7 +147,7 @@ def plan_dates(
     expected: str = "",
     check_missing: bool = True,
 ) -> tuple[list[str], list[str], str, str]:
-    """规划 [核对区间]（缺文件检查）与 [处理日期]。
+    """规划 [核对区间]（缺文件核对）与 [处理日期]。
 
     返回 (missing, dates, range_start, range_end)：
     - 核对区间：--bizdate 时只核对那一天；否则 [max(远端最早, --start-date), --end-date 或预期最新]。
