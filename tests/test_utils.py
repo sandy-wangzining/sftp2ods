@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.parse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -134,6 +135,25 @@ class TestSecretValues(OfflineTestCase):
         out = utils.redact_secrets(["ab"], "ab is a common substring")
         self.assertIn("ab is", out)
 
+    def test_redact_secrets_masks_url_encoded_forms(self):
+        """凭证以 URL 编码形态落进自由文本时也要遮：明文 / quote / quote_plus 三种形态一起替。
+
+        paramiko 等把凭证塞进自由文本的报错里没有可识别的键名，形态规则挡不住；
+        只替明文时，编码后的凭证（如 token 里的空格/斜杠被转义）会原样进日志。
+        """
+        secret = "SECRET value/with+plus"
+        encoded = urllib.parse.quote(secret, safe="")
+        encoded_plus = urllib.parse.quote_plus(secret)
+        # 三种形态确实互不相同，用例才有意义
+        self.assertNotIn(secret, (encoded, encoded_plus))
+        self.assertNotEqual(encoded, encoded_plus)
+        text = f"plain={secret} quote={encoded} plus={encoded_plus}"
+        out = utils.redact_secrets([secret], text)
+        self.assertNotIn(secret, out)
+        self.assertNotIn(encoded, out)
+        self.assertNotIn(encoded_plus, out)
+        self.assertEqual(out.count("***"), 3)
+
 
 class TestRetry(OfflineTestCase):
     def test_succeeds_after_failures(self):
@@ -169,6 +189,16 @@ class TestRetry(OfflineTestCase):
 
 
 class TestRunLock(OfflineTestCase):
+    def test_lock_path_is_redirected_to_temp_in_tests(self):
+        """单测把运行锁根目录重定向到临时目录：跑测试不会在仓库 .run-locks/ 里
+        无限累积锁文件（临时作业路径每次哈希都不同）。生产行为不变。"""
+        from sftp2ods import cli as cli_mod
+
+        repo_root = Path(cli_mod.__file__).resolve().parents[1]
+        self.assertNotEqual(cli_mod.ROOT, repo_root)
+        self.assertTrue(cli_mod.ROOT.is_relative_to(Path(tempfile.gettempdir())))
+        self.assertTrue(cli_mod._lock_path(Path("jobs/demo.json")).is_relative_to(cli_mod.ROOT))
+
     def test_second_acquire_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "demo.lock"

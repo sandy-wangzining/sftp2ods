@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import quote, quote_plus, unquote
 
 try:
     import fcntl  # Linux / macOS：进程级运行锁
@@ -517,10 +517,16 @@ def redact_secrets(values, text: str) -> str:
     if not text:
         return text
     text = str(text)  # 与 redact 同样的宽容度：调用方直接传异常对象/数字也不会炸
-    for value in sorted(set(values or ()), key=len, reverse=True):
+    for secret in sorted(set(values or ()), key=len, reverse=True):
         # 短值（< _SECRET_MIN_LEN）连值级替换也要挡：否则 "SEC" 会把别的密钥切成碎片
-        if len(value) >= _SECRET_MIN_LEN and value in text:
-            text = text.replace(value, "***")
+        if len(secret) < _SECRET_MIN_LEN:
+            continue
+        # 凭证可能以 URL 编码形态出现在自由文本里（如 t%2Dabc123... 对应 t-abc123...），
+        # 而自由文本没有可识别的键名，形态规则挡不住；只替明文会漏，编码后的凭证仍会
+        # 原样进日志。明文、quote、quote_plus 三种形态一起替换（长值优先的排序不变）。
+        for variant in (secret, quote(secret, safe=""), quote_plus(secret)):
+            if variant:
+                text = text.replace(variant, "***")
     return redact(text)
 
 

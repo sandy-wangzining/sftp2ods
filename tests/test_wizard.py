@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -86,7 +87,11 @@ class WizardTestCase(OfflineTestCase):
 
     def run_wizard(self, script, out_path=None):
         ask = ScriptedAsk(script)
-        rc = init_wizard.run_init(out_path=str(out_path or self.out_path), ask=ask, echo=lambda *_a, **_k: None)
+        # 同一个 ScriptedAsk 兼作密钥入口：密钥类问题现在走 ask_secret（默认 getpass 不回显），
+        # 脚本化测试把两者指向同一个按问答题顺序取答案的对象即可
+        rc = init_wizard.run_init(
+            out_path=str(out_path or self.out_path), ask=ask, ask_secret=ask, echo=lambda *_a, **_k: None
+        )
         return rc, ask
 
     def load_job(self):
@@ -156,7 +161,9 @@ class TestWizardFailurePaths(WizardTestCase):
             def __call__(self, prompt=""):
                 raise EOFError()
 
-        rc = init_wizard.run_init(out_path=str(self.out_path), ask=EofAsk(), echo=lambda *_a, **_k: None)
+        rc = init_wizard.run_init(
+            out_path=str(self.out_path), ask=EofAsk(), ask_secret=EofAsk(), echo=lambda *_a, **_k: None
+        )
         self.assertEqual(rc, 1)
 
     def test_keyboard_interrupt_returns_130(self):
@@ -166,13 +173,64 @@ class TestWizardFailurePaths(WizardTestCase):
             def __call__(self, prompt=""):
                 raise KeyboardInterrupt()
 
-        rc = init_wizard.run_init(out_path=str(self.out_path), ask=InterruptAsk(), echo=lambda *_a, **_k: None)
+        rc = init_wizard.run_init(
+            out_path=str(self.out_path), ask=InterruptAsk(), ask_secret=InterruptAsk(), echo=lambda *_a, **_k: None
+        )
         self.assertEqual(rc, 130)
         self.assertFalse(self.out_path.exists())
 
     def test_out_path_is_directory(self):
         with self.assertRaises(SystemExit):
             self.run_wizard(self.base_script() + self.common_tail(), out_path=self.tmp)
+
+
+class TestWizardSecretInput(WizardTestCase):
+    """密钥类输入必须走不回显入口（原来走 input()，密码/口令/webhook 明文回显在终端）。"""
+
+    def test_secret_prompts_go_through_unhidden_entry(self):
+        plain, secret = [], []
+        choices = iter(["1", "1", "3"])  # 认证=密码、布局=平铺、样本来源=暂时没有
+
+        def ask(prompt=""):
+            plain.append(prompt)
+            if "请选择编号" in prompt:
+                return next(choices, "")
+            for fragment, value in (
+                ("主机名", "sftp.example.com"),
+                ("登录名", "user1"),
+                ("远端目录", "/data"),
+                ("文件名正则", "report_(?P<date>\\d{8})\\.csv"),
+                ("合计行", "n"),
+                ("缺文件检查", "n"),
+            ):
+                if fragment in prompt:
+                    return value
+            return ""
+
+        def ask_secret(prompt=""):
+            secret.append(prompt)
+            return "hidden-value"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "job.json"
+            rc = init_wizard.run_init(out_path=str(path), ask=ask, ask_secret=ask_secret, echo=lambda *_a, **_k: None)
+            job = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(rc, 0)
+        # 密码 / webhook / AccessKeySecret 都走不回显入口
+        self.assertTrue(any("密码" in p for p in secret))
+        self.assertTrue(any("webhook" in p for p in secret))
+        self.assertTrue(any("AccessKeySecret" in p for p in secret))
+        # 普通问题不会落到密钥入口
+        self.assertFalse(any("主机名" in p for p in secret))
+        self.assertFalse(any("AccessKeySecret" in p for p in plain))
+        self.assertEqual(job["sftp"]["auth"]["password"], "hidden-value")
+        self.assertEqual(job["maxcompute"]["access_key_secret"], "hidden-value")
+
+    def test_default_secret_entry_uses_getpass(self):
+        """不注入 ask_secret 时，默认入口是 getpass（不回显）。"""
+        with mock.patch.object(init_wizard.getpass, "getpass", return_value="hidden") as gp:
+            self.assertEqual(init_wizard._default_ask_secret("密码："), "hidden")
+        gp.assert_called_once_with("密码：")
 
     def test_bad_regex_generates_but_validation_flags(self):
         # 向导本身不校验正则语法（--check/正式跑时才校验），生成的文件仍可被 load 到再报错

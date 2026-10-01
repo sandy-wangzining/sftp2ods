@@ -271,10 +271,14 @@ class TestConnect(OfflineTestCase):
         class AutoAddPolicy:
             pass
 
+        class RejectPolicy:
+            pass
+
         module.AuthenticationException = AuthenticationException
         module.SSHException = SSHException
         module.PasswordRequiredException = PasswordRequiredException
         module.AutoAddPolicy = AutoAddPolicy
+        module.RejectPolicy = RejectPolicy
         last = {}
 
         class SSHClient:
@@ -408,14 +412,16 @@ class TestScanSafety(OfflineTestCase):
 
 
 class TestHostKeyPolicy(TestConnect):
-    """主机指纹校验：默认严格（只认 known_hosts），sftp.host_key=auto_accept 显式降级。"""
+    """主机指纹校验：默认严格（显式 RejectPolicy + 只认 known_hosts），
+    sftp.host_key=auto_accept 显式降级为 AutoAddPolicy。"""
 
     def test_default_is_strict_load_system_host_keys(self):
         module, last = self._fake_paramiko()
         with mock.patch.object(sftp_mod, "paramiko", module):
             flat_source()._connect()
         self.assertTrue(last["client"].system_host_keys_loaded)
-        self.assertFalse(hasattr(last["client"], "policy"))  # 不设 AutoAddPolicy
+        # 显式 RejectPolicy：拒绝未知主机指纹，"严格"写死在代码里，不依赖 paramiko 的隐式默认策略
+        self.assertIsInstance(last["client"].policy, module.RejectPolicy)
 
     def test_auto_accept_uses_autoadd_policy(self):
         module, last = self._fake_paramiko()
