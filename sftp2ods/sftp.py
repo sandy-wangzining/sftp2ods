@@ -31,6 +31,14 @@ except ImportError:  # pragma: no cover - 未安装时给出明确指引（tests
 DATE_RE = re.compile(r"\A\d{8}\Z")
 
 
+def _cfg_or_default(cfg: dict, key: str, default, conv):
+    """读配置数值：None/空串用默认值；显式 0 保留（不能 `x or default`）。"""
+    value = cfg.get(key)
+    if value is None or value == "":
+        return conv(default)
+    return conv(value)
+
+
 def _safe_remote_name(name: str, kind: str) -> str:
     """远端返回的目录项名必须是纯文件名：含路径分隔符 / .. 直接拒绝。
 
@@ -139,13 +147,14 @@ class SftpSource:
         self.password = str(auth.get("password") or "")
         self.key_file = str(auth.get("key_file") or "")
         self.passphrase = str(auth.get("passphrase") or "")
-        self.connect_timeout = float(self.cfg.get("connect_timeout") or 30)
-        self.io_timeout = float(self.cfg.get("io_timeout") or 600)
-        self.retry_times = int(self.cfg.get("retry_times") or 3)
-        self.retry_delay = float(self.cfg.get("retry_delay") or 10)
+        self.connect_timeout = _cfg_or_default(self.cfg, "connect_timeout", 30, float)
+        self.io_timeout = _cfg_or_default(self.cfg, "io_timeout", 600, float)
+        self.retry_times = _cfg_or_default(self.cfg, "retry_times", 3, int)
+        self.retry_delay = _cfg_or_default(self.cfg, "retry_delay", 10, float)
         source = source_cfg or self.cfg.get("_source") or {}
         self.layout = str(source.get("layout") or "flat")
-        self.root = str(source.get("root") or "").strip().rstrip("/")
+        root_raw = str(source.get("root") or "").strip()
+        self.root = "/" if root_raw == "/" else root_raw.rstrip("/")
         self.download_dir = Path(source.get("download_dir") or ".")
         try:
             self.file_re = re.compile(str(source.get("file_regex") or ""))
@@ -168,6 +177,15 @@ class SftpSource:
                 f"（业务日期从文件名里提取，pt 靠它确定）"
             )
 
+    def _join_root(self, *parts: str) -> str:
+        """拼远端路径：root="/" 时结果仍以单斜杠开头，不能变成 //name 或空串。"""
+        rest = "/".join(str(p) for p in parts if p)
+        if not self.root:
+            return rest
+        if self.root == "/":
+            return f"/{rest}" if rest else "/"
+        return f"{self.root}/{rest}" if rest else self.root
+
     # ------------------------------------------------------------ 连接
     def _connect(self):
         """建立连接，返回 (ssh, sftp)。认证类失败抛 FatalSourceError（不重试）。
@@ -184,6 +202,11 @@ class SftpSource:
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         else:
             ssh.load_system_host_keys()
+            # load_system_host_keys() 不传参只读系统 known_hosts（如 /etc/ssh/ssh_known_hosts），
+            # 用户自己 ssh-keyscan 进 ~/.ssh/known_hosts 的指纹要另 load_host_keys
+            user_known = Path.home() / ".ssh" / "known_hosts"
+            if user_known.is_file():
+                ssh.load_host_keys(str(user_known))
             # 显式拒绝未知主机指纹：不能让"默认严格"依赖 paramiko 的隐式默认策略——
             # 将来 paramiko 改默认值或重构时会静默降级为不校验主机指纹（中间人风险），
             # 把"严格"写死在代码里，行为可预期。
@@ -220,16 +243,25 @@ class SftpSource:
         except paramiko.PasswordRequiredException as exc:
             ssh.close()
             raise FatalSourceError(f"私钥需要口令，但 sftp.auth.passphrase 没配或不对（{exc}）")
+        except paramiko.BadHostKeyException as exc:
+            ssh.close()
+            raise FatalSourceError(
+                f"SFTP 主机指纹不匹配：{self.username}@{self.host}:{self.port}（{exc}）；"
+                f"可能是主机换过密钥，也可能是中间人攻击。请核对本机 known_hosts"
+            ) from exc
         except paramiko.SSHException as exc:
             ssh.close()
             message = str(exc)
-            if "not found in known_hosts" in message and host_key != "auto_accept":
+            unknown_host = "not found in known_hosts" in message.lower()
+            if unknown_host and host_key != "auto_accept":
                 # 严格模式下最常见的第一类错误：提示怎么把主机指纹加进 known_hosts
                 message += (
                     f"；本工具默认校验主机指纹（防中间人），请先运行："
                     f"ssh-keyscan -p {self.port} {self.host} >> ~/.ssh/known_hosts"
                     f'（确实要跳过校验可在 sftp 块加 "host_key": "auto_accept"）'
                 )
+            if unknown_host:
+                raise FatalSourceError(f"SFTP 连接失败：{type(exc).__name__}: {message}") from exc
             raise RuntimeError(f"SFTP 连接失败：{type(exc).__name__}: {message}")
         except OSError as exc:
             ssh.close()
@@ -321,7 +353,7 @@ class SftpSource:
                 dir_name = _safe_remote_name(entry.filename, "日期目录")
                 date = normalize_date(match.group("date"), dir_name, "日期目录名")
                 try:
-                    children = sftp.listdir_attr(f"{root}/{dir_name}" if root else dir_name)
+                    children = sftp.listdir_attr(self._join_root(dir_name))
                 except OSError as exc:
                     if not _is_missing_path_error(exc):
                         raise  # 同上：瞬时失败不能变成"这天不存在"
@@ -331,7 +363,7 @@ class SftpSource:
                     if stat.S_ISDIR(item.st_mode or 0) or not self.file_re.fullmatch(item.filename):
                         continue
                     file_name = _safe_remote_name(item.filename, "文件名")
-                    path = f"{root}/{dir_name}/{file_name}" if root else f"{dir_name}/{file_name}"
+                    path = self._join_root(dir_name, file_name)
                     result.setdefault(date, []).append(
                         RemoteFile(date, file_name, self._entry_size(sftp, item, path), path, f"{date}/{file_name}")
                     )
@@ -345,7 +377,7 @@ class SftpSource:
                     continue
                 file_name = _safe_remote_name(entry.filename, "文件名")
                 date = normalize_date(match.group("date"), file_name, "文件名")
-                path = f"{root}/{file_name}" if root else file_name
+                path = self._join_root(file_name)
                 result.setdefault(date, []).append(
                     RemoteFile(date, file_name, self._entry_size(sftp, entry, path), path, file_name)
                 )

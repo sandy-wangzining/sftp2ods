@@ -152,6 +152,15 @@ class TestValidate(OfflineTestCase):
         job["sftp"]["retry_times"] = -1
         self.assert_invalid(job, "sftp.retry_times")
 
+    def test_sftp_zero_timeout_and_retry_are_valid(self):
+        """0 是有意义的取值（不重试 / 不等待 / 不限制超时），配置校验必须放行。"""
+        job = minimal_job()
+        job["sftp"]["retry_times"] = 0
+        job["sftp"]["retry_delay"] = 0
+        job["sftp"]["connect_timeout"] = 0
+        job["sftp"]["io_timeout"] = 0
+        validated(job)
+
     def test_sftp_auth_errors(self):
         job = minimal_job()
         job["sftp"]["auth"] = {"type": "magic"}
@@ -276,6 +285,48 @@ class TestValidate(OfflineTestCase):
         job["parse"]["columns"][0]["//注"] = "y"
         warnings = config.collect_warnings(config.normalize_job(job))
         self.assertEqual(warnings, [])
+
+    def test_collect_warnings_sftp_and_auth_type_guard(self):
+        """sftp / sftp.auth 不是对象时不能 AttributeError，也不能把字符串拆成逐字符假告警。"""
+        warnings = config.collect_warnings({"sftp": "host", "parse": {}})
+        text = "\n".join(warnings)
+        self.assertNotIn("sftp.h", text)
+        self.assertNotIn("sftp.auth.", text)
+
+        warnings = config.collect_warnings({"sftp": {"host": "h", "auth": "password"}, "parse": {}})
+        text = "\n".join(warnings)
+        self.assertNotIn("sftp.auth.p", text)
+
+    def test_collect_warnings_non_object_blocks_do_not_crash(self):
+        """source/target/missing/notify/parse 不是对象时不能按字符告警，也不能 AttributeError。"""
+        warnings = config.collect_warnings(
+            {
+                "source": "root",
+                "target": ["table"],
+                "missing": "check",
+                "notify": 1,
+                "parse": [{"columns": []}],
+            }
+        )
+        text = "\n".join(warnings)
+        self.assertNotIn("source.r", text)
+        self.assertNotIn("target.t", text)
+        self.assertNotIn("missing.c", text)
+
+    def test_null_sftp_numbers_get_defaults(self):
+        """JSON null / 空串不能跳过默认值，否则 port 等会带着 None 进连接层。"""
+        job = minimal_job()
+        job["sftp"]["port"] = None
+        job["sftp"]["connect_timeout"] = None
+        job["sftp"]["io_timeout"] = ""
+        job["sftp"]["retry_times"] = None
+        job["sftp"]["retry_delay"] = None
+        out = validated(job)
+        self.assertEqual(out["sftp"]["port"], 22)
+        self.assertEqual(out["sftp"]["connect_timeout"], 30)
+        self.assertEqual(out["sftp"]["io_timeout"], 600)
+        self.assertEqual(out["sftp"]["retry_times"], 3)
+        self.assertEqual(out["sftp"]["retry_delay"], 10)
 
 
 class TestProfiles(OfflineTestCase):

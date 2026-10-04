@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import quote, quote_plus, unquote
 
@@ -64,8 +66,10 @@ def progress_log(label: str, count: int, unit: str = "行") -> None:
 
 def add_log_sink(handle) -> None:
     """把日志再写一份到文件（--log-file），句柄由调用方负责关闭。"""
+    global _log_sink_warned
     with _lock:
         _sinks.append(handle)
+        _log_sink_warned = False
 
 
 def remove_log_sink(handle) -> None:
@@ -85,12 +89,15 @@ def remove_log_sink(handle) -> None:
 
 
 _logged_once: set = set()
+_log_sink_warned = False
 
 
 def reset_log_once() -> None:
     """清空"已打过的告警"记录（每次运行开始时调，见 cli.main）。"""
+    global _log_sink_warned
     with _lock:
         _logged_once.clear()
+        _log_sink_warned = False
 
 
 def log_once(message: str) -> None:
@@ -100,6 +107,20 @@ def log_once(message: str) -> None:
             return
         _logged_once.add(message)
     log(message)
+
+
+def _warn_log_sink_once(exc: BaseException) -> None:
+    """日志文件写失败时往 stderr 打一条，并把该 sink 摘掉后不再静默重试。"""
+    global _log_sink_warned
+    with _lock:
+        if _log_sink_warned:
+            return
+        _log_sink_warned = True
+    try:
+        sys.stderr.write(f"警告：日志文件写入失败（{type(exc).__name__}: {exc}），已停止写入该文件\n")
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001 - stderr 也坏了就放弃
+        pass
 
 
 def log(message: str) -> None:
@@ -129,12 +150,20 @@ def log(message: str) -> None:
             encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
             safe = line.encode(encoding, "replace").decode(encoding, "replace")
             print(safe, flush=True)
+        failed_exc = None
+        alive = []
         for handle in _sinks:
             try:
                 handle.write(line + "\n")
                 handle.flush()
-            except Exception:  # noqa: BLE001 - 日志文件问题不影响主流程
-                pass
+                alive.append(handle)
+            except Exception as exc:  # noqa: BLE001 - 日志文件问题不影响主流程，但必须可见一次
+                failed_exc = exc
+        if failed_exc is not None:
+            _sinks[:] = alive
+        sink_exc = failed_exc
+    if sink_exc is not None:
+        _warn_log_sink_once(sink_exc)
 
 
 class RunLock:
@@ -162,7 +191,13 @@ class RunLock:
             raise SystemExit(
                 f"无法创建运行锁文件 {self.path}（{exc}）；请检查该路径所在目录是否存在/可写，或用 --job 指定别处的作业"
             )
-        if not _try_lock(self.fh):
+        try:
+            locked = _try_lock(self.fh)
+        except OSError:
+            self.fh.close()
+            self.fh = None
+            raise
+        if not locked:
             self.fh.close()
             self.fh = None
             raise SystemExit(f"已有任务在运行（锁文件 {self.path}），本次退出；确认没有任务在跑时可删除该文件后重试。")
@@ -186,22 +221,83 @@ class RunLock:
                 self.fh.close()
 
 
-def _try_lock(fh) -> bool:
-    """对已打开的文件加排它锁；别人拿着锁时返回 False（不阻塞等待）。"""
+def _lock_error_kind(exc: OSError) -> str:
+    """文件锁 OSError：busy / unsupported / other。"""
+    code = getattr(exc, "errno", None)
+    busy = {errno.EAGAIN, errno.EACCES, errno.EDEADLK}
+    wow = getattr(errno, "EWOULDBLOCK", None)
+    if wow is not None:
+        busy.add(wow)
+    unsupported = set()
+    for name in ("ENOLCK", "ENOTSUP", "EOPNOTSUPP"):
+        val = getattr(errno, name, None)
+        if val is not None:
+            unsupported.add(val)
+    if code in busy:
+        return "busy"
+    if code in unsupported:
+        return "unsupported"
+    return "other"
+
+
+def _handle_lock_oserror(exc: OSError, *, blocking: bool) -> bool:
+    """busy → 非阻塞返回 False；不支持锁 → 告警后当作已获取（无锁继续）；其余抛出。"""
+    kind = _lock_error_kind(exc)
+    if kind == "busy":
+        if blocking:
+            raise
+        return False
+    if kind == "unsupported":
+        log_once(f"  警告：文件系统不支持文件锁（{exc}），本次不加锁继续执行")
+        return True
+    raise exc
+
+
+def _acquire_lock(fh, *, blocking: bool) -> bool:
+    """加排它锁。True = 已持有或无锁继续；False = 非阻塞时锁被占用。"""
     if fcntl is not None:
+        flags = fcntl.LOCK_EX if blocking else (fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
-            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fh, flags)
             return True
-        except OSError:
-            return False
+        except OSError as exc:
+            return _handle_lock_oserror(exc, blocking=blocking)
     if msvcrt is not None:
+        mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
         try:
             fh.seek(0)
-            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            msvcrt.locking(fh.fileno(), mode, 1)
             return True
-        except OSError:
-            return False
-    return True  # 两种锁都没有：不阻塞（退回"无锁"行为）
+        except OSError as exc:
+            return _handle_lock_oserror(exc, blocking=blocking)
+    return True
+
+
+def _try_lock(fh) -> bool:
+    """对已打开的文件加排它锁；别人拿着锁时返回 False（不阻塞等待）。"""
+    return _acquire_lock(fh, blocking=False)
+
+
+@contextmanager
+def interprocess_lock(path: Path):
+    """进程间排它锁（阻塞），Windows 用 msvcrt、POSIX 用 flock；不支持则告警后无锁继续。
+
+    锁文件本身不删除（避免削掉别人的锁）。用于台账这类短临界区的 load-modify-save。
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if fcntl is None and msvcrt is None:
+        yield
+        return
+    fh = open(path, "a+")
+    try:
+        _acquire_lock(fh, blocking=True)
+        try:
+            yield
+        finally:
+            _unlock(fh)
+    finally:
+        fh.close()
 
 
 def _unlock(fh) -> None:
@@ -394,26 +490,6 @@ def redact(text: str) -> str:
         # 键名不敏感时值里也可能藏着密钥（'X-Api-Key: xxx' 头行、查询串、嵌套结构），递归一次
         return f"{prefix}{quote}{redact(value)}{quote}"
 
-    def _query(match: re.Match) -> str:
-        """URL 查询串 / `key: value` 里的值：命中密钥词才替换，其余原样返回。"""
-        if _is_sensitive_key(match.group(1)):
-            return f"{match.group(1)}{match.group(2)}***"
-        value = match.group(3)
-        if "%" in value:
-            try:
-                decoded = unquote(value)
-            except Exception:  # noqa: BLE001 - 解码失败按原文处理
-                decoded = value
-            if decoded != value and redact(decoded) != decoded:
-                return f"{match.group(1)}{match.group(2)}***"
-        return f"{match.group(1)}{match.group(2)}{redact(value)}"
-
-    def _header(match: re.Match) -> str:
-        """多行文本里的一行 "Header: value"：只吃头名命中密钥词的行。"""
-        if _is_sensitive_key(match.group(2)):
-            return f"{match.group(1)}***"
-        return f"{match.group(1)}{redact(match.group(3))}"
-
     out = str(text)
     out = _BEARER_RE.sub(_bearer, out)
     out = _BASIC_RE.sub(_bearer, out)
@@ -427,9 +503,57 @@ def redact(text: str) -> str:
     # JSON 片段规则至少要出现引号才可能匹配；没引号的长文本（十六进制转储等）直接跳过，省一遍全量扫描
     if '"' in out or "'" in out:
         out = _JSON_RE.sub(_json, out)
-    out = _QUERY_RE.sub(_query, out)
-    # 头行规则放最后：它最宽松（只要求行首是 name: value），前面几条先处理过更精确的形态
-    return _HEADER_RE.sub(_header, out)
+    return _query_header_redact(out)
+
+
+def _query_header_redact(text: str) -> str:
+    """查询串与头行脱敏：迭代扫描，避免按「段数」递归把长 query 打成 O(n²)/RecursionError。"""
+    return _HEADER_RE.sub(_header_mask, _replace_query_iter(text))
+
+
+def _header_mask(match: re.Match) -> str:
+    if _is_sensitive_key(match.group(2)):
+        return f"{match.group(1)}***"
+    return match.group(0)
+
+
+def _replace_query_iter(text: str) -> str:
+    """从左到右替换 query 形态；非敏感键的值再从值起点继续扫（嵌套 key=value），不调用 redact()。"""
+    parts: list[str] = []
+    pos = 0
+    n = len(text)
+    while pos < n:
+        match = _QUERY_RE.search(text, pos)
+        if not match:
+            parts.append(text[pos:])
+            break
+        parts.append(text[pos : match.start()])
+        key, sep, value = match.group(1), match.group(2), match.group(3)
+        if _is_sensitive_key(key) or _percent_encoded_secret(value):
+            parts.append(f"{key}{sep}***")
+            pos = match.end()
+            continue
+        parts.append(f"{key}{sep}")
+        next_pos = match.start(3)
+        if next_pos <= pos:
+            pos = match.end()
+            parts.append(value)
+            continue
+        pos = next_pos
+    return "".join(parts)
+
+
+def _percent_encoded_secret(value: str) -> bool:
+    if "%" not in value:
+        return False
+    try:
+        decoded = unquote(value)
+    except Exception:  # noqa: BLE001 - 解码失败按原文处理
+        return False
+    if decoded == value:
+        return False
+    # 解码后再走完整脱敏（Bearer/JSON 等）；深度跟 % 解码层数走，不跟 query 段数走
+    return redact(decoded) != decoded
 
 
 # =============================================================================

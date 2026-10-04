@@ -67,6 +67,22 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = ROOT / "config.json"
 MISSING_SHOW_LIMIT = 20  # 飞书/日志里最多列多少个缺失日期（防刷屏）
 
+_GETPASS_ERRORS = (EOFError, OSError)
+_GetPassWarning = getattr(getpass, "GetPassWarning", None)
+if isinstance(_GetPassWarning, type) and issubclass(_GetPassWarning, BaseException):
+    _GETPASS_ERRORS = (*_GETPASS_ERRORS, _GetPassWarning)
+
+
+def prompt_secret(prompt: str = "") -> str:
+    """密钥输入：优先 getpass 不回显；没有 tty 时退回 input() 并明确告警会明文回显。"""
+    if prompt:
+        log(prompt)
+    try:
+        return getpass.getpass("")
+    except _GETPASS_ERRORS:
+        log("警告：无法隐藏输入，接下来的内容会明文回显在终端上")
+        return input()
+
 
 # =============================================================================
 # 参数与工具
@@ -595,16 +611,27 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
         # 先完整解析一遍数行数（表头校验、合计行校验都在这趟完成；坏文件在写库前就拦住）。
         # 行数按 local_paths 的顺序存列表：用 path.name 当键有两个坑——台账键与远端文件名
         # 不同口径时下面按 item.name 取值会 KeyError；同一天两个文件重名时会互相覆盖、行数偏小
+        # 源文件总大小不超过 REUSE_ROWS_MAX_BYTES 时把行缓存下来给写库复用，避免再扫一遍。
         file_rows: list[int] = []
+        prepared_rows: list[list] | None = None
         try:
+            reuse = parse_mod.source_bytes(local_paths) <= parse_mod.REUSE_ROWS_MAX_BYTES
+            collected: list[list] = []
             for path in local_paths:
                 stats = {"skipped": 0}
-                file_rows.append(sum(1 for _ in parse_spec.iter_rows(path, stats)))
+                if reuse:
+                    rows_list = list(parse_spec.iter_rows(path, stats))
+                    file_rows.append(len(rows_list))
+                    collected.extend(rows_list)
+                else:
+                    file_rows.append(sum(1 for _ in parse_spec.iter_rows(path, stats)))
                 if stats["skipped"]:
                     log(f"  {path.name}：跳过 {stats['skipped']} 行（命中 skip_if_empty 的空键行）")
                 extras = stats.get("extra_headers") or []
                 if extras:
                     note_extra_headers(path.name, extras)
+            if reuse:
+                prepared_rows = collected
         except SystemExit:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -639,7 +666,13 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
 
         try:
             mc_mod.write_partition(
-                table, table_name, date, lambda paths=local_paths: parse_mod.iter_batches(paths, parse_spec), rows
+                table,
+                table_name,
+                date,
+                lambda paths=local_paths, rows=prepared_rows: parse_mod.iter_batches(
+                    paths, parse_spec, prepared_rows=rows
+                ),
+                rows,
             )
             verified = mc_mod.count_partition(o, project, table_name, date, timeout=args.sql_timeout)
         except SystemExit:
@@ -711,11 +744,7 @@ def main(argv: list[str] | None = None) -> int:
             不回显是为了密钥不进终端 scrollback，也不被 `script` / 录屏抄走——原来走
             input() 时密钥明文回显在终端上。无 tty 等读不到隐藏输入的场景退回 input()。
             """
-            log(prompt)
-            try:
-                return getpass.getpass("")
-            except Exception:  # noqa: BLE001 - 没有 tty 等场景退回普通输入
-                return input()
+            return prompt_secret(prompt)
 
         try:
             return run_init(args.init_out, ask=_wizard_ask, echo=log, ask_secret=_wizard_ask_secret)

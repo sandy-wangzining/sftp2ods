@@ -3,12 +3,15 @@
 
 from __future__ import annotations
 
+import errno
+import io
 import sys
 import tempfile
 import time
 import unittest
 import urllib.parse
 from pathlib import Path
+from unittest import mock
 
 # 只在路径缺失时追加（不插到最前面）：避免把仓库根/tests 目录置于标准库与第三方库
 # 之前遮蔽同名模块；按 README 在仓库根运行（或 CI 里 pip install -e .）时，
@@ -111,6 +114,13 @@ class TestRedact(OfflineTestCase):
 
         small, big = elapsed(20), elapsed(40)
         self.assertLess(big, max(small * 8, 0.5), f"反斜杠串耗时 {small:.3f}s → {big:.3f}s，疑似回溯爆炸")
+
+    def test_nested_query_does_not_recursion_error(self):
+        """嵌套 key=value 段用迭代脱敏，不能按段数递归到 RecursionError。"""
+        nested = "x=" * 2000 + "token=supersecret"
+        out = utils.redact("note=" + nested)
+        self.assertNotIn("supersecret", out)
+        self.assertIn("token=***", out)
 
     def test_long_token_like_text_is_fast(self):
         """超长的小写字母数字串不能把 _URL_AUTH_RE 拖成 O(n²)（修复前 20KB 要 10 秒以上）。
@@ -259,6 +269,63 @@ class TestRunLock(OfflineTestCase):
                 pass
             with utils.RunLock(path) as lock:
                 self.assertTrue(lock.path.is_file())
+
+
+class TestTryLockErrno(OfflineTestCase):
+    def _fcntl_mod(self):
+        mod = mock.Mock()
+        mod.LOCK_EX = 2
+        mod.LOCK_NB = 4
+        mod.LOCK_UN = 8
+        return mod
+
+    def test_busy_errnos_return_false(self):
+        fake = self._fcntl_mod()
+        fh = mock.Mock()
+        for code in (errno.EAGAIN, errno.EACCES, errno.EDEADLK):
+            fake.flock.side_effect = OSError(code, "busy")
+            with mock.patch.object(utils, "fcntl", fake):
+                self.assertFalse(utils._try_lock(fh), msg=code)
+
+    def test_unsupported_warns_and_proceeds(self):
+        fake = self._fcntl_mod()
+        fake.flock.side_effect = OSError(errno.ENOLCK, "no lock")
+        logged = []
+        with mock.patch.object(utils, "fcntl", fake):
+            with mock.patch.object(utils, "log_once", logged.append):
+                self.assertTrue(utils._try_lock(mock.Mock()))
+        self.assertTrue(any("不支持" in str(line) for line in logged), logged)
+
+    def test_other_oserror_raises(self):
+        fake = self._fcntl_mod()
+        fake.flock.side_effect = OSError(errno.EBADF, "bad fd")
+        with mock.patch.object(utils, "fcntl", fake):
+            with self.assertRaises(OSError) as ctx:
+                utils._try_lock(mock.Mock())
+        self.assertEqual(ctx.exception.errno, errno.EBADF)
+
+
+class TestLogSink(OfflineTestCase):
+    def test_write_failure_warns_stderr_and_drops_sink(self):
+        class Boom:
+            def write(self, *_args, **_kwargs):
+                raise OSError("disk full")
+
+            def flush(self):
+                return None
+
+        boom = Boom()
+        utils.add_log_sink(boom)
+        try:
+            buf = io.StringIO()
+            with mock.patch.object(sys, "stderr", buf):
+                utils.log("hello")
+                first = buf.getvalue()
+                self.assertIn("日志文件", first)
+                utils.log("again")
+                self.assertEqual(buf.getvalue(), first)
+        finally:
+            utils.remove_log_sink(boom)
 
 
 if __name__ == "__main__":

@@ -334,7 +334,10 @@ class ParseSpec:
             known = {norm(col.header) for col in self.columns}
             extras = [name.strip() for name in header_row if norm(name) not in known]
             if extras:
-                stats["extra_headers"] = extras
+                acc = stats.setdefault("extra_headers", [])
+                for name in extras:
+                    if name not in acc:
+                        acc.append(name)
         return pos, len(header_row)
 
     # ---------------------------------------------------------------- 取值
@@ -378,12 +381,19 @@ class ParseSpec:
         """命中 skip_if_empty 的行是否要跳过（任一指定列为空 → 跳过；'' 与 NULL 都算空）。"""
         return any(values[index] is None or values[index] == "" for index in self.skip_indexes)
 
+    def _add_footer_sums(self, sums: list, values: list) -> None:
+        """把一行金额累进合计（含 skip_if_empty 跳过的行，与文件合计行同口径）。"""
+        for k, index in enumerate(self.footer_sum_indexes):
+            # 高精度 context 累加（见 SUM_PRECISION 的说明）：默认 context 只有 28 位，
+            # 会把大额合计静默舍入，与精确的合计行比对时产生"假不一致"
+            sums[k] = _SUM_CONTEXT.add(sums[k], values[index] or decimal.Decimal(0))
+
     # ---------------------------------------------------------------- 主流程
     def iter_rows(self, path: Path, stats: dict | None = None):
         """逐行产出类型化值列表（表头校验、空行跳过、合计行识别与校验）。
 
-        生成器被完整消费时做尾部校验（合计行位置与金额核对）；行数统计与写入两趟
-        都会完整消费，验证因此会跑两遍（代价可忽略，换来写库前先拦下坏文件）。
+        生成器被完整消费时做尾部校验（合计行位置与金额核对）。写库前 CLI 会先完整
+        消费一趟拦住坏文件；源文件不大时把行缓存下来给 Tunnel 复用，避免再读一遍。
         """
         stats = stats if stats is not None else {}
         stats.setdefault("skipped", 0)
@@ -425,14 +435,12 @@ class ParseSpec:
                         footer, footer_row_no = row, row_no
                         continue
                     values = self.convert_row(row, header_pos, path.name, row_no)
+                    # 跳过的行仍计入合计：源文件合计行通常含这些行，只是不写库
+                    self._add_footer_sums(sums, values)
+                    last_data_row_no = row_no
                     if self.row_skipped(values):
                         stats["skipped"] += 1
                         continue
-                    last_data_row_no = row_no
-                    for k, index in enumerate(self.footer_sum_indexes):
-                        # 高精度 context 累加（见 SUM_PRECISION 的说明）：默认 context 只有 28 位，
-                        # 会把大额合计静默舍入，与精确的合计行比对时产生"假不一致"
-                        sums[k] = _SUM_CONTEXT.add(sums[k], values[index] or decimal.Decimal(0))
                     stats["rows"] += 1
                     yield values
         except UnicodeDecodeError as exc:
@@ -447,13 +455,25 @@ class ParseSpec:
             return
         if header_pos is None:  # pragma: no cover - content=True 时不可能走到
             raise RuntimeError(f"{path.name} 没有可解析的表头行")
+        if self.footer_enabled and footer is None:
+            raise RuntimeError(
+                f"{path.name} 配置了合计行（parse.footer）但文件中没有合计行（首列为空的行）；"
+                f"文件可能被截断或格式变了，已中止"
+            )
         if footer is not None:
             if last_data_row_no is not None and footer_row_no < last_data_row_no:
                 raise RuntimeError(f"{path.name} 合计行不在数据行之后（第 {footer_row_no} 行），格式可能变了")
             if self.footer_sum_indexes:
                 got = []
                 for index in self.footer_sum_indexes:
-                    raw = footer[index].strip() if index < len(footer) else ""
+                    pos = header_pos[index] if index < len(header_pos) else -1
+                    if pos < 0:
+                        col = self.columns[index]
+                        raise RuntimeError(
+                            f"{path.name} 合计行无法核对：列 {col.header!r}（{col.name}）"
+                            f"在文件表头中不存在，无法按列名取合计值"
+                        )
+                    raw = footer[pos].strip() if pos < len(footer) else ""
                     try:
                         # 与数据行同一套数字口径：千分位必须按 "1,234" 规范写，
                         # 不能简单 replace(",") —— "1,23"/欧式小数会被静默读成错值
@@ -569,17 +589,49 @@ def read_header(path: Path, encoding: str = "utf-8-sig") -> list[str]:
     raise ConfigError(f"{path.name} 里没有找到表头行（空文件？）")
 
 
-def iter_batches(paths: list[Path], spec: ParseSpec, batch_size: int = 500, stats: dict | None = None):
+# 第一趟解析结果可复用给写库：源文件总大小不超过该值才把行留在内存里，
+# 避免把多 GB 文件的解析结果全载入 RAM；超限时写库再扫一遍文件。
+REUSE_ROWS_MAX_BYTES = 32 * 1024 * 1024
+
+
+def source_bytes(paths: list[Path]) -> int:
+    """本地源文件总字节数；任一文件 stat 失败则视为超限（不缓存）。"""
+    total = 0
+    try:
+        for path in paths:
+            total += Path(path).stat().st_size
+            if total > REUSE_ROWS_MAX_BYTES:
+                return total
+    except OSError:
+        return REUSE_ROWS_MAX_BYTES + 1
+    return total
+
+
+def iter_batches(
+    paths: list[Path],
+    spec: ParseSpec,
+    batch_size: int = 500,
+    stats: dict | None = None,
+    prepared_rows: list | None = None,
+):
     """多个文件按 batch_size 攒批给 Tunnel 写入（Tunnel 按批传，别一行一条发）。
 
     stats 传入时，跳过行/数据行会累计进去（「先数行数」那趟用它统计）。
+    prepared_rows 给定时不再读文件，直接切已解析好的行（写库校验/重试可重复调用）。
     """
     batch: list[list] = []
-    for path in paths:
-        for row in spec.iter_rows(path, stats):
-            batch.append(row)
-            if len(batch) >= batch_size:
-                yield batch
-                batch = []
+    rows_iter = prepared_rows if prepared_rows is not None else None
+    if rows_iter is None:
+
+        def _from_files():
+            for path in paths:
+                yield from spec.iter_rows(path, stats)
+
+        rows_iter = _from_files()
+    for row in rows_iter:
+        batch.append(row)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
     if batch:
         yield batch

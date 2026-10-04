@@ -207,11 +207,12 @@ def normalize_job(job: dict) -> dict:
     check_block_types(job)
     sftp = dict(job.get("sftp") or {})
     if sftp:
-        sftp.setdefault("port", 22)
-        sftp.setdefault("connect_timeout", 30)
-        sftp.setdefault("io_timeout", 600)
-        sftp.setdefault("retry_times", 3)
-        sftp.setdefault("retry_delay", 10)
+        # JSON null / 空串不能靠 setdefault：键已存在时不会补默认值，None 会一路传到连接层
+        _fill_default(sftp, "port", 22)
+        _fill_default(sftp, "connect_timeout", 30)
+        _fill_default(sftp, "io_timeout", 600)
+        _fill_default(sftp, "retry_times", 3)
+        _fill_default(sftp, "retry_delay", 10)
         auth = dict(sftp.get("auth") or {})
         if auth:
             auth.setdefault("type", "password")
@@ -249,6 +250,17 @@ def normalize_job(job: dict) -> dict:
 # =============================================================================
 
 
+def _fill_default(block: dict, key: str, default) -> None:
+    """缺省、JSON null、空串都当成未配置，写入默认值。"""
+    if block.get(key) is None or block.get(key) == "":
+        block[key] = default
+
+
+def _as_mapping(value) -> dict:
+    """未知键扫描只接受对象；字符串/数组退化成空，避免 .get 崩或按字符告警。"""
+    return value if isinstance(value, dict) else {}
+
+
 def _check_unknown_keys(obj: dict, allowed: set, where: str, warnings: list) -> None:
     """逐个键比对白名单，命中就追加一条告警（JSON 没有注释，以 // 或 # 开头的键当注释放过）。"""
     for key in obj:
@@ -263,13 +275,14 @@ def collect_warnings(job: dict) -> list[str]:
     warnings: list[str] = []
     warnings.extend(job.pop(_WARNINGS_KEY, None) or [])
     _check_unknown_keys(job, JOB_KEYS, "作业", warnings)
-    _check_unknown_keys(job.get("sftp") or {}, SFTP_KEYS, "sftp", warnings)
-    _check_unknown_keys(job.get("sftp", {}).get("auth") or {}, SFTP_AUTH_KEYS, "sftp.auth", warnings)
-    _check_unknown_keys(job.get("source") or {}, SOURCE_KEYS, "source", warnings)
-    _check_unknown_keys(job.get("target") or {}, TARGET_KEYS, "target", warnings)
-    _check_unknown_keys(job.get("missing") or {}, MISSING_KEYS, "missing", warnings)
-    _check_unknown_keys(job.get("notify") or {}, NOTIFY_KEYS, "notify", warnings)
-    parse_cfg = job.get("parse") or {}
+    sftp = _as_mapping(job.get("sftp"))
+    _check_unknown_keys(sftp, SFTP_KEYS, "sftp", warnings)
+    _check_unknown_keys(_as_mapping(sftp.get("auth")), SFTP_AUTH_KEYS, "sftp.auth", warnings)
+    _check_unknown_keys(_as_mapping(job.get("source")), SOURCE_KEYS, "source", warnings)
+    _check_unknown_keys(_as_mapping(job.get("target")), TARGET_KEYS, "target", warnings)
+    _check_unknown_keys(_as_mapping(job.get("missing")), MISSING_KEYS, "missing", warnings)
+    _check_unknown_keys(_as_mapping(job.get("notify")), NOTIFY_KEYS, "notify", warnings)
+    parse_cfg = _as_mapping(job.get("parse"))
     _check_unknown_keys(parse_cfg, parse_mod.PARSE_KEYS, "parse", warnings)
     for index, col in enumerate(parse_cfg.get("columns") or []):
         if isinstance(col, dict):
@@ -332,8 +345,8 @@ def validate_job(job: dict) -> None:
     if not sftp.get("username"):
         raise ConfigError("作业配置缺少 sftp.username（SFTP 登录名）")
     _require_number(sftp.get("port"), "sftp.port", minimum=1, maximum=65535, integer=True)
-    _require_number(sftp.get("connect_timeout"), "sftp.connect_timeout", exclusive_min=0)
-    _require_number(sftp.get("io_timeout"), "sftp.io_timeout", exclusive_min=0)
+    _require_number(sftp.get("connect_timeout"), "sftp.connect_timeout", minimum=0)
+    _require_number(sftp.get("io_timeout"), "sftp.io_timeout", minimum=0)
     _require_number(sftp.get("retry_times"), "sftp.retry_times", minimum=0, integer=True)
     _require_number(sftp.get("retry_delay"), "sftp.retry_delay", minimum=0)
     auth = sftp.get("auth")

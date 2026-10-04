@@ -35,6 +35,8 @@ def flat_source(**overrides) -> sftp_mod.SftpSource:
     cfg.update(overrides.pop("sftp", {}))
     source = {"root": "/data", "layout": "flat", "file_regex": "report_(?P<date>\\d{8})\\.csv"}
     source.update(overrides.pop("source", {}))
+    if overrides:
+        raise TypeError(f"未知 override: {sorted(overrides)}")
     return sftp_mod.SftpSource(cfg, source)
 
 
@@ -68,6 +70,33 @@ class TestSourceConfigGuards(OfflineTestCase):
                 }
             )
         self.assertIn("(?P<date>", str(ctx.exception))
+
+
+class TestZeroConfigAndRoot(OfflineTestCase):
+    def test_unknown_override_keys_error(self):
+        with self.assertRaises(TypeError) as ctx:
+            flat_source(host="x")
+        self.assertIn("未知", str(ctx.exception))
+
+    def test_zero_timeouts_and_delay_are_kept(self):
+        source = flat_source(sftp={"retry_times": 0, "retry_delay": 0, "connect_timeout": 0, "io_timeout": 0})
+        self.assertEqual(source.retry_times, 0)
+        self.assertEqual(source.retry_delay, 0.0)
+        self.assertEqual(source.connect_timeout, 0.0)
+        self.assertEqual(source.io_timeout, 0.0)
+
+    def test_root_slash_lists_filesystem_root(self):
+        """root="/" 必须扫根目录，不能 rstrip 成空后再 listdir(".")（家目录）。"""
+        fake = FakeSftp()
+        fake.tree["/"] = [FakeEntry("report_20260920.csv", 4)]
+        fake.contents["/report_20260920.csv"] = b"a,b\n"
+        fake.tree["."] = []
+        source = flat_source(source={"root": "/"}, sftp={"retry_times": 0})
+        self.assertEqual(source.root, "/")
+        with mock.patch.object(sftp_mod.SftpSource, "_connect", connect_to(fake)):
+            files = source.list_files()
+        self.assertIn("20260920", files)
+        self.assertEqual(files["20260920"][0].remote, "/report_20260920.csv")
 
 
 class TestNormalize(OfflineTestCase):
@@ -261,6 +290,16 @@ class TestDownload(OfflineTestCase):
             with self.assertRaises(RuntimeError):
                 source.download(item, self.tmp / item.name)
 
+    def test_retry_times_zero_does_not_retry(self):
+        """retry_times=0 表示只试一次，不能被 `x or 3` 吞成 3 次重试。"""
+        item = self._item()
+        self.fake.fail_downloads = 1
+        source = flat_source(sftp={"retry_times": 0, "retry_delay": 0})
+        with mock.patch.object(sftp_mod.SftpSource, "_connect", connect_to(self.fake)):
+            with self.assertRaises(RuntimeError):
+                source.download(item, self.tmp / item.name)
+        self.assertEqual(self.fake.get_calls, 1)
+
 
 class FakeChannel:
     def __init__(self):
@@ -292,6 +331,9 @@ class TestConnect(OfflineTestCase):
         class PasswordRequiredException(SSHException):
             pass
 
+        class BadHostKeyException(SSHException):
+            pass
+
         class AutoAddPolicy:
             pass
 
@@ -301,6 +343,7 @@ class TestConnect(OfflineTestCase):
         module.AuthenticationException = AuthenticationException
         module.SSHException = SSHException
         module.PasswordRequiredException = PasswordRequiredException
+        module.BadHostKeyException = BadHostKeyException
         module.AutoAddPolicy = AutoAddPolicy
         module.RejectPolicy = RejectPolicy
         last = {}
@@ -316,11 +359,17 @@ class TestConnect(OfflineTestCase):
             def load_system_host_keys(self):
                 self.system_host_keys_loaded = True
 
+            def load_host_keys(self, filename):
+                self.user_host_keys = getattr(self, "user_host_keys", [])
+                self.user_host_keys.append(filename)
+
             def connect(self, **kwargs):
                 if last.get("fail_auth"):
                     raise AuthenticationException("bad password")
                 if last.get("fail_passphrase"):
                     raise PasswordRequiredException("private key file is encrypted")
+                if last.get("fail_bad_host_key"):
+                    raise BadHostKeyException("host key mismatch")
                 if last.get("fail_ssh"):
                     raise SSHException(last["fail_ssh"])
                 self.kwargs = kwargs
@@ -489,6 +538,27 @@ class TestHostKeyPolicy(TestConnect):
         # 显式 RejectPolicy：拒绝未知主机指纹，"严格"写死在代码里，不依赖 paramiko 的隐式默认策略
         self.assertIsInstance(last["client"].policy, module.RejectPolicy)
 
+    def test_loads_user_known_hosts_when_present(self):
+        module, last = self._fake_paramiko()
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            known = home / ".ssh" / "known_hosts"
+            known.parent.mkdir()
+            known.write_text("host ssh-rsa AAAA\n", encoding="utf-8")
+            with mock.patch.object(sftp_mod, "paramiko", module):
+                with mock.patch.object(sftp_mod.Path, "home", return_value=home):
+                    flat_source()._connect()
+        self.assertEqual(last["client"].user_host_keys, [str(known)])
+
+    def test_skips_user_known_hosts_when_missing(self):
+        module, last = self._fake_paramiko()
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            with mock.patch.object(sftp_mod, "paramiko", module):
+                with mock.patch.object(sftp_mod.Path, "home", return_value=home):
+                    flat_source()._connect()
+        self.assertFalse(getattr(last["client"], "user_host_keys", []))
+
     def test_auto_accept_uses_autoadd_policy(self):
         module, last = self._fake_paramiko()
         source = flat_source(sftp={"host_key": "auto_accept"})
@@ -502,9 +572,18 @@ class TestHostKeyPolicy(TestConnect):
         module, last = self._fake_paramiko()
         last["fail_ssh"] = "Server 'h' not found in known_hosts"
         with mock.patch.object(sftp_mod, "paramiko", module):
-            with self.assertRaises(RuntimeError) as ctx:
+            with self.assertRaises(FatalSourceError) as ctx:
                 flat_source()._connect()
         self.assertIn("ssh-keyscan", str(ctx.exception))
+
+    def test_bad_host_key_is_fatal(self):
+        """指纹不匹配是确定性安全错误，不能当瞬时故障重试。"""
+        module, last = self._fake_paramiko()
+        last["fail_bad_host_key"] = True
+        with mock.patch.object(sftp_mod, "paramiko", module):
+            with self.assertRaises(FatalSourceError) as ctx:
+                flat_source()._connect()
+        self.assertIn("指纹", str(ctx.exception))
 
     def test_auto_accept_error_has_no_keyscan_hint(self):
         """auto_accept 模式（显式不校验）下报错不应再提示 keyscan。"""
@@ -512,7 +591,7 @@ class TestHostKeyPolicy(TestConnect):
         last["fail_ssh"] = "Server 'h' not found in known_hosts"
         source = flat_source(sftp={"host_key": "auto_accept"})
         with mock.patch.object(sftp_mod, "paramiko", module):
-            with self.assertRaises(RuntimeError) as ctx:
+            with self.assertRaises(FatalSourceError) as ctx:
                 source._connect()
         self.assertNotIn("ssh-keyscan", str(ctx.exception))
 

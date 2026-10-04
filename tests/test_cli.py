@@ -613,11 +613,11 @@ class TestSyncInterrupt(CliTestCase):
             calls = {"n": 0}
             real_iter_batches = parse_mod.iter_batches
 
-            def counting(paths, spec):
+            def counting(*args, **kwargs):
                 calls["n"] += 1
                 if calls["n"] >= WRITE_PHASE_CALL_INDEX:
                     raise KeyboardInterrupt
-                return real_iter_batches(paths, spec)
+                return real_iter_batches(*args, **kwargs)
 
             with mock.patch.object(parse_mod, "iter_batches", counting):
                 rc = cli_mod.main(["--job", str(world.job_path), "--bizdate", "20260920"])
@@ -731,7 +731,7 @@ class TestMainEntry(CliTestCase):
             "/data/report_20260921.csv": report([["o2", "2.00"]]),
         }
         with World(self.tmp, files=files) as world:
-            with mock.patch.dict("os.environ", {"bizdate": "20260922"}, clear=True):
+            with mock.patch.dict("os.environ", {"bizdate": "20260922"}, clear=False):
                 rc = cli_mod.main(
                     ["--job", str(world.job_path), "--start-date", "2026-09-20", "--end-date", "2026-09-21"]
                 )
@@ -785,6 +785,25 @@ class TestRedactionHelpers(CliTestCase):
         out = redact_secrets(collect_secret_values(job), text)
         self.assertNotIn("secret-pw", out)
         self.assertNotIn("abc12345", out)
+
+
+class TestPromptSecret(CliTestCase):
+    def test_getpass_success(self):
+        with mock.patch.object(cli_mod.getpass, "getpass", return_value="hidden"):
+            self.assertEqual(cli_mod.prompt_secret(), "hidden")
+
+    def test_fallback_warns_that_input_echoes(self):
+        logs = []
+        with mock.patch.object(cli_mod.getpass, "getpass", side_effect=EOFError()):
+            with mock.patch.object(cli_mod, "log", logs.append):
+                with mock.patch("builtins.input", return_value="echoed"):
+                    self.assertEqual(cli_mod.prompt_secret(), "echoed")
+        self.assertTrue(any("明文回显" in str(line) for line in logs), logs)
+
+    def test_unexpected_errors_are_not_swallowed(self):
+        with mock.patch.object(cli_mod.getpass, "getpass", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                cli_mod.prompt_secret()
 
 
 if __name__ == "__main__":

@@ -282,6 +282,26 @@ class TestHeaderMapping(SpecTestCase):
         self.assert_rows(self.rows_of(path, spec(COLUMNS), stats), [["o1", decimal.Decimal("1.5"), 3, 0.25]])
         self.assertEqual(stats["extra_headers"], ["New column", "Another"])
 
+    def test_extra_headers_accumulate_across_files(self):
+        """多文件共用 stats 时新增列必须累计，不能被后一个文件覆盖。"""
+        p1 = self.make_file(
+            "a.csv",
+            csv_bytes(
+                ["Order ID", "Settlement amount", "Count", "Rate", "NewA"],
+                [["o1", "1.5", "3", "0.25", "x"]],
+            ),
+        )
+        p2 = self.make_file(
+            "b.csv",
+            csv_bytes(
+                ["Order ID", "Settlement amount", "Count", "Rate", "NewB"],
+                [["o2", "1.5", "3", "0.25", "y"]],
+            ),
+        )
+        stats = {"skipped": 0}
+        list(parse_mod.iter_batches([p1, p2], spec(COLUMNS), batch_size=10, stats=stats))
+        self.assertEqual(stats["extra_headers"], ["NewA", "NewB"])
+
     def test_no_extra_headers_entry_when_all_mapped(self):
         path = self.make_file("a.csv", csv_bytes([c["header"] for c in COLUMNS], [["o1", "1.5", "3", "0.25"]]))
         stats = {"skipped": 0}
@@ -418,6 +438,21 @@ class TestFooter(SpecTestCase):
             self.rows_of(path, s)
         self.assertIn("合计", str(ctx.exception))
 
+    def test_footer_enabled_but_missing_is_error(self):
+        """配置了 parse.footer 但文件没有合计行：当截断/格式变化，必须失败。"""
+        path = self.make([["a", "1.5"], ["b", "2.5"]])
+        s = spec(self.COLS, footer={"sum": ["amount"]})
+        with self.assertRaises(RuntimeError) as ctx:
+            self.rows_of(path, s)
+        self.assertIn("没有合计行", str(ctx.exception))
+
+    def test_footer_enabled_header_only_is_error(self):
+        path = self.make_file("a.csv", csv_bytes([c["header"] for c in self.COLS], []))
+        s = spec(self.COLS, footer={"sum": ["amount"]})
+        with self.assertRaises(RuntimeError) as ctx:
+            self.rows_of(path, s)
+        self.assertIn("没有合计行", str(ctx.exception))
+
     def test_multiple_footers_error(self):
         rows = csv_bytes([c["header"] for c in self.COLS], [["a", "1"], ["", "0"], ["b", "2"], ["", "1"]])
         path = self.make_file("a.csv", rows)
@@ -457,6 +492,51 @@ class TestFooter(SpecTestCase):
         path = self.make([["a", "1,234.50"], ["b", "2.50"]], footer=["", "1,237.00"])
         s = spec(self.COLS, footer={"sum": ["amount"]})
         self.assertEqual(len(self.rows_of(path, s)), 2)
+
+    def test_footer_sum_follows_header_mapping_not_config_index(self):
+        """合计行按表头映射取值：文件多一列时不能用配置列下标去索引原始行。"""
+        path = self.make_file(
+            "a.csv",
+            csv_bytes(["Name", "Extra", "Amount"], [["a", "999", "1.5"], ["b", "0", "2.5"], ["", "0", "4.0"]]),
+        )
+        s = spec(self.COLS, footer={"sum": ["amount"]})
+        got = self.rows_of(path, s)
+        self.assertEqual(len(got), 2)
+
+    def test_footer_sum_missing_mapped_column_errors(self):
+        cols = [
+            {"header": "Name", "name": "name", "type": "string"},
+            {"header": "Amount", "name": "amount", "type": "decimal(19,10)", "required": False},
+        ]
+        # 文件里没有 Amount，但合计行不是空行（否则会被当成空行跳过）
+        path = self.make_file("a.csv", csv_bytes(["Name", "Extra"], [["a", "z"], ["", "4.0"]]))
+        s = spec(cols, footer={"sum": ["amount"]})
+        with self.assertRaises(RuntimeError) as ctx:
+            self.rows_of(path, s)
+        self.assertIn("合计行无法核对", str(ctx.exception))
+        self.assertIn("Amount", str(ctx.exception))
+
+    def test_skip_if_empty_rows_still_count_in_footer_sum(self):
+        """skip_if_empty 的行不写库，但仍计入合计（与文件合计行同口径）。"""
+        cols = [
+            {"header": "Name", "name": "name", "type": "string"},
+            {"header": "Note", "name": "note", "type": "string"},
+            {"header": "Amount", "name": "amount", "type": "decimal(19,10)"},
+        ]
+        path = self.make_file(
+            "a.csv",
+            csv_bytes(
+                ["Name", "Note", "Amount"],
+                [["a", "keep", "1.5"], ["b", "", "2.5"], ["", "", "4.0"]],
+            ),
+        )
+        s = spec(cols, footer={"sum": ["amount"]}, skip_if_empty=["note"])
+        stats = {"skipped": 0, "rows": 0}
+        got = self.rows_of(path, s, stats)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0][0], "a")
+        self.assertEqual(stats["skipped"], 1)
+        self.assertEqual(stats["rows"], 1)
 
 
 class TestDelimiterEncoding(SpecTestCase):
@@ -514,6 +594,14 @@ class TestBatches(SpecTestCase):
         batches = list(parse_mod.iter_batches([p1, p2], spec(COLUMNS), batch_size=10))
         self.assertEqual(sum(len(b) for b in batches), 2)
 
+    def test_prepared_rows_does_not_reread_files(self):
+        """写库复用第一趟行列表时，不再打开源文件。"""
+        path = self.make_file("a.csv", csv_bytes([c["header"] for c in COLUMNS], [["o1", "1", "2", "3"]]))
+        rows = list(spec(COLUMNS).iter_rows(path))
+        path.unlink()
+        batches = list(parse_mod.iter_batches([path], spec(COLUMNS), prepared_rows=rows))
+        self.assertEqual(sum(len(b) for b in batches), 1)
+
 
 class TestReadHeader(SpecTestCase):
     def test_reads_first_row(self):
@@ -570,7 +658,7 @@ class TestValueRange(SpecTestCase):
         s = spec([{"header": "金额", "name": "amount", "type": "decimal(10,2)"}])
         ok = self.make_file("ok.csv", csv_bytes(["金额"], [["1.500"], ["2.3400"]]))
         got = self.rows_of(ok, s)
-        self.assertEqual(len(got), 2)
+        self.assert_rows(got, [[decimal.Decimal("1.500")], [decimal.Decimal("2.3400")]])
         bad = self.make_file("bad.csv", csv_bytes(["金额"], [["1.234"]]))
         with self.assertRaises(RuntimeError) as ctx:
             self.rows_of(bad, s)

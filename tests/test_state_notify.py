@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -39,6 +40,27 @@ class TestState(OfflineTestCase):
         state_mod.save_state(path, state)
         self.assertEqual(state_mod.load_state(path), state)
         self.assertFalse((self.tmp / "state.json.tmp").exists())
+
+    def test_save_state_uses_unique_tmp_name(self):
+        """两个 writer 不能共用固定的 .tmp，临时名要带 pid/uuid。"""
+        path = self.tmp / "state.json"
+        seen = []
+        real_replace = os.replace
+
+        def capture(src, dst):
+            seen.append(Path(src).name)
+            real_replace(src, dst)
+
+        with mock.patch.object(state_mod.os, "replace", capture):
+            state_mod.save_state(path, {"a": 1})
+            state_mod.save_state(path, {"b": 2})
+        self.assertEqual(len(seen), 2)
+        self.assertNotEqual(seen[0], seen[1])
+        for name in seen:
+            self.assertTrue(name.startswith("state.json."), name)
+            self.assertTrue(name.endswith(".tmp"), name)
+            self.assertNotEqual(name, "state.json.tmp")
+            self.assertIn(str(os.getpid()), name)
 
     def test_save_creates_parent_dir(self):
         path = self.tmp / "deep" / "dir" / ".uploaded.json"
@@ -104,6 +126,31 @@ class TestState(OfflineTestCase):
         path.write_bytes(b"123")
         self.assertEqual(len(state_mod.md5_of(path)), 32)
         self.assertEqual(state_mod.md5_of(self.tmp / "nope"), "")
+
+    def test_save_state_merges_concurrent_records(self):
+        """后一次 save 不能整文件覆盖掉磁盘上另一进程刚写入的键。"""
+        path = self.tmp / "state.json"
+        state_mod.save_state(path, {"a.csv": {"table": "t", "pt": "1", "size": 1}})
+        state_mod.save_state(path, {"b.csv": {"table": "t", "pt": "2", "size": 2}})
+        data = state_mod.load_state(path)
+        self.assertIn("a.csv", data)
+        self.assertIn("b.csv", data)
+
+    def test_save_state_uses_interprocess_lock(self):
+        path = self.tmp / "state.json"
+        seen = []
+
+        from contextlib import contextmanager
+
+        @contextmanager
+        def fake_lock(lock_path):
+            seen.append(str(lock_path))
+            yield
+
+        with mock.patch.object(state_mod, "interprocess_lock", fake_lock):
+            state_mod.save_state(path, {"a": 1})
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0].endswith(".lock"))
 
 
 class FakeResponse:

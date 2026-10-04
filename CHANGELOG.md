@@ -50,6 +50,39 @@
 - **台账文件含非法 UTF-8 字节时给明确报错**（UnicodeDecodeError 原来逃出 except、抛裸 traceback）。
 - **飞书告警对非对象 JSON 响应按失败处理**（原来 `data.get` 抛 AttributeError 打断主流程）。
 - **探测分隔符失败留一条告警**（原来静默回退逗号，后续解析报错指向不明）。
+- **台账改为"进程间锁 + 读盘合并"写入**：两个工具可能共用一份 `.uploaded.json`，只做原子替换
+  挡不住丢更新（A 读完后 B 写入的记录会被 A 整文件覆盖）。现在 load-modify-save 外包一层
+  跨平台文件锁（flock / msvcrt），持锁期间重新读盘再合并本次记录；临时文件名带 pid+uuid，
+  写完 `os.replace` 原子替换。
+- **第一趟解析结果可复用，小文件写库不再二次扫描**：源文件总大小 ≤ `REUSE_ROWS_MAX_BYTES`
+  （32MB）时把解析好的行缓存给写库复用（`iter_batches(prepared_rows=...)`），大文件仍按原
+  方式重扫，峰值内存有硬上限。
+- **多文件解析：新增列统计累计而不是互相覆盖**（原来后一个文件的 `extra_headers` 会覆盖前一个）。
+- **合计行（parse.footer）三处口径修正**：① 配置了合计行但文件里找不到合计行 → 直接报错
+  （原来静默接受被截断的文件）；② 合计值按"表头映射"取列（文件多列/列序不同时不再取错位）；
+  ③ `skip_if_empty` 跳过的数据行仍计入合计（与源文件合计行同口径，不再假报"合计不一致"）。
+- **JSON 配置 null/空串不再绕过默认值**：`sftp.port/connect_timeout/io_timeout/retry_times/
+  retry_delay` 原来用 `setdefault`，JSON `null` 会带着 None 进连接层；现在空串/null 一律按
+  未配置补默认值。
+- **非对象配置块的告警不再崩/不再逐字符噪音**：`collect_warnings` 对 sftp/sftp.auth/source/
+  target/missing/notify/parse 非对象时按"空块"处理（原来 AttributeError 或把字符串拆成
+  逐字符假告警）。
+- **文件锁的错误分类**：busy（别人持锁）→ 按"已有任务在运行"退出；`ENOLCK/ENOTSUP`（文件
+  系统不支持锁）→ 告警后不加锁继续；其它 OSError 原样抛出（原来任何 OSError 都被当成
+  "锁被占用"，在不支持 flock 的文件系统上会永久挡住作业）。
+- **`--log-file` 写入失败不再完全静默**：失败时向 stderr 告警一次并摘掉该 sink（主流程不受影响）。
+- **显式配置的 0 不再被 `or 默认值` 吞掉**：`retry_times/retry_delay/connect_timeout/io_timeout`
+  改 `_cfg_or_default`（None/空串才用默认值；0 = 不重试/零等待）。
+- **`source.root="/"` 不再被 rstrip 成空后扫家目录**：新增 `_join_root`，两种布局的远端路径
+  拼接统一走它。
+- **主机指纹类错误改为不可重试（FatalSourceError）**：指纹不匹配（BadHostKeyException）、
+  严格模式下"未知主机"原来按瞬时故障重试若干轮（白等）；现在直接失败并给排查指引；
+  严格模式额外加载 `~/.ssh/known_hosts`（paramiko 的 load_system_host_keys(None) 语义随版本
+  有差异，显式加载用户文件兜底）。
+- **脱敏的查询串/头行规则改为迭代扫描**：原来按段递归有 O(n²)/RecursionError 风险，
+  改从左到右单遍替换（嵌套 key=value 仍覆盖）。
+- **`--init` 的密钥输入回退可见**：getpass 不可用退回 input() 时明确提示会明文回显；
+  只捕获 EOFError/OSError（+ GetPassWarning），其它异常不再被静默降级。
 
 ### 安全
 
@@ -83,6 +116,10 @@
   测试文件不再把仓库根/tests 目录插到 `sys.path` 最前（改为缺失时追加，避免遮蔽同名模块）。
 - 新增回归用例覆盖上述修复（台账键口径、区间优先于环境变量、合计行数字口径、decimal 尾零、
   分区值白名单、分隔符探测告警、软链/未知大小、向导异常路径、`--init` 退出码、lifecycle NaN 等）。
+- 第二次复审批次的回归用例：台账并发合并写入、解析结果复用（`prepared_rows` 不再读文件）、
+  合计行缺失/按表头映射/跳过行计入、零值超时与重试保留、`root="/"`、指纹不匹配不可重试、
+  多文件新增列累计、Decimal 尾零断言改 `as_tuple`、配置工厂未知 override 报错、环境变量
+  `clear` 用法收敛等（离线用例 334 → 363）。
 
 ### 文档
 

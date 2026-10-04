@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from pathlib import Path
 
-from .utils import log
+from .utils import interprocess_lock, log
 
 STATE_FILE_NAME = ".uploaded.json"
 
@@ -35,12 +36,32 @@ def load_state(path: Path) -> dict:
 
 
 def save_state(path: Path, state: dict) -> None:
-    """写台账（先写临时文件再原子替换，半截文件不会覆盖好台账）。"""
+    """写台账（进程间锁 + 与磁盘合并 + 临时文件原子替换）。
+
+    两个工具可能共用一份台账：只做原子替换挡不住丢更新（A 读完后 B 写入的记录会被 A 整文件覆盖）。
+    因此在 load-modify-save 外包一层跨平台文件锁（POSIX flock / Windows msvcrt），
+    持锁期间重新读盘再合并本次记录。
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    with interprocess_lock(path.with_name(path.name + ".lock")):
+        merged = load_state(path)
+        merged.update(state)
+        _write_state_unlocked(path, merged)
+
+
+def _write_state_unlocked(path: Path, state: dict) -> None:
+    """写台账（先写临时文件再原子替换，半截文件不会覆盖好台账）。调用方须已持锁。"""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
 
 
 def record_of(state: dict, keys, size: int, table: str, pt: str, project: str | None = None) -> dict | None:
