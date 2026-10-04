@@ -10,8 +10,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# 只在路径缺失时追加（不插到最前面）：避免把仓库根/tests 目录置于标准库与第三方库
+# 之前遮蔽同名模块；按 README 在仓库根运行（或 CI 里 pip install -e .）时，
+# 本地包本来就在搜索路径最前（python -m 会把当前目录放在 sys.path[0]）
+for _path in (Path(__file__).resolve().parents[1], Path(__file__).resolve().parent):
+    if str(_path) not in sys.path:
+        sys.path.append(str(_path))
 
 from _helpers import (  # noqa: E402
     FakeOdps,
@@ -35,6 +39,10 @@ from sftp2ods import state as state_mod  # noqa: E402
 from sftp2ods.utils import FatalSourceError, RunLock, collect_secret_values, redact_secrets  # noqa: E402
 
 HEADERS = ["Order ID", "Settlement amount"]
+
+# mc.write_partition 的调用顺序：第 1 次 batches_factory() 是写前单格大小检查，
+# 第 2 次才是真正写库（见 mc.write_partition._do）。改实现时同步改这里。
+WRITE_PHASE_CALL_INDEX = 2
 
 
 def report(rows) -> bytes:
@@ -607,7 +615,7 @@ class TestSyncInterrupt(CliTestCase):
 
             def counting(paths, spec):
                 calls["n"] += 1
-                if calls["n"] >= 2:  # 第 1 次是写前单格大小检查；第 2 次才是真正写库
+                if calls["n"] >= WRITE_PHASE_CALL_INDEX:
                     raise KeyboardInterrupt
                 return real_iter_batches(paths, spec)
 
@@ -674,6 +682,15 @@ class TestMainEntry(CliTestCase):
         path.write_text("{oops", encoding="utf-8")
         self.assertEqual(cli_mod.main(["--job", str(path)]), 1)
 
+    def test_init_errors_map_to_exit_codes(self):
+        """--init 分支与其它分支同口径：配置/文件错 → 1（记日志），Ctrl+C → 130，不留裸 traceback。"""
+        from sftp2ods import init_wizard
+
+        with mock.patch.object(init_wizard, "run_init", side_effect=SystemExit("--init-out 指向的是目录")):
+            self.assertEqual(cli_mod.main(["--init"]), 1)
+        with mock.patch.object(init_wizard, "run_init", side_effect=KeyboardInterrupt):
+            self.assertEqual(cli_mod.main(["--init"]), 130)
+
     def test_check_flag(self):
         data = report([["o1", "1.00"]])
         with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
@@ -706,6 +723,58 @@ class TestMainEntry(CliTestCase):
         with World(self.tmp) as world:
             with mock.patch.dict("os.environ", {"bizdate": "oops"}, clear=False):
                 self.assertEqual(cli_mod.main(["--job", str(world.job_path)]), 1)
+
+    def test_explicit_range_wins_over_env_bizdate(self):
+        """调度环境里 bizdate 总存在；显式补数区间必须优先，不能被"单日 vs 区间"互斥拦下。"""
+        files = {
+            "/data/report_20260920.csv": report([["o1", "1.00"]]),
+            "/data/report_20260921.csv": report([["o2", "2.00"]]),
+        }
+        with World(self.tmp, files=files) as world:
+            with mock.patch.dict("os.environ", {"bizdate": "20260922"}, clear=True):
+                rc = cli_mod.main(
+                    ["--job", str(world.job_path), "--start-date", "2026-09-20", "--end-date", "2026-09-21"]
+                )
+            self.assertEqual(rc, 0)
+            self.assertEqual(sorted(world.table.deleted), ["pt=20260920", "pt=20260921"])
+
+
+class TestSyncLedgerKeyMismatch(CliTestCase):
+    def test_ledger_rows_track_local_file_not_remote_name(self):
+        """台账键的 basename 与远端文件名不同口径时，行数按本地落地文件记录，不能再 KeyError。
+
+        原实现：行数按 path.name 累积、却按 item.name 取值——两把键不一致时数据已入库、
+        台账写不进去，异常还会穿透 run_sync 变成裸 traceback。
+        """
+        data = report([["o1", "1.00"]])
+        with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
+            item = sftp_mod.RemoteFile(
+                date="20260920",
+                name="report_20260920.csv",
+                size=len(data),
+                remote="/data/report_20260920.csv",
+                ledger_key="20260920/renamed.csv",
+            )
+            with mock.patch.object(sftp_mod.SftpSource, "list_files", lambda self: {"20260920": [item]}):
+                self.assertEqual(world.sync(bizdate="20260920"), 0)
+            self.assertEqual(world.ledger()["20260920/renamed.csv"]["rows"], 1)
+
+
+class TestLifecycleDays(CliTestCase):
+    def test_nan_and_infinity_rejected(self):
+        # json.load 默认接受 NaN/Infinity 字面量：原来 float(raw) != int(raw) 会对 NaN 抛
+        # 未捕获的 ValueError（裸 traceback），现在统一给 SystemExit
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.assertRaises(SystemExit):
+                cli_mod._lifecycle_days({"lifecycle_days": bad})
+
+    def test_positive_int_values(self):
+        self.assertEqual(cli_mod._lifecycle_days({"lifecycle_days": 30}), 30)
+        self.assertEqual(cli_mod._lifecycle_days({"lifecycle_days": 30.0}), 30)
+        self.assertIsNone(cli_mod._lifecycle_days({}))
+        for bad in (True, 0, -1, 2.5, "30"):
+            with self.assertRaises(SystemExit):
+                cli_mod._lifecycle_days({"lifecycle_days": bad})
 
 
 class TestRedactionHelpers(CliTestCase):

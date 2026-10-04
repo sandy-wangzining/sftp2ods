@@ -10,8 +10,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# 只在路径缺失时追加（不插到最前面）：避免把仓库根/tests 目录置于标准库与第三方库
+# 之前遮蔽同名模块；按 README 在仓库根运行（或 CI 里 pip install -e .）时，
+# 本地包本来就在搜索路径最前（python -m 会把当前目录放在 sys.path[0]）
+for _path in (Path(__file__).resolve().parents[1], Path(__file__).resolve().parent):
+    if str(_path) not in sys.path:
+        sys.path.append(str(_path))
 
 from _helpers import OfflineTestCase  # noqa: E402
 
@@ -33,10 +37,13 @@ class TestNormDate(OfflineTestCase):
     def test_normalizes(self):
         self.assertEqual(dates.norm_date("2026-09-20", "--bizdate"), "20260920")
         self.assertEqual(dates.norm_date("2026/09/20", "--bizdate"), "20260920")
+        self.assertEqual(dates.norm_date("20260920", "--bizdate"), "20260920")
 
     def test_rejects_bad(self):
-        with self.assertRaises(SystemExit):
-            dates.norm_date("202609", "--bizdate")
+        # 分隔符位置不对的写法不能被"删掉所有 - 和 /"静默归一化（会落到错误的 pt 上）
+        for bad in ("202609", "20-2609-21", "2026-0/921", "2026092-1", "2026-0921"):
+            with self.assertRaises(SystemExit):
+                dates.norm_date(bad, "--bizdate")
 
 
 class TestEnvBizdate(OfflineTestCase):
@@ -45,16 +52,16 @@ class TestEnvBizdate(OfflineTestCase):
             self.assertIsNone(dates.env_bizdate())
 
     def test_valid(self):
-        with mock.patch.dict(os.environ, {"bizdate": "2026-09-20"}):
+        with mock.patch.dict(os.environ, {"bizdate": "2026-09-20"}, clear=True):
             self.assertEqual(dates.env_bizdate().isoformat(), "2026-09-20")
 
     def test_invalid_strict(self):
-        with mock.patch.dict(os.environ, {"bizdate": "oops"}):
+        with mock.patch.dict(os.environ, {"bizdate": "oops"}, clear=True):
             with self.assertRaises(SystemExit):
                 dates.env_bizdate()
 
     def test_invalid_non_strict(self):
-        with mock.patch.dict(os.environ, {"SKYNET_BIZDATE": "oops"}):
+        with mock.patch.dict(os.environ, {"SKYNET_BIZDATE": "oops"}, clear=True):
             self.assertIsNone(dates.env_bizdate(strict=False))
 
 

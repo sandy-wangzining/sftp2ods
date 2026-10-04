@@ -10,8 +10,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# 只在路径缺失时追加（不插到最前面）：避免把仓库根/tests 目录置于标准库与第三方库
+# 之前遮蔽同名模块；按 README 在仓库根运行（或 CI 里 pip install -e .）时，
+# 本地包本来就在搜索路径最前（python -m 会把当前目录放在 sys.path[0]）
+for _path in (Path(__file__).resolve().parents[1], Path(__file__).resolve().parent):
+    if str(_path) not in sys.path:
+        sys.path.append(str(_path))
 
 from _helpers import FakeInstance, FakeTable, OfflineTestCase  # noqa: E402
 
@@ -38,7 +42,8 @@ class TestCredentials(OfflineTestCase):
         self.assertIn("作业", source)
 
     def test_env_when_profile_empty(self):
-        with mock.patch.dict(os.environ, {"ALIYUN_ACCESS_KEY_ID": "EA", "ALIYUN_ACCESS_KEY_SECRET": "ES"}):
+        # clear=True：不把宿主机上残留的 ALIYUN_*/ALIBABA_* 变量带进用例（结果随环境变化）
+        with mock.patch.dict(os.environ, {"ALIYUN_ACCESS_KEY_ID": "EA", "ALIYUN_ACCESS_KEY_SECRET": "ES"}, clear=True):
             with tempfile.TemporaryDirectory() as tmp:
                 with mock.patch.object(mc_mod.Path, "home", return_value=Path(tmp)):
                     ak, sk, source = mc_mod.load_mc_credentials({}, "作业")
@@ -269,6 +274,77 @@ class TestWritePartition(OfflineTestCase):
             mc_mod.write_partition(table, "t", "20260920", self.factory([["a"]]), total=5)
         self.assertIn("写入行数异常", str(ctx.exception))
 
+    def test_retry_after_failed_session_does_not_duplicate(self):
+        """第一次写入"写了半截再失败"（会话里残留未提交的块），重试必须开新会话。
+
+        替身按 pyodps 语义建模 reopen：reopen=False 会把失败会话的块与本轮一起提交。
+        生产代码漏传 reopen=True 时，本用例会看到分区里出现重复行。
+        """
+        table = FakeTable()
+        original_open = table.open_writer
+        calls = {"n": 0}
+
+        def open_writer(partition=None, reopen=False):
+            writer = original_open(partition=partition, reopen=reopen)
+            calls["n"] += 1
+            if calls["n"] == 1:
+                real_write = writer.write
+
+                def half_then_fail(rows):
+                    real_write(rows)
+                    raise OSError("tunnel down after partial write")
+
+                writer.write = half_then_fail
+            return writer
+
+        table.open_writer = open_writer
+        written = mc_mod.write_partition(table, "t", "20260920", self.factory([["a"], ["b"]]), total=2, retries=3)
+        self.assertEqual(written, 2)
+        self.assertEqual(table.rows_in("20260920"), [["a"], ["b"]], "重试复用了失败会话，行被提交了两遍")
+
+
+class TestFakeWriterSessionModel(OfflineTestCase):
+    """替身本身的会话语义校准（reopen=True 开新会话 / reopen=False 复用）。"""
+
+    def test_reopen_semantics_match_pyodps(self):
+        table = FakeTable()
+        with self.assertRaises(OSError):
+            with table.open_writer(partition="pt=20260920", reopen=True) as writer:
+                writer.write([["stale"]])
+                raise OSError("tunnel down")
+        with table.open_writer(partition="pt=20260920", reopen=True) as writer:
+            writer.write([["fresh"]])
+        self.assertEqual(table.rows_in("20260920"), [["fresh"]], "reopen=True 应开新会话、丢弃旧块")
+
+        table2 = FakeTable()
+        with self.assertRaises(OSError):
+            with table2.open_writer(partition="pt=20260920", reopen=True) as writer:
+                writer.write([["stale"]])
+                raise OSError("tunnel down")
+        with table2.open_writer(partition="pt=20260920", reopen=False) as writer:
+            writer.write([["fresh"]])
+        self.assertEqual(table2.rows_in("20260920"), [["stale"], ["fresh"]], "reopen=False 应复用失败会话的块")
+
+
+class TestFakeInstanceStop(OfflineTestCase):
+    def test_stop_marks_terminated(self):
+        """stop 后 is_terminated 必须为真：否则"stop 后轮询终止"的代码在测试里永不退出
+        （单测把 sleep 变成空操作，死循环不会被超时打断）。"""
+        instance = FakeInstance()
+        self.assertFalse(instance.is_terminated())
+        instance.stop()
+        self.assertTrue(instance.stopped)
+        self.assertTrue(instance.is_terminated())
+
+
+class TestCellBytes(OfflineTestCase):
+    def test_types(self):
+        self.assertEqual(mc_mod._cell_bytes(None), 0)
+        self.assertEqual(mc_mod._cell_bytes("中文"), 6)
+        self.assertEqual(mc_mod._cell_bytes(b"\xff\xfe"), 2)  # bytes 按原始长度算，不走 str() 的 b'...' 形态
+        self.assertEqual(mc_mod._cell_bytes(bytearray(b"abc")), 3)
+        self.assertEqual(mc_mod._cell_bytes(123), 3)
+
 
 class TestCountPartition(OfflineTestCase):
     def _odps(self, rows):
@@ -288,6 +364,12 @@ class TestCountPartition(OfflineTestCase):
     def test_identifier_guard(self):
         with self.assertRaises(SystemExit):
             mc_mod.count_partition(self._odps([]), "p", "t;drop", "20260920")
+
+    def test_partition_value_whitelist(self):
+        """分区值拼进 SQL 前必须过白名单（pt 恒为 8 位业务日），注入形态一律拒绝。"""
+        for bad in ("2026-09-20", "20260920'; drop table x --", "", "202609201"):
+            with self.assertRaises(SystemExit):
+                mc_mod.count_partition(self._odps([]), "p", "t", bad)
 
 
 if __name__ == "__main__":

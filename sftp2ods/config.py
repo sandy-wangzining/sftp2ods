@@ -102,7 +102,12 @@ def _as_secrets(value, where: str) -> dict:
 
 def job_tz_of(job: dict) -> ZoneInfo:
     """作业时区：missing.timezone（默认 Asia/Shanghai），只影响 ${today} 等占位符与缺文件核对。"""
-    return load_zone(str((job.get("missing") or {}).get("timezone") or DEFAULT_TZ))
+    missing = job.get("missing")
+    if missing is not None and not isinstance(missing, dict):
+        # render_job 会在 check_block_types 之前调到这里：missing 写成字符串时
+        # 直接 .get 是 "'str' object has no attribute 'get'" 这种无上下文的裸异常
+        raise ConfigError(f"作业配置的 missing 必须是对象（键值对），实际 {type(missing).__name__}：{_show(missing)}")
+    return load_zone(str((missing or {}).get("timezone") or DEFAULT_TZ))
 
 
 def build_context(config: dict, bizdate, job_secrets: dict | None = None, tz: ZoneInfo | None = None) -> dict:
@@ -169,20 +174,23 @@ def deep_substitute(value, context: dict):
     return _PLACEHOLDER_RE.sub(_replace, value)
 
 
-def render_job(job_raw: dict, config: dict, bizdate) -> dict:
-    """作业配置 → 替换占位符（secrets/日期）后的运行时配置。
+def render_job(job_raw: dict, config: dict, bizdate) -> tuple[dict, dict]:
+    """作业配置 → 替换占位符（secrets/日期）后的运行时配置；返回 (作业, 渲染后的 --config)。
 
     作业文件里的 secrets 原样保留（密钥本身不参与占位符替换），只用于 ${secrets.x}。
+    --config 文件的 maxcompute/profiles 也参与替换（共享凭证常写成 ${secrets.ak}）：
+    替换结果以**新副本**返回，不就地改写入参——同一进程里用同一个 config 跑多个作业时，
+    就地改写会把上一个作业已替换的密钥/日期串到下一个作业。
     """
     context = build_context(config, bizdate, job_raw.get("secrets"), tz=job_tz_of(job_raw))
     job = {key: value for key, value in job_raw.items() if key != "secrets"}
     rendered = deep_substitute(job, context)
     rendered["secrets"] = _as_secrets(job_raw.get("secrets"), "作业配置的 secrets")
-    # --config 文件自己的 maxcompute/profiles 也参与替换（共享凭证常写成 ${secrets.ak}）
+    rendered_config = dict(config)
     for block in ("maxcompute", "profiles"):
         if isinstance(config.get(block), dict):
-            config[block] = deep_substitute(config[block], context)
-    return rendered
+            rendered_config[block] = deep_substitute(config[block], context)
+    return rendered, rendered_config
 
 
 def check_block_types(job: dict) -> None:
@@ -388,8 +396,13 @@ def validate_job(job: dict) -> None:
         if (
             isinstance(raw_lifecycle, bool)
             or not isinstance(raw_lifecycle, (int, float))
-            or float(raw_lifecycle) != int(raw_lifecycle)
-            or int(raw_lifecycle) <= 0
+            # NaN/Infinity 先挡掉：json.load 默认接受这些字面量，而 float(raw) != int(raw)
+            # 会对 NaN 直接抛 ValueError；浮点相等比较也不可靠，改判 is_integer()
+            or (
+                isinstance(raw_lifecycle, float)
+                and (not math.isfinite(raw_lifecycle) or not raw_lifecycle.is_integer())
+            )
+            or raw_lifecycle <= 0
         ):
             raise ConfigError(f"target.lifecycle_days 必须是正整数（天），实际 {raw_lifecycle!r}")
 
@@ -511,7 +524,10 @@ def build_job_summary(job: dict) -> list[str]:
     target = job.get("target") or {}
     missing = job.get("missing") or {}
     columns = parse_cfg.get("columns") or []
-    amount_count = sum(1 for col in columns if str(col.get("type") or "").lower().startswith("decimal"))
+    # 列元素可能是非对象（配置校验会拦，但概要打印是更早的路径）：加类型守卫，别崩在 AttributeError
+    amount_count = sum(
+        1 for col in columns if isinstance(col, dict) and str(col.get("type") or "").lower().startswith("decimal")
+    )
     layout_cn = "日期子目录" if str(source.get("layout") or "flat") == "date_dir" else "平铺"
     window = "无（默认全部日期）"
     if missing.get("check", True):

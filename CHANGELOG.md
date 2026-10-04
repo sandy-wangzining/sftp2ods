@@ -5,6 +5,89 @@
 
 ## [Unreleased]
 
+### 修复
+
+- **台账行数按本地落地文件记录，台账键与远端文件名不同口径时不再 KeyError**：行数统计原来按本地
+  路径名累积、写台账时却按远端 `item.name` 取值——两把键不一致时数据已写入 MaxCompute、台账却写
+  不进去，异常还会穿透 `run_sync` 变成裸 traceback；同一天两个文件重名时统计还会互相覆盖、行数
+  偏小并误报"写后校验不一致"。现在行数与 `local_paths` 按位置一一对应，两个坑一起消掉。
+- **显式补数区间优先于环境变量 bizdate**：调度环境（DataWorks）里 `bizdate` 环境变量总是存在，
+  以前执行 `--start-date/--end-date` 补数会被 `run_sync` 的"单日 vs 区间"互斥拦下、退出码还错成
+  1（文档约定 2=参数问题）。现在命令行显式给了区间就忽略环境变量 bizdate；`--bizdate` 与区间
+  同时显式给出仍在参数校验阶段以退出码 2 拒绝（互斥规则本身不变）。
+- **合计行金额与数据行走同一套数字口径**：合计行原来用 `raw.replace(",", "")` 解析，绕过了数据行
+  的千分位校验——欧式小数（`1.234,56`）、畸形千分位（`1,23`）会被静默读成错值，只在"合计不一致"
+  处报出指向不明的错误。现在同样走 `strip_thousands`，违规写法给出与数据行一致的报错。
+- **decimal 尾部补零不再被误判超限**：`decimal(10,2)` 下的 `1.500` 数值上精确可表示，原来按
+  "小数位 3 位 > 2 位"整文件中止（文件完全正常却天天失败）；现在只有"去掉多余小数位会改值"
+  （如 `1.234`）才拒绝。
+- **日期参数（`norm_date`）改用结构化白名单**：原来"删掉所有 `-` 和 `/`"会把 `20-2609-21`、
+  `2026092-1` 这类明显写错的日期静默归一化成合法值、落到错误的 pt 上（同一参数的 `--bizdate`
+  路径是严格正则，两套标准）。现在只接受 `YYYYMMDD` 或分隔符一致的 `YYYY-MM-DD` / `YYYY/MM/DD`。
+- **远端大小未知时不再误报"大小不一致"**：READDIR 未返回 `st_size`、或软链 `stat()` 失败时，
+  原来把 0/链接长度当"远端大小"，下载成功后仍被判不一致且报错指向错误方向；现在标记为大小未知
+  （日志显示"大小未知"），下载后跳过大小核对，`state.local_ready` 同步支持 `size=None`。
+- **`file_regex` / `date_dir_regex` 必须含 `(?P<date>)` 命名组**：缺组时原来在扫描时抛
+  IndexError（报错不可读、还会被重试循环当瞬时错误白重试）；现在在 `SftpSource` 构造时给出配置错。
+- **向导列名去重考虑生成的后缀**：`["Amount","Amount","Amount_1"]` 原会生成两个 `amount_1`
+  （重名列，生成的配置直接被校验拒绝）；现在补后缀后继续探测直到无冲突。
+- **向导读本地样本失败可重试**：读不存在的文件/无权限抛的 OSError 原来穿透到最外层、被误报成
+  "写文件失败"并终止；现在与解析失败一样提示后重试（"3 次机会"名实相符）。写文件失败单独收口，
+  只对写入段报"写文件失败"。
+- **向导只对预期异常降级为"连接失败"**：原来 `except (ConfigError, Exception)` 把代码缺陷
+  （TypeError/AttributeError）也降级成"连接失败"并继续生成占位列——会产出一份列定义完全错误的
+  配置却提示成功；现在只接连接类错误，其它异常继续上抛。
+- **`--init` 分支补齐异常出口**：向导里的配置错（SystemExit）与 Ctrl+C 原来直接冒泡成裸
+  traceback；现在与其它分支同口径（记日志后返回 1 / 130）。
+- **`lifecycle_days` 的 NaN/Infinity 给出配置错**：json.load 默认接受这些字面量，原来
+  `float(raw) != int(raw)` 会对 NaN 抛未捕获的 ValueError（裸 traceback）；现在统一为带字段名的
+  配置错误（config 校验与 cli 兜底两处）。
+- **`job_tz_of` 对非对象 `missing` 给中文报错**（原来在 `.get` 处抛裸 AttributeError）；
+  **`build_job_summary` 对非对象列定义加类型守卫**（概要打印比配置校验更早，原来会崩在 AttributeError）。
+- **空 `parse.columns` 在 `ParseSpec` 构造时快速失败**（原来崩在无上下文的 IndexError）。
+- **`retry_call` 校验 `attempts>=1`**（原来 attempts<=0 会报"重试 -1 次仍失败：None"），重试日志
+  口径统一为"第 x/n 次尝试失败"（分子分母都按总尝试次数）。
+- **台账文件含非法 UTF-8 字节时给明确报错**（UnicodeDecodeError 原来逃出 except、抛裸 traceback）。
+- **飞书告警对非对象 JSON 响应按失败处理**（原来 `data.get` 抛 AttributeError 打断主流程）。
+- **探测分隔符失败留一条告警**（原来静默回退逗号，后续解析报错指向不明）。
+
+### 安全
+
+- **拼进 count SQL 的分区值加白名单**：MaxCompute 没有绑定参数，pt 只能拼进语句；现在
+  `count_partition` 对分区值做 `\d{8}` 白名单校验（pt 恒为 8 位业务日）后再拼接，注入面归零。
+- **默认 MaxCompute endpoint 改 https**：作业未写 endpoint 时走明文 HTTP 会暴露 AK/SK 签名与
+  查询结果；`mc.DEFAULT_ENDPOINT`、向导默认值与 `jobs/*.example.json` 模板统一改为 https。
+- **`require_identifier` 拒绝非字符串**：`str(None)` / `str(True)` 都能过标识符正则，配置漏填会被
+  静默拼出名为 `None` / `True` 的表名；现在非字符串/空值直接报配置错。
+- **`_URL_AUTH_RE` 的 scheme 部分限长（防回溯）**：无上限时在长小写字母数字串上会在每个起始位置
+  贪婪回扫（实测 20KB 要 10 秒、40KB 要 50 秒）；限长后保持线性（真实 scheme 远短于 63 字符）。
+- **向导写文件先按 0600 创建再写入**：文件含 SFTP 密码/AK-SK/webhook 明文，原来 `write_text` 先按
+  默认 umask（通常 0644）创建、再 chmod，存在同机其他用户可读的窗口期。
+- **SFTP 重试的日志与异常做值级脱敏**：带上本连接的密码/口令，遮住 paramiko 自由文本里回显的凭证。
+- **`run_sql_with_timeout` 改用单调时钟**：墙钟被 NTP 校时/夏令时回拨会让超时提前触发或永不触发。
+
+### 工程
+
+- **测试替身按真实语义校准**：`FakeWriter` 按 pyodps 会话语义建模 reopen（失败会话残留的块在
+  reopen=False 时会与本轮一起提交——生产代码漏传 `reopen=True` 的"数据翻倍"由此可被测试发现）；
+  `FakeInstance.stop()` 同时置"已终止"（否则 stop 后轮询的代码在测试里死循环，且 sleep 被替换成
+  空操作不会被超时打断）；`FakeOdps.run_sql` 解析不出分区值时显式 AssertionError（不再静默按 0 行
+  伪装成"数据没写进去"）；删除从未被消费的 `FakeOdps.fail_writes`；`FakeSftp` 深拷贝入参 tree、
+  `stat()` 对已登记目录返回目录条目（与 paramiko 语义一致）。
+- **性能回归用例改相对判据**：原用 1s/2s 墙钟阈值，共享 CI 负载高时会偶发假失败；现在按"规模放大
+  后耗时不应超线性暴涨"判断（含地板值兜住计时噪声），回溯爆炸/平方级退化仍然拦得住。
+- **用例隔离与可移植性**：环境变量用例统一 `clear=True`；`/tmp`、`Path.home()`、Windows-only skip
+  等依赖运行环境的断言改为临时目录/注入环境变量/显式判定（盘符相对名的安全分支不再被平台跳过）；
+  用例间共享的列定义改深拷贝；Decimal 断言改按 `as_tuple`（能发现尾随零丢失）、double 列改
+  `assertAlmostEqual`；`RunLock` 用例改用 `with`（不手工调 `__enter__`）；`warn` 模式补告警断言；
+  测试文件不再把仓库根/tests 目录插到 `sys.path` 最前（改为缺失时追加，避免遮蔽同名模块）。
+- 新增回归用例覆盖上述修复（台账键口径、区间优先于环境变量、合计行数字口径、decimal 尾零、
+  分区值白名单、分隔符探测告警、软链/未知大小、向导异常路径、`--init` 退出码、lifecycle NaN 等）。
+
+### 文档
+
+- README：`maxcompute.endpoint` 默认值标注为 https；离线用例数 303 → 334。
+
 ## [1.4.1] - 2026-10-01
 
 ### 修复

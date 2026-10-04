@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import hashlib
+import math
 import os
 import sys
 import tempfile
@@ -56,6 +57,7 @@ from .utils import (
     as_bool,
     collect_secret_values,
     log,
+    redact,
     redact_secrets,
     reset_log_once,
     setup_console,
@@ -222,7 +224,14 @@ def _lifecycle_days(target_cfg: dict) -> int | None:
     raw = target_cfg.get("lifecycle_days")
     if raw is None or raw == "":
         return None
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or float(raw) != int(raw) or int(raw) <= 0:
+    if (
+        isinstance(raw, bool)
+        or not isinstance(raw, (int, float))
+        # NaN/Infinity 先挡掉：json.load 默认接受这些字面量，而 float(raw) != int(raw)
+        # 会对 NaN 直接抛 ValueError（裸 traceback）；浮点相等比较也不可靠，改判 is_integer()
+        or (isinstance(raw, float) and (not math.isfinite(raw) or not raw.is_integer()))
+        or raw <= 0
+    ):
         raise SystemExit(f"target.lifecycle_days 必须是正整数（天），实际 {raw!r}")
     return int(raw)
 
@@ -283,7 +292,7 @@ def run_check(job: dict, config: dict, args, job_path: Path, config_path: Path |
         )
         if sample:
             date, item = sample
-            log(f"  最新样本：{date}/{item.name}（{item.size:,} 字节）")
+            log(f"  最新样本：{date}/{item.name}（{item.size_text}）")
         else:
             log("  ⚠️ 远端目录下没有匹配文件（检查 source.root / file_regex / 源方是否已产出）")
         missing_cfg = job.get("missing") or {}
@@ -573,7 +582,7 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
             if existing is not None:
                 local_paths.append(existing)
                 continue
-            log(f"下载 {date}/{item.name}（{item.size:,} 字节）...")
+            log(f"下载 {date}/{item.name}（{item.size_text}）...")
             try:
                 local_paths.append(source.download(item, download_dir / item.ledger_key))
             except FatalSourceError as exc:
@@ -583,12 +592,14 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
                 log(f"❌ 下载 {item.name} 失败：{_redact_job(job, exc)}")
                 return 1
 
-        # 先完整解析一遍数行数（表头校验、合计行校验都在这趟完成；坏文件在写库前就拦住）
-        file_rows: dict[str, int] = {}
+        # 先完整解析一遍数行数（表头校验、合计行校验都在这趟完成；坏文件在写库前就拦住）。
+        # 行数按 local_paths 的顺序存列表：用 path.name 当键有两个坑——台账键与远端文件名
+        # 不同口径时下面按 item.name 取值会 KeyError；同一天两个文件重名时会互相覆盖、行数偏小
+        file_rows: list[int] = []
         try:
             for path in local_paths:
                 stats = {"skipped": 0}
-                file_rows[path.name] = sum(1 for _ in parse_spec.iter_rows(path, stats))
+                file_rows.append(sum(1 for _ in parse_spec.iter_rows(path, stats)))
                 if stats["skipped"]:
                     log(f"  {path.name}：跳过 {stats['skipped']} 行（命中 skip_if_empty 的空键行）")
                 extras = stats.get("extra_headers") or []
@@ -599,7 +610,7 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
         except Exception as exc:  # noqa: BLE001
             log(f"❌ 解析失败：{_redact_job(job, exc)}")
             return 1
-        rows = sum(file_rows.values())
+        rows = sum(file_rows)
         total_rows += rows
         log(f"{date}：{len(local_paths)} 个文件，{rows:,} 行 → pt={date}")
         if args.dry_run:
@@ -642,13 +653,13 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
         # 写入并校验成功后才记台账（失败中断后重跑会重试这个日期）
         # 台账带 md5：下次运行时跳过判断会校验本地文件内容（防误改/静默损坏），
         # 旧台账没有 md5 字段时按只比大小兼容处理（见 state.local_ready）
-        for item, path in zip(items, local_paths):
+        for index, (item, path) in enumerate(zip(items, local_paths)):
             ledger[item.ledger_key] = {
                 "project": project,
                 "table": table_name,
                 "pt": date,
                 "size": item.size,
-                "rows": file_rows[item.name],
+                "rows": file_rows[index],
                 "md5": state_mod.md5_of(path),
             }
         try:
@@ -708,6 +719,13 @@ def main(argv: list[str] | None = None) -> int:
 
         try:
             return run_init(args.init_out, ask=_wizard_ask, echo=log, ask_secret=_wizard_ask_secret)
+        except KeyboardInterrupt:
+            log("已中断（配置未生成完），退出")
+            return 130
+        except SystemExit as exc:
+            # 与其它分支同口径：向导里的配置错/文件错记一笔再返回，别把裸 traceback 抛给调度
+            log(f"❌ {redact(str(exc))}")
+            return 1
         finally:
             _detach_log_sink(log_handle)
 
@@ -743,6 +761,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.bizdate:
             base_day = parse_day_arg(args.bizdate)
             bizdate = base_day.strftime("%Y%m%d")
+        elif args.start_date or args.end_date:
+            # 显式补数区间优先于环境变量 bizdate：调度环境里 bizdate 总是存在，不忽略它的话
+            # 合法的补数命令会被 run_sync 的"单日 vs 区间"互斥拦下（退出码还会错成 1）
+            base_day = datetime.now(job_tz_of(job_raw)).date() - timedelta(days=1)
         else:
             from_env = env_bizdate(strict=not args.check)
             if from_env is not None:
@@ -751,7 +773,9 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 base_day = datetime.now(job_tz_of(job_raw)).date() - timedelta(days=1)
 
-        job = render_job(job_raw, config, base_day)  # 替换 ${secrets.x}/${bizdate} 等占位符
+        # 替换 ${secrets.x}/${bizdate} 等占位符；--config 的 maxcompute/profiles 用返回的副本
+        # （render_job 不改写入参，同一进程重复调用时不会串上一个作业已替换的密钥/日期）
+        job, config = render_job(job_raw, config, base_day)
         job = normalize_job(job)  # 补齐默认值，让配置尽量短
         validate_job(job)
         for warning in collect_warnings(job):  # 未知字段告警（拼写错误提示）

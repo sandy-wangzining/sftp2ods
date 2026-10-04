@@ -111,7 +111,9 @@ class FakeSftp:
     """假 SFTP 会话：tree = {目录: [FakeEntry]}，contents = {远端路径: bytes}。"""
 
     def __init__(self, tree=None, contents=None):
-        self.tree = dict(tree or {})
+        # 内层目录条目也复制一份：浅拷贝会让 add_file/add_dir 写穿到调用方的数据结构，
+        # 多个用例复用同一个 tree 变量时互相污染
+        self.tree = {key: list(value) for key, value in (tree or {}).items()}
         self.contents = dict(contents or {})
         self.link_targets = {}  # 远端路径 -> 目标文件大小（stat 跟随软链后的真实大小）
         self.fail_downloads = 0  # 前 N 次下载失败（模拟网络抖动）
@@ -135,6 +137,10 @@ class FakeSftp:
             return FakeEntry(path.rpartition("/")[2], self.link_targets[path])
         if path in self.contents:
             return FakeEntry(path.rpartition("/")[2], len(self.contents[path]))
+        if path in self.tree:
+            # 已登记的目录也存在：对目录一律抛 ENOENT 与 paramiko 语义不符，
+            # 会让"对目录做 stat 存在性判断"的代码在测试里走"文件不存在"分支
+            return FakeEntry(path.rpartition("/")[2] or ".", 0, is_dir=True)
         raise OSError(errno.ENOENT, "No such file", path)
 
     def get(self, remote, local):
@@ -209,19 +215,34 @@ class FakeTableSchema:
 
 
 class FakeWriter:
-    def __init__(self, table, partition, reopen):
+    """Tunnel 写入会话替身：写入先攒在会话里、with 正常退出时才提交到表。
+
+    reopen 语义与 pyodps 对齐（open_writer(reopen=True) 会开一个**新**上传会话，
+    reopen=False 复用上次会话）：上一次失败会话残留的块在 reopen=False 时会与
+    本轮数据一起提交——生产代码漏传 reopen=True 导致的"数据翻倍"由此可被测试发现。
+    """
+
+    def __init__(self, table, partition, reopen, blocks):
         self.table = table
         self.partition = partition
         self.reopen = reopen
+        self.blocks = blocks
 
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc_info):
+    def __exit__(self, exc_type, exc_info, exc_tb):
+        if exc_type is None:
+            # 会话提交：失败会话里残留的块（reopen=False 复用时）也在 blocks 里
+            self.table.written.setdefault(self.partition, []).extend(self.blocks)
+            self.table.sessions.pop(self.partition, None)
+        else:
+            # 会话中断：已上传的块留在服务端会话里（下一次 open_writer 可能复用）
+            self.table.sessions[self.partition] = self.blocks
         return False
 
     def write(self, rows):
-        self.table.written.setdefault(self.partition, []).extend([list(row) for row in rows])
+        self.blocks.extend([list(row) for row in rows])
 
 
 class FakeTable:
@@ -229,6 +250,7 @@ class FakeTable:
 
     def __init__(self, columns=None, partitions=(("pt", "string"),)):
         self.written: dict[str, list] = {}
+        self.sessions: dict[str, list] = {}  # 未提交（失败会话残留）的块
         self.deleted: list[str] = []
         self.created: list[str] = []
         self.writers: list[FakeWriter] = []
@@ -239,7 +261,9 @@ class FakeTable:
 
     def delete_partition(self, spec, if_exists=False):
         self.deleted.append(spec)
-        # 先删再填：删掉后旧数据不再存在（count(*) 也应反映这一点）
+        # 先删再填：删掉后旧数据不再存在（count(*) 也应反映这一点）。
+        # 注意不动 sessions：服务端的上传会话不随分区删除消失，这正是重试必须
+        # reopen=True（开新会话）的原因
         if spec.startswith("pt="):
             self.written.pop(spec, None)
 
@@ -247,7 +271,8 @@ class FakeTable:
         self.created.append(spec)
 
     def open_writer(self, partition=None, reopen=False):
-        writer = FakeWriter(self, partition, reopen)
+        blocks = [] if reopen else list(self.sessions.get(partition, []))
+        writer = FakeWriter(self, partition, reopen, blocks)
         self.writers.append(writer)
         return writer
 
@@ -286,7 +311,10 @@ class FakeInstance:
         return None
 
     def stop(self):
+        # 真实实例 stop 后进入"已终止"：否则 stop 后轮询 is_terminated() 的代码在测试里
+        # 永不退出（OfflineTestCase 把 sleep 变成空操作，死循环不会被超时打断）
         self.stopped = True
+        self._terminated = True
 
     def open_reader(self):
         return FakeReader(self.rows)
@@ -299,7 +327,6 @@ class FakeOdps:
         self.table = table
         self.table_name = table_name
         self.sql: list[str] = []
-        self.fail_writes = 0
 
     def exist_table(self, name):
         return name == self.table_name
@@ -315,7 +342,11 @@ class FakeOdps:
             marker = "pt = '"
             start = sql.find(marker)
             end = sql.find("'", start + len(marker)) if start >= 0 else -1
-            pt = sql[start + len(marker) : end] if start >= 0 and end > 0 else ""
+            if start < 0 or end <= 0:
+                # 解析不出来时静默返回 0 会把"SQL 形态变了"伪装成"数据没写进去"，
+                # 断言会以误导性的形式失败——显式炸出来
+                raise AssertionError(f"fake 无法解析 count 语句里的分区值：{sql!r}")
+            pt = sql[start + len(marker) : end]
             rows = self.table.written.get(f"pt={pt}", [])
             return FakeInstance(rows=[{"cnt": len(rows)}])
         return FakeInstance()

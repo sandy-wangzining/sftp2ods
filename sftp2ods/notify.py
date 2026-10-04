@@ -46,7 +46,9 @@ def notify(
         # requests 的异常消息里带完整 URL，末段 hook id 就是凭证：必须脱敏后再进日志
         log(f"  警告：飞书通知发送失败：{type(exc).__name__}: {redact(str(exc))}")
         return False
-    if resp.status_code == 200 and data.get("code", data.get("StatusCode", 0)) == 0:
+    # isinstance 判断不能省：非对象响应（JSON 数组/字符串/null，网关错误页等）没有 .get，
+    # 直接调用会抛 AttributeError 打断主流程（告警失败不影响业务是函数的约定）
+    if resp.status_code == 200 and isinstance(data, dict) and data.get("code", data.get("StatusCode", 0)) == 0:
         log("飞书通知已发送")
         return True
     log(f"  警告：飞书通知发送失败：HTTP {resp.status_code} {redact(str(data)[:200])}")

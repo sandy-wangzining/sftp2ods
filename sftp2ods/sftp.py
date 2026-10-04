@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import errno
+import ntpath
 import re
 import stat
 from dataclasses import dataclass
@@ -47,13 +48,21 @@ def _safe_remote_name(name: str, kind: str) -> str:
 def local_path_within(base: Path, key: str, remote_name: str) -> Path:
     """把台账键拼成本地落地路径，并确保结果落在下载目录内。
 
-    远端是 POSIX 系统，文件名里出现 ":" 是合法的（如 report:20260920.csv），不能一律禁掉；
-    但 Windows 上 "Z:xxx" 这类盘符相对名会让 `base / key` 直接跳出下载目录（写到别的盘），
-    所以拼出路径后用 resolve() 做一次包含性判断：越界就拒绝。POSIX 上 ":" 只是普通字符，
-    同一判断不会误伤正常文件名。
+    两层判断：
+    1) 拼出路径后 resolve() 做包含性判断（挡 ".." 与平台相关的越界形态）；
+    2) 显式拦截 Windows 盘符相对名（"Z:xxx" / "a:b.csv"）：NT 上它解析到「该盘的当前目录」
+       而不是下载目录。POSIX 上这类名字只是普通文件名，但同一个作业跨平台跑时行为必须一致，
+       所以统一拒绝；"report:20260920.csv" 这种冒号前多于一个字符的名字不受影响
+       （ntpath.splitdrive 只把「单字符 + 冒号」当盘符），合法的冒号文件名不会误伤。
     """
     base = Path(base)
-    candidate = base / str(key)
+    key_text = str(key)
+    if ntpath.splitdrive(key_text)[0]:
+        raise FatalSourceError(
+            f"远端文件名 {remote_name!r} 落地后的本地路径落在下载目录之外"
+            f"（Windows 盘符相对名 {key_text!r}）；可能是服务端异常或伪造数据，拒绝处理"
+        )
+    candidate = base / key_text
     try:
         base_real = base.resolve()
         target_real = candidate.resolve()
@@ -104,12 +113,17 @@ class RemoteFile:
 
     date: str  # 业务日期 YYYYMMDD（= 目标 pt）
     name: str  # 文件名
-    size: int  # 字节数（远端列表值，下载后核对）
+    size: int | None  # 字节数；None = 远端未给出（下载后跳过大小核对）
     remote: str  # 远端完整路径
     ledger_key: str  # 台账键（flat = 文件名；date_dir = 日期/文件名）
 
     def __repr__(self) -> str:  # 日志里简洁可读
         return f"<RemoteFile {self.date}/{self.name} {self.size}B>"
+
+    @property
+    def size_text(self) -> str:
+        """日志里的大小文案：未知大小不能按 0 展示（会误导成"空文件"）。"""
+        return "大小未知" if self.size is None else f"{self.size:,} 字节"
 
 
 class SftpSource:
@@ -144,6 +158,15 @@ class SftpSource:
                 self.dir_re = re.compile(str(dir_re or ""))
             except re.error as exc:
                 raise ConfigError(f"source.date_dir_regex 不是合法正则：{exc}")
+            if "date" not in self.dir_re.groupindex:
+                # 缺 (?P<date>) 时 match.group("date") 会在扫描时抛 IndexError：
+                # 报错不可读，还会被重试循环当成瞬时错误白重试若干轮
+                raise ConfigError(f"source.date_dir_regex 必须带日期命名捕获组 (?P<date>...)：{dir_re!r}")
+        elif "date" not in self.file_re.groupindex:
+            raise ConfigError(
+                f"source.file_regex 必须带日期命名捕获组 (?P<date>...)：{source.get('file_regex')!r}"
+                f"（业务日期从文件名里提取，pt 靠它确定）"
+            )
 
     # ------------------------------------------------------------ 连接
     def _connect(self):
@@ -243,6 +266,9 @@ class SftpSource:
             base_delay=self.retry_delay,
             desc=desc,
             fatal=(FatalSourceError,),
+            # paramiko 的报错常把凭证写进自由文本（认证失败会回显密码/口令），
+            # 形态规则盖不住，带上本连接的凭证值做值级脱敏
+            secrets=[value for value in (self.password, self.passphrase) if value],
         )
 
     # ------------------------------------------------------------ 列文件
@@ -255,16 +281,24 @@ class SftpSource:
         raw = self._run("列远端文件", self._scan)
         return {date: sorted(files, key=lambda item: item.name) for date, files in raw.items()}
 
-    def _entry_size(self, sftp, entry, remote_path: str) -> int:
+    def _entry_size(self, sftp, entry, remote_path: str) -> int | None:
         """条目大小：软链在 READDIR 里的 st_size 是链接自身（= 目标路径字符串长度），
         直接当"远端大小"用会让下载后的大小核对必然失败、台账也永远对不上；对软链用
-        stat()（跟随链接）取目标文件的真实大小。"""
-        size = int(getattr(entry, "st_size", 0) or 0)
+        stat()（跟随链接）取目标文件的真实大小。
+
+        远端没给大小（READDIR 未返回 st_size，或软链 stat 失败）时返回 None：
+        下面各处会跳过大小核对，而不是把未知当成 0 字节去比较（那必然误报不一致）。
+        """
+        raw_size = getattr(entry, "st_size", None)
+        size = int(raw_size) if raw_size is not None else None
         if stat.S_ISLNK(getattr(entry, "st_mode", 0) or 0):
             try:
-                size = int(sftp.stat(remote_path).st_size or 0)
-            except Exception:  # noqa: BLE001 - 取不到就退回列表值（下载后仍会核对大小）
-                pass
+                target_size = sftp.stat(remote_path).st_size
+                if target_size is not None:
+                    size = int(target_size)
+            except Exception as exc:  # noqa: BLE001 - 取不到就按"大小未知"处理
+                log(f"  警告：软链 {remote_path} 的 stat 失败（{exc}），大小未知，下载后跳过大小核对")
+                size = None
         return size
 
     def _scan(self, sftp) -> dict[str, list[RemoteFile]]:
@@ -330,8 +364,11 @@ class SftpSource:
             return tmp
 
         tmp = self._run(f"下载 {item.name}", _do)
-        actual = tmp.stat().st_size if tmp.is_file() else None
-        if actual != item.size:
+        if not tmp.is_file():
+            raise RuntimeError(f"下载 {item.name} 后本地文件不存在（{tmp}）；.part 已保留供排查，重跑会重新下载")
+        actual = tmp.stat().st_size
+        # item.size 为 None = 远端没给大小（未知），跳过核对而不是把未知当 0 字节误报
+        if item.size is not None and actual != item.size:
             raise RuntimeError(
                 f"下载 {item.name} 大小不一致（远端 {item.size} 字节，本地 {actual}）；.part 已保留供排查，重跑会重新下载"
             )

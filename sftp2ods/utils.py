@@ -50,7 +50,9 @@ def setup_console() -> None:
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:  # noqa: BLE001 - 某些重定向流不支持 reconfigure（如 CI 捕获）
+        except (AttributeError, OSError, ValueError):
+            # 只吞"这个流不支持 reconfigure"（含 io.UnsupportedOperation，它是 OSError/ValueError
+            # 的子类）；吞掉别的异常会把本函数自身的编程错误也一起静默，日后无从排查乱码
             pass
 
 
@@ -101,19 +103,24 @@ def log_once(message: str) -> None:
 
 
 def log(message: str) -> None:
-    """线程安全的控制台输出；时间戳=运行机器本地时间，只标记执行时刻。
+    """线程安全的控制台输出；时间戳=运行机器本地时间（带时区偏移），只标记执行时刻。
 
     防御：Windows CI/老控制台默认是 cp1252 之类编码，中文/符号会抛 UnicodeEncodeError；
     这里第一次调用时自动把控制台切到 UTF-8，切不了就用"可替换字符"降级输出，保证不中断业务。
     """
     global _console_patched
     if not _console_patched:
-        setup_console()
-        _console_patched = True
+        # check-then-set 放进锁里：多线程首次调用时不会重复执行 setup_console
+        # （TextIOWrapper.reconfigure 不是线程安全的）
+        with _lock:
+            if not _console_patched:
+                setup_console()
+                _console_patched = True
 
     import datetime as _dt
 
-    stamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # 带时区偏移的本地时间：跨时区/夏令时排障时能和调度系统、服务端日志对齐
+    stamp = _dt.datetime.now(_dt.timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S%z")
     line = f"[{stamp}] {message}"
     with _lock:
         try:
@@ -254,10 +261,13 @@ def require_identifier(value, where: str) -> str:
     要么成为注入点。配置虽然是本机文件，但名字写错时给一句人话，远好过让 MaxCompute
     抛一句看不出所以然的语法错。
     """
-    text = str(value)
-    if not _IDENT_RE.match(text):
-        raise ConfigError(f"{where} 不是合法的 MaxCompute 标识符：{text!r}；只允许字母/数字/下划线且不能以数字开头")
-    return text
+    if not isinstance(value, str) or not value:
+        # 不能先 str() 再校验：str(None) == "None"、str(True) == "True" 都能过标识符正则，
+        # 配置漏填时会被静默拼出一个名叫 None / True 的表名——快速失败，别写错对象
+        raise ConfigError(f"{where} 缺失或不是字符串：{value!r}")
+    if not _IDENT_RE.match(value):
+        raise ConfigError(f"{where} 不是合法的 MaxCompute 标识符：{value!r}；只允许字母/数字/下划线且不能以数字开头")
+    return value
 
 
 # =============================================================================
@@ -303,8 +313,10 @@ _QUERY_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])([A-Za-z0-9_.\-]{1,64})([:=])([^&\
 _JSON_RE = re.compile(r"""(?i)(["']([^"']{1,64})["']\s*:\s*)(?P<q>["'])((?:\\.|(?!\\.)(?!(?P=q))[\s\S])*)(?P=q)""")
 _BEARER_RE = re.compile(r"(?i)(\b(?:bearer)\s+)[A-Za-z0-9._~+/=-]{6,}")
 _BASIC_RE = re.compile(r"(?i)(authorization:\s*basic\s+)\S{8,}")
-# URL 里的 userinfo（https://user:pass@host）
-_URL_AUTH_RE = re.compile(r"(?i)([a-z][a-z0-9+.\-]*://[^/\s:@]+):([^/\s@]+)@")
+# URL 里的 userinfo（https://user:pass@host）。scheme 部分限长（{0,63}）：无上限时
+# 在长小写字母数字串上会在每个起始位置贪婪回扫（实测 20KB 要 10 秒、40KB 要 50 秒），
+# 限长后整条规则保持线性（真实 scheme 远短于 63 个字符）
+_URL_AUTH_RE = re.compile(r"(?i)([a-z][a-z0-9+.\-]{0,63}://[^/\s:@]+):([^/\s@]+)@")
 # 请求头行：'X-Api-Key: xxx' / 'X-Api-Key=xxx' 形态
 _HEADER_RE = re.compile(r"(?im)^(\s*([A-Za-z0-9_.\-]{1,64})\s*[:=]\s*)(.+)$")
 # 飞书 webhook 形态：open.feishu.cn/open-apis/bot/v2/hook/<id>；scheme 部分可选——
@@ -405,10 +417,10 @@ def redact(text: str) -> str:
     out = str(text)
     out = _BEARER_RE.sub(_bearer, out)
     out = _BASIC_RE.sub(_bearer, out)
-    # URL userinfo 规则必须同时出现 "://" 与 "@" 才可能匹配，先做一次 O(n) 预判：
-    # 它的 [a-z0-9+.\-]* 没有长度上限，在长文本（整段十六进制转储、超长 token）上会在每个
-    # 起始位置贪婪回扫，实测 20KB 就要 10 秒、40KB 要 50 秒，且 C 层正则期间 Ctrl+C 也打断不了。
-    # 其余规则都有 {1,64} 之类的长度上限（实测线性），只有这一条需要预判。
+    # URL userinfo 规则必须同时出现 "://" 与 "@" 才可能匹配，先做一次 O(n) 预判省掉
+    # 一次无谓的全量扫描。该规则的 scheme 部分已限长（见 _URL_AUTH_RE），配合预判在
+    # 长文本（整段十六进制转储、超长 token）上保持线性；没有预判 + 无上限的旧写法
+    # 实测 20KB 要 10 秒、40KB 要 50 秒，且 C 层正则期间 Ctrl+C 也打断不了。
     if "://" in out and "@" in out:
         out = _URL_AUTH_RE.sub(_url_auth, out)
     out = _WEBHOOK_RE.sub(_webhook, out)
@@ -536,12 +548,23 @@ def redact_secrets(values, text: str) -> str:
 
 
 def retry_call(
-    fn, attempts: int = 5, base_delay: float = 15, desc: str = "", fatal=(FatalSourceError,), max_delay: float = 300
+    fn,
+    attempts: int = 5,
+    base_delay: float = 15,
+    desc: str = "",
+    fatal=(FatalSourceError,),
+    max_delay: float = 300,
+    secrets=(),
 ):
     """执行 fn，瞬时错误指数退避重试；FatalSourceError 与调用方声明的不重试异常直接抛出。
 
-    重试日志与最终异常都会做脱敏，避免把密码等打进日志。
+    重试日志与最终异常都会做脱敏，避免把密码等打进日志。secrets 给定时（如
+    collect_secret_values 的结果）另外做值级脱敏：凭证出现在自由文本里时形态规则挡不住。
     """
+    if attempts < 1:
+        # attempts<=0 时循环体一次都不执行，last_err 保持 None，最终报错会变成
+        # "重试 -1 次仍失败：None"（丢失失败原因）——提前给一句明确的参数错误
+        raise ValueError(f"retry_call 的 attempts 必须 >= 1，当前 {attempts}")
     delay = base_delay
     last_err = None
     for attempt in range(1, attempts + 1):
@@ -553,8 +576,9 @@ def retry_call(
             last_err = exc
             if attempt == attempts:
                 break
-            log(f"  [{desc} 第 {attempt}/{attempts - 1} 次失败] {redact(str(exc))}；{delay:g}s 后重试")
+            # 分子/分母都按"总尝试次数"口径，避免写成 第 x/(n-1) 次 这种对不上的读法
+            log(f"  [{desc} 第 {attempt}/{attempts} 次尝试失败] {redact_secrets(secrets, str(exc))}；{delay:g}s 后重试")
             time.sleep(delay)
             delay = min(delay * 2, max_delay)
     # 报"重试 N-1 次"（成功那次之外又试了几次），与实际行为一致；from last_err 保住原始异常链
-    raise RuntimeError(f"{desc} 重试 {attempts - 1} 次仍失败：{redact(str(last_err))}") from last_err
+    raise RuntimeError(f"{desc} 重试 {attempts - 1} 次仍失败：{redact_secrets(secrets, str(last_err))}") from last_err

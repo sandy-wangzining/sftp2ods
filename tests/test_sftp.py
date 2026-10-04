@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import errno
-import os
 import stat
 import sys
 import tempfile
@@ -12,8 +11,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# 只在路径缺失时追加（不插到最前面）：避免把仓库根/tests 目录置于标准库与第三方库
+# 之前遮蔽同名模块；按 README 在仓库根运行（或 CI 里 pip install -e .）时，
+# 本地包本来就在搜索路径最前（python -m 会把当前目录放在 sys.path[0]）
+for _path in (Path(__file__).resolve().parents[1], Path(__file__).resolve().parent):
+    if str(_path) not in sys.path:
+        sys.path.append(str(_path))
 
 from _helpers import FakeEntry, FakeSftp, OfflineTestCase, add_dir, add_file, connect_to  # noqa: E402
 
@@ -45,6 +48,26 @@ def date_dir_source(**overrides) -> sftp_mod.SftpSource:
         },
         **overrides,
     )
+
+
+class TestSourceConfigGuards(OfflineTestCase):
+    def test_file_regex_requires_date_group(self):
+        """file_regex 缺 (?P<date>) 时必须在配置阶段报错（否则扫描时抛 IndexError，还会被重试）。"""
+        with self.assertRaises(SystemExit) as ctx:
+            flat_source(source={"file_regex": r"report_\d{8}\.csv"})
+        self.assertIn("(?P<date>", str(ctx.exception))
+
+    def test_date_dir_regex_requires_date_group(self):
+        with self.assertRaises(SystemExit) as ctx:
+            flat_source(
+                source={
+                    "root": "/d",
+                    "layout": "date_dir",
+                    "file_regex": r"a\.csv",
+                    "date_dir_regex": r"\d{8}",
+                }
+            )
+        self.assertIn("(?P<date>", str(ctx.exception))
 
 
 class TestNormalize(OfflineTestCase):
@@ -411,6 +434,48 @@ class TestScanSafety(OfflineTestCase):
             item = source.list_files()["20260920"][0]
         self.assertEqual(item.size, len(b"a,b\n1,2\n"))
 
+    def test_symlink_stat_failure_marks_size_unknown(self):
+        """软链 stat 失败时按"大小未知"处理（None），不能退回链接长度——
+        那会让下载成功后仍被判"大小不一致"，且报错指向错误的方向。"""
+        fake = FakeSftp()
+        link = "/data/report_20260920.csv"
+        fake.tree["/data"] = [FakeEntry("report_20260920.csv", size=len(link), is_link=True)]
+        # contents 与 link_targets 都不登记 → stat 抛 ENOENT
+        source = flat_source(sftp={"retry_times": 0})
+        with mock.patch.object(sftp_mod.SftpSource, "_connect", connect_to(fake)):
+            item = source.list_files()["20260920"][0]
+        self.assertIsNone(item.size)
+        self.assertEqual(item.size_text, "大小未知")
+
+    def test_entry_without_size_is_unknown(self):
+        """READDIR 未返回 st_size（paramiko 给 None）时不能当成 0 字节：下载后核对必然误报。"""
+        fake = FakeSftp()
+        entry = FakeEntry("report_20260920.csv", size=0)
+        entry.st_size = None
+        fake.tree["/data"] = [entry]
+        fake.contents["/data/report_20260920.csv"] = b"a,b\n"
+        source = flat_source(sftp={"retry_times": 0})
+        with mock.patch.object(sftp_mod.SftpSource, "_connect", connect_to(fake)):
+            item = source.list_files()["20260920"][0]
+        self.assertIsNone(item.size)
+
+    def test_download_skips_size_check_when_unknown(self):
+        """大小未知时下载成功即通过（不做核对），不会因为拿不到基准把正常文件判失败。"""
+        fake = FakeSftp()
+        fake.contents["/data/report_20260920.csv"] = b"a,b\n1,2\n"
+        source = flat_source(sftp={"retry_times": 0})
+        item = sftp_mod.RemoteFile(
+            date="20260920",
+            name="report_20260920.csv",
+            size=None,
+            remote="/data/report_20260920.csv",
+            ledger_key="report_20260920.csv",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(sftp_mod.SftpSource, "_connect", connect_to(fake)):
+                got = source.download(item, Path(tmp) / "a.csv")
+            self.assertEqual(got.read_bytes(), b"a,b\n1,2\n")
+
 
 class TestHostKeyPolicy(TestConnect):
     """主机指纹校验：默认严格（显式 RejectPolicy + 只认 known_hosts），
@@ -478,8 +543,9 @@ class TestLocalPathWithin(OfflineTestCase):
         with self.assertRaises(FatalSourceError):
             sftp_mod.local_path_within(self.base, "../escape.csv", "escape.csv")
 
-    @unittest.skipUnless(os.name == "nt", "盘符相对名只在 Windows 上会跳出下载目录")
-    def test_windows_drive_relative_rejected(self):
+    def test_windows_drive_relative_rejected_on_all_platforms(self):
+        """盘符相对名（"Z:xxx"/"a:b.csv"）在 NT 上会跳出下载目录；判定显式化后任何平台都拒绝
+        （安全关键路径不因平台被跳过，跨平台行为一致）。"""
         for key in ("Z:20260920.csv", "a:b.csv"):
             with self.assertRaises(FatalSourceError):
                 sftp_mod.local_path_within(self.base, key, key)

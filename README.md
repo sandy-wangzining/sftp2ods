@@ -110,7 +110,7 @@ DWD 层：按业务口径加工/引用
 | `job` | 否 | 作业名（日志 + 默认下载目录名） |
 | `description` | 否 | 一句话描述（日志用） |
 | `secrets` | 否 | 密钥键值对；配置里用 `${secrets.键名}` 引用 |
-| `maxcompute` | 是* | `project` / `endpoint`（默认 us-west-1）/ `access_key_id`+`access_key_secret`（可简写 `ak`/`sk`） |
+| `maxcompute` | 是* | `project` / `endpoint`（默认 us-west-1，https）/ `access_key_id`+`access_key_secret`（可简写 `ak`/`sk`） |
 | `profiles` | 否 | 多套 MaxCompute 凭证，配合 `target.profile` 或 `--mc-profile` 切换 |
 | `sftp` | 是 | SFTP 连接（见下） |
 | `source` | 是 | 远端文件规则（见下） |
@@ -284,7 +284,7 @@ date_dir 布局还会回退按旧的文件名键查找），已上传的日期�
 ## 开发与测试
 
 ```bash
-python -m unittest discover -s tests -v    # 303 个离线用例：不连 SFTP、不连数仓
+python -m unittest discover -s tests -v    # 334 个离线用例：不连 SFTP、不连数仓
 pip install -e ".[dev]" && ruff check .    # 代码检查（配置在 pyproject.toml，当前 0 告警）
 ruff format .                              # 统一格式（CI 另跑 ruff format --check）
 ```

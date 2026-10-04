@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 
 from .parse import normalize_type
-from .utils import log, progress_log, require_identifier, retry_call
+from .utils import ConfigError, log, progress_log, require_identifier, retry_call
 
 try:
     from odps import ODPS
@@ -25,7 +26,9 @@ PARTITION_COLUMN = "pt"
 SQL_TIMEOUT_SECONDS = 600
 MAX_CELL_BYTES = 7_000_000  # MaxCompute 单列字符串上限 8MB，留余量提前报错
 SQL_HEARTBEAT_SECONDS = 30
-DEFAULT_ENDPOINT = "http://service.us-west-1.maxcompute.aliyun.com/api"
+# https：作业没写 endpoint 时 AK/SK 签名与查询结果不能走明文 HTTP
+DEFAULT_ENDPOINT = "https://service.us-west-1.maxcompute.aliyun.com/api"
+_PARTITION_VALUE_RE = re.compile(r"\A\d{8}\Z")  # pt 恒为 8 位业务日
 
 
 # =============================================================================
@@ -110,7 +113,9 @@ def connect_odps(
 def run_sql_with_timeout(o, sql: str, timeout: int = SQL_TIMEOUT_SECONDS, desc: str = "SQL"):
     """提交 SQL 并等待完成：成功返回 / 失败抛错 / 超时主动 stop() 取消并抛 TimeoutError。"""
     instance = o.run_sql(sql)
-    started = time.time()
+    # 单调时钟：墙钟被 NTP 校时/夏令时回拨会让 now - started 变负或突跳，
+    # 600 秒超时可能提前触发或永不触发
+    started = time.monotonic()
     last_log = started
     while True:
         if instance.is_successful():
@@ -118,7 +123,7 @@ def run_sql_with_timeout(o, sql: str, timeout: int = SQL_TIMEOUT_SECONDS, desc: 
         if instance.is_terminated():
             instance.wait_for_success(timeout=1)  # 触发一次，抛出带错误信息的异常
             return instance
-        now = time.time()
+        now = time.monotonic()
         if timeout and timeout > 0 and now - started > timeout:
             try:
                 instance.stop()
@@ -308,14 +313,29 @@ def _cell_bytes(cell) -> int:
         return 0
     if isinstance(cell, str):
         return len(cell.encode("utf-8"))
+    if isinstance(cell, (bytes, bytearray)):
+        # bytes 走 str() 会变成 "b'...'" 转义形态，长度虚增数倍，接近上限的真实数据会被误判超长
+        return len(cell)
     return len(str(cell).encode("utf-8"))
+
+
+def _partition_literal(partition_value) -> str:
+    """拼进 SQL 的分区值：白名单 + 引号转义。
+
+    MaxCompute 没有绑定参数，分区值只能拼进语句；白名单把"能拼什么"锁死
+    （pt 恒为 8 位业务日），点号/引号/反斜杠/空格等注入面直接归零。
+    """
+    text = str(partition_value)
+    if not _PARTITION_VALUE_RE.match(text):
+        raise ConfigError(f"分区值必须是 8 位业务日 yyyyMMdd：{text!r}")
+    return text.replace("'", "''")
 
 
 def count_partition(o, project: str, table_name: str, partition_value: str, timeout: int = SQL_TIMEOUT_SECONDS) -> int:
     """SELECT COUNT(*) 校验分区行数（用于写后核对）。"""
     project = require_identifier(project, "target.project")
     table_name = require_identifier(table_name, "target.table")
-    literal = str(partition_value).replace("'", "''")  # 拼 SQL 前转义
+    literal = _partition_literal(partition_value)
     sql = f"select count(*) as cnt from {project}.{table_name} where {PARTITION_COLUMN} = '{literal}'"
     instance = run_sql_with_timeout(o, sql, timeout=timeout, desc=f"校验 {table_name} 行数")
     with instance.open_reader() as reader:

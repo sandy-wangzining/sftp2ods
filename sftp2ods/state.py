@@ -23,7 +23,9 @@ def load_state(path: Path) -> dict:
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:
+        # JSONDecodeError 与 UnicodeDecodeError（文件被截断/编码损坏）都是 ValueError 子类；
+        # 只接 JSONDecodeError 会让损坏的台账以裸 traceback 冒出来，而不是这句明确报错
         raise SystemExit(
             f"上传台账读不了：{path}（{exc}）；确认文件损坏可改名或删除，重跑会按本地文件重新上传（先删再填，幂等）"
         )
@@ -77,13 +79,16 @@ def md5_of(path: Path) -> str:
     return digest.hexdigest()
 
 
-def local_ready(target: Path, size: int, md5: str = "") -> bool:
+def local_ready(target: Path, size: int | None, md5: str = "") -> bool:
     """本地文件已存在且大小与远端一致（不用重新下载）；md5 给定时（台账里有）再校验内容。
 
     旧台账没有 md5 字段：md5 传空串，退回只比大小（兼容迁移前的记录）。
+    size=None（远端没给大小）时只要求文件存在：拿不到基准就没法比，重下也解决不了。
     """
     target = Path(target)
-    if not target.is_file() or target.stat().st_size != size:
+    if not target.is_file():
+        return False
+    if size is not None and target.stat().st_size != size:
         return False
     if md5:
         return md5_of(target) == md5

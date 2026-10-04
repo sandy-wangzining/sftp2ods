@@ -11,8 +11,12 @@ from datetime import date
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# 只在路径缺失时追加（不插到最前面）：避免把仓库根/tests 目录置于标准库与第三方库
+# 之前遮蔽同名模块；按 README 在仓库根运行（或 CI 里 pip install -e .）时，
+# 本地包本来就在搜索路径最前（python -m 会把当前目录放在 sys.path[0]）
+for _path in (Path(__file__).resolve().parents[1], Path(__file__).resolve().parent):
+    if str(_path) not in sys.path:
+        sys.path.append(str(_path))
 
 from _helpers import FakeSftp, OfflineTestCase, add_file, connect_to, csv_bytes  # noqa: E402
 
@@ -33,7 +37,9 @@ class ScriptedAsk:
 
     def __call__(self, prompt=""):
         self.prompts.append(prompt)
-        for index, (fragment, value) in enumerate(self.script):
+        # 在副本上枚举：边遍历边 pop 只因为紧跟着 return 才安全，日后想改成"未命中继续扫"
+        # 就会下标错位/漏答
+        for index, (fragment, value) in enumerate(list(self.script)):
             if fragment in prompt:
                 self.script.pop(index)
                 return str(value)
@@ -98,7 +104,8 @@ class WizardTestCase(OfflineTestCase):
 
     def load_job(self):
         raw = json.loads(self.out_path.read_text(encoding="utf-8"))
-        job = config.normalize_job(config.render_job(raw, {}, date(2026, 9, 23)))
+        job, _config = config.render_job(raw, {}, date(2026, 9, 23))
+        job = config.normalize_job(job)
         config.validate_job(job)
         return job
 
@@ -248,6 +255,34 @@ class TestWizardSecretInput(WizardTestCase):
             config.validate_job(config.normalize_job(raw))
 
 
+class TestWizardSampleErrors(WizardTestCase):
+    def test_local_sample_missing_file_retries(self):
+        """读本地样本失败（不存在/无权限等 OSError）要提示后重试，不能直接终止向导。"""
+        asks = iter([str(self.tmp / "no_such_file.csv"), str(self.csv_path)])
+        echoes: list = []
+        headers = init_wizard._read_local_sample(lambda p="": next(asks), echoes.append)
+        self.assertEqual(headers, ["Order ID", "Settlement amount", "Created time"])
+        self.assertTrue(any("读取失败" in str(line) for line in echoes), echoes)
+
+    def test_remote_connect_unexpected_error_propagates(self):
+        """代码缺陷（TypeError 等）不能降级成"连接失败"：否则会生成一份列定义完全错误的配置
+        却提示成功。"""
+        with mock.patch.object(sftp_mod.SftpSource, "__init__", side_effect=TypeError("bug")):
+            with self.assertRaises(TypeError):
+                init_wizard._read_remote_sample(lambda p="": p, lambda *_a, **_k: None, {}, {})
+
+    def test_write_failure_returns_1_with_clean_message(self):
+        """写文件失败（磁盘满/权限）按退出码 1 汇报，不是裸 traceback。"""
+        script = self.base_script() + self.common_tail()
+        asks = ScriptedAsk(script)
+        with mock.patch.object(init_wizard.os, "open", side_effect=OSError("disk full")):
+            rc = init_wizard.run_init(
+                out_path=str(self.out_path), ask=asks, ask_secret=asks, echo=lambda *_a, **_k: None
+            )
+        self.assertEqual(rc, 1)
+        self.assertFalse(self.out_path.exists())
+
+
 class TestWizardRemoteSampleGuard(WizardTestCase):
     """向导拉样本的落地路径也走"必须在 base 之内"的校验：越界名 → 拒绝、不下载。"""
 
@@ -292,6 +327,12 @@ class TestSlugAndColumns(OfflineTestCase):
         self.assertEqual(columns[0]["type"], "decimal(19,10)")
         self.assertEqual(columns[1]["type"], "bigint")
         self.assertEqual(columns[2]["type"], "string")
+
+    def test_build_columns_dedupe_against_generated_suffix(self):
+        # 补后缀后仍可能与已有列名撞车（amount_1 既是补出来的、也是源表头原生的）：
+        # 必须继续找下一个可用名，不能生成两个 amount_1
+        columns = init_wizard.build_columns(["Amount", "Amount", "Amount_1"], set(), set())
+        self.assertEqual([c["name"] for c in columns], ["amount", "amount_1", "amount_1_1"])
 
     def test_match_columns_by_number_and_name(self):
         headers = ["Order ID", "Amount", "Currency"]

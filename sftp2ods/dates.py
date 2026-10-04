@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 import re
 from datetime import date, datetime, timedelta
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .utils import ConfigError
 
@@ -30,10 +30,11 @@ def load_zone(name: str) -> ZoneInfo:
     """按名称加载时区（如 Asia/Shanghai、UTC、America/New_York）。"""
     try:
         return ZoneInfo(str(name))
-    except Exception:
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        # 只认"时区名不认识/不合法"两类：别的异常（如 TypeError）是编程错误，不该伪装成时区问题
         raise ConfigError(
             f"无法识别时区：{name}（如 Asia/Shanghai / UTC / America/New_York；Windows 本机需 pip install tzdata）"
-        )
+        ) from exc
 
 
 def parse_day_arg(text: str) -> date:
@@ -58,15 +59,22 @@ def parse_day_arg(text: str) -> date:
 
 
 def norm_date(text: str, flag: str) -> str:
-    """日期参数归一化成 YYYYMMDD（容忍 2026-09-21 / 2026/09/21 写法）；写错直接报错。"""
-    value = re.sub(r"[-/]", "", str(text or "").strip())
-    if not re.fullmatch(r"\d{8}", value):
+    """日期参数归一化成 YYYYMMDD（容忍 2026-09-21 / 2026/09/21 写法）；写错直接报错。
+
+    用结构化白名单而不是"删掉所有 - 和 /"：后者会把 `20-2609-21` 这类明显写错的日期
+    也归一化成合法值，静默落到错误的 pt 上（同一个参数的 --bizdate 路径是严格正则，
+    两套标准）。分隔符只允许"两处都有且一致"或"都没有"。
+    """
+    value = str(text or "").strip()
+    match = re.fullmatch(r"\A(\d{4})([-/]?)(\d{2})\2(\d{2})\Z", value)
+    if not match:
         raise ConfigError(f"{flag} 应为 YYYYMMDD 或 YYYY-MM-DD，实际 {text!r}")
+    year, _, month, day = match.groups()
     try:
-        datetime.strptime(value, DATE_FMT)
+        datetime(int(year), int(month), int(day))
     except ValueError:
         raise ConfigError(f"{flag} 不是有效日期：{text!r}")
-    return value
+    return f"{year}{month}{day}"
 
 
 def env_bizdate(strict: bool = True) -> date | None:
@@ -84,7 +92,7 @@ def env_bizdate(strict: bool = True) -> date | None:
         return None
     try:
         return parse_day_arg(text)
-    except SystemExit as exc:
+    except ConfigError as exc:
         if not strict:
             from .utils import log
 

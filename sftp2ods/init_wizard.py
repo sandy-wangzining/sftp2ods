@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 
@@ -23,7 +24,7 @@ from .config import DEFAULT_TZ
 from .sftp import SftpSource, local_path_within
 from .utils import ConfigError
 
-DEFAULT_ENDPOINT = "http://service.us-west-1.maxcompute.aliyun.com/api"
+DEFAULT_ENDPOINT = "https://service.us-west-1.maxcompute.aliyun.com/api"
 DEFAULT_FILE_REGEX_FLAT = "settlement_report_(?P<date>\\d{8})\\.csv"
 DEFAULT_FILE_REGEX_DIR = "data_(?P<date>\\d{8})\\.csv"
 DEFAULT_DIR_REGEX = "(?P<date>\\d{8})"
@@ -51,6 +52,8 @@ def _default_ask_secret(prompt: str = "") -> str:
     try:
         return getpass.getpass(prompt)
     except Exception:  # noqa: BLE001 - 没有 tty 等场景退回普通输入
+        # 退回 input() 时输入会明文回显，而向导提示语里写着"输入不回显"——必须显式纠正预期
+        print("（警告：当前环境无法隐藏输入，接下来输入的密钥会明文回显）", file=sys.stderr)
         return input(prompt)
 
 
@@ -101,15 +104,17 @@ def slugify(header: str) -> str:
 
 def build_columns(headers: list[str], amount_indexes, int_indexes) -> list[dict]:
     """按"哪些列是金额/整数"生成列定义（其余 string）；列名去重。"""
-    seen: dict[str, int] = {}
+    used: set[str] = set()
     columns = []
     for index, header in enumerate(headers):
         name = slugify(header) or f"col_{index + 1}"
-        if name in seen:
-            seen[name] += 1
-            name = f"{name}_{seen[name]}"
-        else:
-            seen[name] = 0
+        # 补后缀后必须再查一次重名：["Amount", "Amount", "Amount_1"] 只按基名计数会
+        # 生成两个 amount_1（列重名，validate_parse_config 会直接拒绝这份配置）
+        base, suffix = name, 1
+        while name in used:
+            name = f"{base}_{suffix}"
+            suffix += 1
+        used.add(name)
         if index in amount_indexes:
             type_text = "decimal(19,10)"
         elif index in int_indexes:
@@ -159,7 +164,8 @@ def _read_local_sample(ask, echo) -> list[str] | None:
         path = Path(path_text).expanduser()
         try:
             headers = parse_mod.read_header(path)
-        except ConfigError as exc:
+        except (ConfigError, OSError) as exc:
+            # 读不存在的文件/无权限是 OSError：也要走"提示后重试"，不能让整个向导直接终止
             echo(f"   读取失败：{exc}")
             continue
         if headers:
@@ -174,7 +180,10 @@ def _read_remote_sample(ask, echo, sftp_cfg: dict, source_cfg: dict) -> list[str
         try:
             source = SftpSource(sftp_cfg, source_cfg)
             files_by_date = source.list_files()
-        except (ConfigError, Exception) as exc:  # noqa: BLE001 - ConfigError 是 SystemExit 子类，需单独接
+        except (ConfigError, OSError, RuntimeError) as exc:
+            # 只接预期的连接类错误（ConfigError 是 SystemExit 子类需单独列；FatalSourceError
+            # 与重试耗尽都是 RuntimeError 子类）。TypeError/AttributeError 等代码缺陷继续上抛：
+            # 全部降级成"连接失败"会生成一份列定义完全错误的配置却提示成功
             echo(f"   连接/列目录失败：{exc}")
             return None
         if not files_by_date:
@@ -182,7 +191,7 @@ def _read_remote_sample(ask, echo, sftp_cfg: dict, source_cfg: dict) -> list[str
             return None
         date = max(files_by_date)
         item = sorted(files_by_date[date], key=lambda it: it.name)[0]
-        echo(f"   最新文件：{date}/{item.name}（{item.size:,} 字节），下载中 ...")
+        echo(f"   最新文件：{date}/{item.name}（{item.size_text}），下载中 ...")
         try:
             # 与主下载路径同一把锁：落地路径必须落在 base（向导的临时 workdir）之内，
             # 免得"包含性校验"在这里成了例外（远端是 POSIX，名字带 ":" 合法，不能靠禁冒号）。
@@ -372,10 +381,20 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
             raise SystemExit(
                 f"--init-out 指向的是目录，需要给文件名：{target_path}（例如 {target_path / (job_name + '.json')}）"
             )
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        target_path.write_text(json.dumps(job, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        if os.name != "nt":
-            os.chmod(target_path, 0o600)  # 含密钥，收紧权限（Windows 忽略）
+        try:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            # 文件含 SFTP 密码/AK-SK/webhook 明文：先按 0600 创建再写入（write_text 会先按
+            # 默认 umask（通常 0644）创建，再 chmod 之间存在同机其他用户可读的窗口期）
+            fd = os.open(target_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(job, ensure_ascii=False, indent=2) + "\n")
+            if os.name != "nt":
+                os.chmod(target_path, 0o600)  # 已存在文件的旧权限一并收紧（Windows 忽略）
+        except OSError as exc:
+            # 只有"写文件"这一段失败才叫写文件失败（读取类 OSError 在各自的交互里已处理）
+            echo("")
+            echo(f"写文件失败：{exc}")
+            return 1
 
         echo("")
         echo(f"✅ 已生成：{target_path}")
@@ -390,9 +409,9 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         echo(f"配置不合法：{exc}")
         return 1
     except OSError as exc:
-        # 目标路径不可写（权限/磁盘满/父目录是文件）时给一句人话，而不是裸 traceback
+        # 兜底（临时目录创建失败等写文件之外的 OSError）：给一句人话而不是裸 traceback
         echo("")
-        echo(f"写文件失败：{exc}")
+        echo(f"文件操作失败：{exc}")
         return 1
     except (EOFError, ValueError):
         # stdin 被关闭（`sftp2ods --init <&-`、CI 里没接管道）时 input() 抛的是 ValueError / RuntimeError

@@ -3,14 +3,20 @@
 
 from __future__ import annotations
 
+import copy
 import decimal
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# 只在路径缺失时追加（不插到最前面）：避免把仓库根/tests 目录置于标准库与第三方库
+# 之前遮蔽同名模块；按 README 在仓库根运行（或 CI 里 pip install -e .）时，
+# 本地包本来就在搜索路径最前（python -m 会把当前目录放在 sys.path[0]）
+for _path in (Path(__file__).resolve().parents[1], Path(__file__).resolve().parent):
+    if str(_path) not in sys.path:
+        sys.path.append(str(_path))
 
 from _helpers import OfflineTestCase, csv_bytes  # noqa: E402
 
@@ -18,7 +24,9 @@ from sftp2ods import parse as parse_mod  # noqa: E402
 
 
 def parse_cfg(columns, **overrides) -> dict:
-    cfg = {"encoding": "utf-8-sig", "delimiter": "auto", "columns": columns}
+    # 深拷贝列定义：模块级 COLUMNS 被多个用例共享，被测代码若在校验/规格化时回写列字典，
+    # 用例之间会互相污染（顺序依赖的隐性坑）。deepcopy 同时兼容"故意传非法元素"的用例
+    cfg = {"encoding": "utf-8-sig", "delimiter": "auto", "columns": copy.deepcopy(columns)}
     cfg.update(overrides)
     return cfg
 
@@ -193,6 +201,21 @@ class SpecTestCase(OfflineTestCase):
     def rows_of(self, path: Path, s: parse_mod.ParseSpec, stats=None):
         return list(s.iter_rows(path, stats))
 
+    def assert_rows(self, got, expected):
+        """逐元素比较行：Decimal 按 as_tuple 比（== 会忽略尾随零，"1234.5" 与 "1234.50" 相等），
+        float 列用 assertAlmostEqual（二进制浮点不适合精确相等），其余照常。"""
+        self.assertEqual(len(got), len(expected), f"行数不一致：{got!r} != {expected!r}")
+        for got_row, exp_row in zip(got, expected):
+            self.assertEqual(len(got_row), len(exp_row))
+            for got_val, exp_val in zip(got_row, exp_row):
+                if isinstance(exp_val, decimal.Decimal):
+                    self.assertIsInstance(got_val, decimal.Decimal)
+                    self.assertEqual(got_val.as_tuple(), exp_val.as_tuple())
+                elif isinstance(exp_val, float):
+                    self.assertAlmostEqual(got_val, exp_val)
+                else:
+                    self.assertEqual(got_val, exp_val)
+
 
 COLUMNS = [
     {"header": "Order ID", "name": "order_id", "type": "string"},
@@ -209,7 +232,7 @@ class TestHeaderMapping(SpecTestCase):
             csv_bytes([" order  id ", "SETTLEMENT AMOUNT", "Count", "Rate"], [["o1", "1.5", "3", "0.25"]]),
         )
         s = spec(COLUMNS)
-        self.assertEqual(self.rows_of(path, s), [["o1", decimal.Decimal("1.5"), 3, 0.25]])
+        self.assert_rows(self.rows_of(path, s), [["o1", decimal.Decimal("1.5"), 3, 0.25]])
 
     def test_missing_required_errors(self):
         path = self.make_file("a.csv", csv_bytes(["Order ID", "Count"], [["o1", "1"]]))
@@ -228,12 +251,24 @@ class TestHeaderMapping(SpecTestCase):
             {"header": "Rate", "name": "rate", "type": "double"},
         ]
         s = spec(columns)
-        self.assertEqual(self.rows_of(path, s), [["o1", None, 3, 0.5]])
+        logs = []
+        with mock.patch.object(parse_mod, "log", logs.append):
+            got = self.rows_of(path, s)
+        self.assert_rows(got, [["o1", None, 3, 0.5]])
+        # 不仅结果要补 NULL，"warn" 告警本身也要真的发出来（静默忽略不该通过本用例）
+        self.assertTrue(
+            any("未匹配到列头" in str(line) and "Settlement amount" in str(line) for line in logs),
+            logs,
+        )
 
     def test_on_missing_header_warn_mode(self):
         path = self.make_file("a.csv", csv_bytes(["Order ID", "Count", "Rate"], [["o1", "3", "0.5"]]))
         s = spec(COLUMNS, on_missing_header="warn")
-        self.assertEqual(self.rows_of(path, s), [["o1", None, 3, 0.5]])
+        logs = []
+        with mock.patch.object(parse_mod, "log", logs.append):
+            got = self.rows_of(path, s)
+        self.assert_rows(got, [["o1", None, 3, 0.5]])
+        self.assertTrue(any("未匹配到列头" in str(line) for line in logs), logs)
 
     def test_extra_source_headers_recorded_and_ignored(self):
         path = self.make_file(
@@ -244,7 +279,7 @@ class TestHeaderMapping(SpecTestCase):
             ),
         )
         stats = {"skipped": 0}
-        self.assertEqual(self.rows_of(path, spec(COLUMNS), stats), [["o1", decimal.Decimal("1.5"), 3, 0.25]])
+        self.assert_rows(self.rows_of(path, spec(COLUMNS), stats), [["o1", decimal.Decimal("1.5"), 3, 0.25]])
         self.assertEqual(stats["extra_headers"], ["New column", "Another"])
 
     def test_no_extra_headers_entry_when_all_mapped(self):
@@ -269,9 +304,8 @@ class TestIterRows(SpecTestCase):
         rows = [["o1", "1,234.50", "", ""], ["o2", "", "7", "1e3"]]
         path = self.make_file("a.csv", csv_bytes([c["header"] for c in COLUMNS], rows))
         got = self.rows_of(path, spec(COLUMNS))
-        self.assertEqual(got[0], ["o1", decimal.Decimal("1234.50"), None, None])
-        # 空 bigint/double 存 NULL；1e3 转 float
-        self.assertEqual(got[1], ["o2", None, 7, 1000.0])
+        # Decimal 按 as_tuple 比：能发现"小数位丢了"（1234.50 被写成 1234.5 时 == 仍相等）
+        self.assert_rows(got, [["o1", decimal.Decimal("1234.50"), None, None], ["o2", None, 7, 1000.0]])
 
     def test_bad_decimal_errors(self):
         path = self.make_file("a.csv", csv_bytes([c["header"] for c in COLUMNS], [["o1", "abc", "1", "1"]]))
@@ -307,7 +341,7 @@ class TestIterRows(SpecTestCase):
     def test_strict_columns_false_pads(self):
         path = self.make_file("a.csv", csv_bytes([c["header"] for c in COLUMNS], [["o1", "1", "2"]]))
         s = spec(COLUMNS, strict_columns=False)
-        self.assertEqual(self.rows_of(path, s), [["o1", decimal.Decimal("1"), 2, None]])
+        self.assert_rows(self.rows_of(path, s), [["o1", decimal.Decimal("1"), 2, None]])
 
     def test_extra_columns_always_error(self):
         path = self.make_file("a.csv", csv_bytes([c["header"] for c in COLUMNS], [["o1", "1", "2", "3", "extra"]]))
@@ -318,7 +352,7 @@ class TestIterRows(SpecTestCase):
     def test_empty_as_empty_keeps_empty_string(self):
         path = self.make_file("a.csv", csv_bytes([c["header"] for c in COLUMNS], [["", "1", "2", "3"]]))
         s = spec(COLUMNS, empty_as="empty")
-        self.assertEqual(self.rows_of(path, s), [["", decimal.Decimal("1"), 2, 3]])
+        self.assert_rows(self.rows_of(path, s), [["", decimal.Decimal("1"), 2, 3]])
         # skip_if_empty 对 '' 同样生效（空串与 NULL 都算空）
         s2 = spec(COLUMNS, empty_as="empty", skip_if_empty=["order_id"])
         stats = {"skipped": 0}
@@ -405,13 +439,24 @@ class TestFooter(SpecTestCase):
         self.assertEqual(len(self.rows_of(path, s)), 1)
 
     def test_footer_requires_first_column(self):
-        path = self.make([["a", "1"]], footer=None)
         s = spec(self.COLS, footer={"sum": ["amount"]})
         # 表头缺第一列：footer 开启时直接报错
         self.make_file("b.csv", csv_bytes(["Amount"], [["1"]]))
         with self.assertRaises(RuntimeError):
             self.rows_of(self.tmp / "b.csv", s)
-        del path
+
+    def test_footer_amounts_use_same_number_rules_as_data_rows(self):
+        """合计行金额与数据行走同一套数字口径：畸形千分位（1,23）必须报错，不能静默读错。"""
+        path = self.make([["a", "1.5"]], footer=["", "1,23"])
+        s = spec(self.COLS, footer={"sum": ["amount"]})
+        with self.assertRaises(RuntimeError) as ctx:
+            self.rows_of(path, s)
+        self.assertIn("千分位", str(ctx.exception))
+
+    def test_footer_amounts_thousands_marker_ok(self):
+        path = self.make([["a", "1,234.50"], ["b", "2.50"]], footer=["", "1,237.00"])
+        s = spec(self.COLS, footer={"sum": ["amount"]})
+        self.assertEqual(len(self.rows_of(path, s)), 2)
 
 
 class TestDelimiterEncoding(SpecTestCase):
@@ -446,6 +491,14 @@ class TestDelimiterEncoding(SpecTestCase):
         with self.assertRaises(RuntimeError) as ctx:
             self.rows_of(path, s)
         self.assertIn("gbk", str(ctx.exception))
+
+    def test_sniff_delimiter_failure_warns_and_falls_back(self):
+        """探测分隔符失败（文件不可读/编码不符）不能静默回退逗号：要留一条线索。"""
+        path = self.make_file("a.csv", "金额,数量\n1,2\n".encode("gbk"))
+        logs = []
+        with mock.patch.object(parse_mod, "log", logs.append):
+            self.assertEqual(parse_mod.sniff_delimiter(path, encoding="utf-8"), ",")
+        self.assertTrue(any("探测分隔符失败" in str(line) for line in logs), logs)
 
 
 class TestBatches(SpecTestCase):
@@ -484,7 +537,7 @@ class TestValueRange(SpecTestCase):
         """千分位逗号照常支持；欧式小数（1.234,56）报错，而不是静默缩水 1000 倍。"""
         s = spec([{"header": "金额", "name": "amount", "type": "decimal(19,2)"}])
         ok = self.make_file("ok.csv", csv_bytes(["金额"], [["1,234.50"]]))
-        self.assertEqual(self.rows_of(ok, s), [[decimal.Decimal("1234.50")]])
+        self.assert_rows(self.rows_of(ok, s), [[decimal.Decimal("1234.50")]])
         for raw in ("1.234,56", "1,23", "1,,2"):
             bad = self.make_file("bad.csv", csv_bytes(["金额"], [[raw]]))
             with self.assertRaises(RuntimeError) as ctx:
@@ -511,6 +564,18 @@ class TestValueRange(SpecTestCase):
             self.rows_of(bad, s)
         self.assertIn("bigint", str(ctx.exception))
 
+    def test_decimal_trailing_zeros_are_not_rejected(self):
+        """尾部补零（decimal(10,2) 下的 1.500）数值上精确可表示，不该被当成"小数位超限"拦下；
+        真正会被舍入改值的（1.234）仍要报错。"""
+        s = spec([{"header": "金额", "name": "amount", "type": "decimal(10,2)"}])
+        ok = self.make_file("ok.csv", csv_bytes(["金额"], [["1.500"], ["2.3400"]]))
+        got = self.rows_of(ok, s)
+        self.assertEqual(len(got), 2)
+        bad = self.make_file("bad.csv", csv_bytes(["金额"], [["1.234"]]))
+        with self.assertRaises(RuntimeError) as ctx:
+            self.rows_of(bad, s)
+        self.assertIn("小数位", str(ctx.exception))
+
 
 class TestFooterPrecision(SpecTestCase):
     def test_large_amounts_not_rounded_by_default_context(self):
@@ -535,6 +600,16 @@ class TestFooterConfigGuards(OfflineTestCase):
                 parse_cfg([{"header": "A", "name": "a", "type": "decimal(19,10)"}], footer={"sum": ["a"]})
             )
         self.assertIn("第一列", str(ctx.exception))
+
+
+class TestParseSpecGuards(OfflineTestCase):
+    def test_empty_columns_rejected_with_clean_error(self):
+        """columns 为空时不能等到 map_header/footer 里抛无上下文的 IndexError，构造时就快速失败。"""
+        with self.assertRaises(SystemExit) as ctx:
+            parse_mod.ParseSpec({})
+        self.assertIn("parse.columns", str(ctx.exception))
+        with self.assertRaises(SystemExit):
+            parse_mod.ParseSpec({"columns": []})
 
 
 if __name__ == "__main__":

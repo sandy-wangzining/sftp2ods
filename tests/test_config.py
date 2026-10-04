@@ -4,14 +4,20 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# 只在路径缺失时追加（不插到最前面）：避免把仓库根/tests 目录置于标准库与第三方库
+# 之前遮蔽同名模块；按 README 在仓库根运行（或 CI 里 pip install -e .）时，
+# 本地包本来就在搜索路径最前（python -m 会把当前目录放在 sys.path[0]）
+for _path in (Path(__file__).resolve().parents[1], Path(__file__).resolve().parent):
+    if str(_path) not in sys.path:
+        sys.path.append(str(_path))
 
 from _helpers import OfflineTestCase, make_args, minimal_job  # noqa: E402
 
@@ -84,16 +90,18 @@ class TestPlaceholders(OfflineTestCase):
         job = minimal_job()
         job["secrets"] = {"sftp_password": "pw-inline"}
         job["sftp"]["auth"]["password"] = "${secrets.sftp_password}"
-        rendered = config.render_job(job, {}, date(2026, 9, 18))
+        rendered, _config = config.render_job(job, {}, date(2026, 9, 18))
         self.assertEqual(rendered["sftp"]["auth"]["password"], "pw-inline")
 
-    def test_render_job_renders_config_block(self):
+    def test_render_job_renders_config_block_without_mutating_input(self):
         job = minimal_job()
-        rendered = config.render_job(
-            job, {"secrets": {"ak": "AK1"}, "maxcompute": {"access_key_id": "${secrets.ak}"}}, date(2026, 9, 18)
-        )
+        conf = {"secrets": {"ak": "AK1"}, "maxcompute": {"access_key_id": "${secrets.ak}"}}
+        rendered, rendered_config = config.render_job(job, conf, date(2026, 9, 18))
         self.assertEqual(rendered["target"]["table"], "ods_demo_di")
-        del rendered
+        self.assertEqual(rendered_config["maxcompute"]["access_key_id"], "AK1")
+        # 不就地改写入参：同一进程里用同一份 config 再跑一个作业时，
+        # 不会把上一个作业已替换的密钥/日期串进这一次
+        self.assertEqual(conf["maxcompute"]["access_key_id"], "${secrets.ak}")
 
 
 class TestNormalize(OfflineTestCase):
@@ -212,9 +220,27 @@ class TestValidate(OfflineTestCase):
         job = minimal_job()
         job["target"]["lifecycle_days"] = True
         self.assert_invalid(job, "lifecycle_days")
+        # NaN/Infinity（json.load 默认接受这些字面量）要给带字段名的配置错，而不是裸 ValueError
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            job = minimal_job()
+            job["target"]["lifecycle_days"] = bad
+            self.assert_invalid(job, "lifecycle_days")
         job = minimal_job()
         job["target"]["allow_empty"] = "flase"
         self.assert_invalid(job, "allow_empty")
+
+    def test_job_tz_of_rejects_non_object_missing(self):
+        """missing 写成字符串时给中文报错，而不是在 .get 处抛裸 AttributeError。"""
+        with self.assertRaises(SystemExit) as ctx:
+            config.job_tz_of({"missing": "Asia/Shanghai"})
+        self.assertIn("missing", str(ctx.exception))
+
+    def test_summary_tolerates_non_object_columns(self):
+        """概要打印是比配置校验更早的路径：列元素不是对象时不能崩在 AttributeError 上。"""
+        job = minimal_job()
+        job["parse"]["columns"] = ["bad", {"type": "string"}]
+        text = "\n".join(config.build_job_summary(job))
+        self.assertIn("解析", text)
 
     def test_missing_errors(self):
         job = minimal_job()
@@ -300,25 +326,32 @@ class TestResolveTargetAndDirs(OfflineTestCase):
 
     def test_download_dir_default(self):
         job = minimal_job()
-        path = Path("/tmp/jobs/demo.json")
-        self.assertEqual(config.resolve_download_dir(job, path), Path("/tmp/jobs/download/demo"))
-        # 作业名里的不安全字符会被过滤
-        job["job"] = "a/b c"
-        self.assertEqual(config.resolve_download_dir(job, path), Path("/tmp/jobs/download/a_b_c"))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "jobs" / "demo.json"
+            self.assertEqual(config.resolve_download_dir(job, path), path.parent / "download" / "demo")
+            # 作业名里的不安全字符会被过滤
+            job["job"] = "a/b c"
+            self.assertEqual(config.resolve_download_dir(job, path), path.parent / "download" / "a_b_c")
 
     def test_download_dir_relative_and_absolute(self):
         job = minimal_job()
-        job["source"]["download_dir"] = "files"
-        path = Path("/tmp/jobs/demo.json")
-        self.assertEqual(config.resolve_download_dir(job, path), Path("/tmp/jobs/files"))
-        job["source"]["download_dir"] = "/abs/files"
-        self.assertEqual(config.resolve_download_dir(job, path), Path("/abs/files"))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "jobs" / "demo.json"
+            job["source"]["download_dir"] = "files"
+            self.assertEqual(config.resolve_download_dir(job, path), path.parent / "files")
+            abs_dir = Path(tmp) / "abs" / "files"
+            job["source"]["download_dir"] = str(abs_dir)
+            self.assertEqual(config.resolve_download_dir(job, path), abs_dir)
 
     def test_download_dir_tilde_expanded(self):
         job = minimal_job()
         job["source"]["download_dir"] = "~/sftp2ods-data"
-        path = Path("/tmp/jobs/demo.json")
-        self.assertEqual(config.resolve_download_dir(job, path), Path.home() / "sftp2ods-data")
+        with tempfile.TemporaryDirectory() as tmp:
+            # 把 "~" 的展开固定到临时目录：不依赖跑测试的机器上真实的用户主目录
+            # （Path.expanduser 走 os.environ 的 HOME/USERPROFILE，不是 pathlib.Path.home）
+            home = Path(tmp)
+            with mock.patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}):
+                self.assertEqual(config.resolve_download_dir(job, home / "jobs" / "demo.json"), home / "sftp2ods-data")
 
     def test_summary_lines(self):
         job = validated(minimal_job())

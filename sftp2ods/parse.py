@@ -272,6 +272,12 @@ class ParseSpec:
 
     def __init__(self, parse_cfg: dict):
         self.columns = build_columns(parse_cfg)
+        if not self.columns:
+            # 空列定义后面每一处取值都会崩在无上下文的 IndexError 上（footer 识别、表头映射）；
+            # 配置本身要求 parse.columns 非空（validate_parse_config 同口径），这里快速失败
+            raise ConfigError(
+                'parse.columns 必须是非空数组（每项形如 {"header": "Order ID", "name": "order_id", "type": "string"}）'
+            )
         self.encoding = str(parse_cfg.get("encoding") or "utf-8-sig")
         self.delimiter = str(parse_cfg.get("delimiter") or "auto")
         self.on_missing_header = str(parse_cfg.get("on_missing_header") or "error").lower()
@@ -449,7 +455,11 @@ class ParseSpec:
                 for index in self.footer_sum_indexes:
                     raw = footer[index].strip() if index < len(footer) else ""
                     try:
-                        value = decimal.Decimal(raw.replace(",", "")) if raw else decimal.Decimal(0)
+                        # 与数据行同一套数字口径：千分位必须按 "1,234" 规范写，
+                        # 不能简单 replace(",") —— "1,23"/欧式小数会被静默读成错值
+                        value = decimal.Decimal(strip_thousands(raw)) if raw else decimal.Decimal(0)
+                    except ValueRangeError as exc:
+                        raise RuntimeError(f"{path.name} 合计行金额不是合法的数字：{raw!r}（{exc}）")
                     except ArithmeticError:
                         raise RuntimeError(f"{path.name} 合计行金额解析失败，格式可能变了：{footer!r}")
                     if not value.is_finite():
@@ -504,7 +514,11 @@ def check_decimal_range(col: Column, value: decimal.Decimal) -> None:
     int_digits = 0 if value == 0 else max(len(digits) + exponent, 0)
     integer_room = col.precision - col.scale
     if frac_digits > col.scale:
-        raise ValueRangeError(f"小数位 {frac_digits} 位超过 {col.type} 允许的 {col.scale} 位")
+        # 尾部补零（如 decimal(10,2) 下的 "1.500"）数值上精确可表示，不算超限；
+        # 只有"去掉多余小数位会改值"的取值才拒绝：value×10^scale 不是整数 ⇔ 会被舍入
+        coefficient = int("".join(str(digit) for digit in digits)) if digits else 0
+        if coefficient % 10 ** (frac_digits - col.scale) != 0:
+            raise ValueRangeError(f"小数位 {frac_digits} 位超过 {col.type} 允许的 {col.scale} 位")
     if int_digits > integer_room:
         raise ValueRangeError(f"整数位 {int_digits} 位超过 {col.type} 允许的 {integer_room} 位")
 
@@ -521,7 +535,8 @@ def sniff_delimiter(path: Path, encoding: str = "utf-8-sig") -> str:
     内容丰富时不可靠，宁可给一个"最像"的默认，让用户用 parse.delimiter 显式覆盖。
     """
     try:
-        with path.open("r", encoding=encoding) as handle:
+        # newline=""：与 iter_rows/read_header 同一口径（不翻译行尾），免得引号内 \r 影响行计数
+        with path.open("r", encoding=encoding, newline="") as handle:
             for line in handle:
                 if line.strip():
                     tabs, commas, semicolons = line.count("\t"), line.count(","), line.count(";")
@@ -530,8 +545,9 @@ def sniff_delimiter(path: Path, encoding: str = "utf-8-sig") -> str:
                     if commas == 0 and semicolons > 0:
                         return ";"
                     return ","
-    except (OSError, UnicodeDecodeError):
-        pass
+    except (OSError, UnicodeDecodeError) as exc:
+        # 静默回退逗号会让后续解析报出指向不明的分隔符错误；留一条线索（文件不可读/编码不符）
+        log(f"  警告：探测分隔符失败（{exc}），回退为逗号；请检查 parse.encoding 或用 parse.delimiter 显式指定")
     return ","
 
 

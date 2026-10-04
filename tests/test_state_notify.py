@@ -10,8 +10,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# 只在路径缺失时追加（不插到最前面）：避免把仓库根/tests 目录置于标准库与第三方库
+# 之前遮蔽同名模块；按 README 在仓库根运行（或 CI 里 pip install -e .）时，
+# 本地包本来就在搜索路径最前（python -m 会把当前目录放在 sys.path[0]）
+for _path in (Path(__file__).resolve().parents[1], Path(__file__).resolve().parent):
+    if str(_path) not in sys.path:
+        sys.path.append(str(_path))
 
 from _helpers import OfflineTestCase  # noqa: E402
 
@@ -46,6 +50,14 @@ class TestState(OfflineTestCase):
         path.write_text("{oops", encoding="utf-8")
         with self.assertRaises(SystemExit):
             state_mod.load_state(path)
+
+    def test_corrupt_encoding_gives_clean_error(self):
+        """台账含非法 UTF-8 字节（被截断/编码损坏）时也要走"明确报错"，不是裸 UnicodeDecodeError。"""
+        path = self.tmp / "state.json"
+        path.write_bytes(b"\xff\xfe{}{}")
+        with self.assertRaises(SystemExit) as ctx:
+            state_mod.load_state(path)
+        self.assertIn("台账", str(ctx.exception))
 
     def test_non_object(self):
         path = self.tmp / "state.json"
@@ -109,8 +121,10 @@ class FakeRequests:
         self.exc = exc
         self.calls = []
 
-    def post(self, url, json=None, timeout=None):
-        self.calls.append({"url": url, "json": json, "timeout": timeout})
+    def post(self, url, **kwargs):
+        # 用 **kwargs 而不是把形参命名成 json：那个名字会遮蔽模块级 import json，
+        # 方法体/后续维护里再用 json 模块就会踩坑；调用方仍按 requests 的习惯传 json=...
+        self.calls.append({"url": url, "json": kwargs.get("json"), "timeout": kwargs.get("timeout")})
         if self.exc:
             raise self.exc
         return self.response
@@ -152,6 +166,14 @@ class TestNotify(OfflineTestCase):
     def test_missing_requests_module(self):
         with mock.patch.object(notify_mod, "requests", None):
             self.assertFalse(notify_mod.notify("https://hook", "t", ["x"]))
+
+    def test_non_object_json_response_is_failure_not_crash(self):
+        """响应是 JSON 数组/字符串等非对象（网关错误页等）时按失败处理：
+        不能抛 AttributeError 打断主流程（告警失败不影响业务是函数的约定）。"""
+        for payload in ([], "oops", 3, True):
+            fake = FakeRequests(response=FakeResponse(status_code=200, payload=payload))
+            with mock.patch.object(notify_mod, "requests", fake):
+                self.assertFalse(notify_mod.notify("https://hook", "t", ["x"]))
 
     def test_failure_log_redacts_webhook(self):
         """发送失败时 requests 的异常消息里带完整 URL/路径，hook id 是凭证，不能明文进日志。"""
