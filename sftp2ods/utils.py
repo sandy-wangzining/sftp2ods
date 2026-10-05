@@ -455,36 +455,47 @@ _WORD_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
 # 日志（requests 异常里就是 `... [X-Api-Key: sk-xxx]` 这种形态）
 _QUERY_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])([A-Za-z0-9_.\-]{1,64})([\"']?)([:=])([ \t]*)([^&\s\"']+)")
 # 敏感键的值吃到行尾/`&`为止：`password=my secret` 原来只遮 "my"、"secret" 明文留下
-# （口令短语很常见）。负向先行断言只挡「引号后紧跟 ***」的已遮罩文本（避免把
-# `"secret_key": "***", "page": 2` 整行再吞一遍）；未闭合引号（password="abc 被日志
-# 截断）或「带引号的键」+ 不带引号的值（\"password\": my secret）必须走这条兜底——
-# 否则 KV/JSON 要收尾引号、常规 QUERY 的值类不吃引号，三套规则全绕过
-_QUERY_SPACE_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9_])(?P<key>[A-Za-z0-9_.\-]{1,64})(?P<q>[\"']?)(?P<sep>\s*[:=]\s*)(?!\s*[\"']?\s*\*\*\*)(?P<val>[^&\n]+)"
+# （口令短语很常见）。「已是 *** 不重复吞」（`"secret_key": "***", "page": 2` 整行再吞
+# 一遍）、未闭合引号（password="abc 被日志截断）、「带引号的键」+ 不带引号的值
+# （\"password\": my secret）都由 _mask_spaced_values 兜底——否则 KV/JSON 要收尾引号、
+# 常规 QUERY 的值类不吃引号，三套规则全绕过。
+# 探测只认「键 + 分隔符」（不含值）：finditer 一次线性遍历、相邻候选互不吞并
+# （含值会让 `failed: password=my` 把 `password=` 一起吞掉、也可能贪婪到行尾）。
+# 宽模式"贪婪值 + 从值起点重扫"的循环会在单行长文本上退化成 O(n²)，回归用例
+# test_spaced_scanner_is_linear_on_long_lines 守着。
+_QUERY_SPACE_PROBE_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])(?P<key>[A-Za-z0-9_.\-]{1,64})(?P<q>[\"']?)(?P<sep>\s*[:=]\s*)"
 )
+_SPACED_ALREADY_MASKED_RE = re.compile(r"\s*[\"']?\s*\*\*\*")
 
 
 def _mask_spaced_values(text: str) -> str:
     """敏感键 + 无引号值遮到行尾/`&`（口令短语含空格不被第一个词截断）。
 
-    用扫描器而不是一次 sub：非敏感键的贪婪值会吞掉其后的 k=v（sub 不重叠），
-    这里非敏感只前移到"值起点"继续扫，后续键照常处理。
+    扫描器按"键+分隔符"探测一次性遍历（整体线性）：非敏感键不遮、finditer 继续
+    找后续 k=v（含其值内部的）；敏感键从分隔符后遮到行尾/&（保留口令短语整段
+    遮蔽），并跳过已遮范围。
     """
     parts: list[str] = []
     pos = 0
-    while True:
-        match = _QUERY_SPACE_RE.search(text, pos)
-        if not match:
-            parts.append(text[pos:])
-            break
-        parts.append(text[pos : match.start()])
-        head = f"{match.group('key')}{match.group('q')}{match.group('sep')}"
-        if _is_sensitive_key(match.group("key")):
-            parts.append(head + "***")
-            pos = match.end()
-        else:
-            parts.append(head)
-            pos = match.start("val")
+    for match in _QUERY_SPACE_PROBE_RE.finditer(text):
+        start = match.start()
+        if start < pos:
+            continue  # 落在敏感键吞掉的范围内
+        if _SPACED_ALREADY_MASKED_RE.match(text, match.end("sep")):
+            continue  # 已是 ***（含带引号形态）：不重复吞（与原实现的负向先行同义）
+        key = match.group("key")
+        if not _is_sensitive_key(key):
+            continue  # 非敏感：不遮，继续找后续 k=v
+        cut = len(text)
+        for boundary in ("&", "\n"):
+            idx = text.find(boundary, match.end("sep"))
+            if idx != -1 and idx < cut:
+                cut = idx
+        parts.append(text[pos:start])
+        parts.append(f"{key}{match.group('q')}{match.group('sep')}***")
+        pos = cut
+    parts.append(text[pos:])
     return "".join(parts)
 
 

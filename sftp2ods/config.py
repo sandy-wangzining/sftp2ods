@@ -515,10 +515,12 @@ def validate_job(job: dict) -> None:
             raise ConfigError("notify.webhook 必须是字符串（飞书群机器人地址）")
 
     # ---- secrets / maxcompute ----
-    if "secrets" in job and not isinstance(job["secrets"], dict):
+    # 显式 JSON null 按"未配置"处理（与 check_block_types / _as_secrets / _profile_source
+    # 同一口径）：把不用的块写成 null 是常态，运行期本来就容忍，校验不该反过来拦下
+    if "secrets" in job and job["secrets"] is not None and not isinstance(job["secrets"], dict):
         raise ConfigError("作业配置的 secrets 必须是对象（键值对）")
     for block in ("maxcompute", "profiles"):
-        if block in job and not isinstance(job[block], dict):
+        if block in job and job[block] is not None and not isinstance(job[block], dict):
             raise ConfigError(f"作业配置的 {block} 必须是对象")
     for key, value in (job.get("profiles") or {}).items():
         if str(key).startswith(("//", "#")):

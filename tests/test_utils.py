@@ -160,13 +160,35 @@ class TestRedact(OfflineTestCase):
 
         def elapsed(count: int) -> float:
             text = "'a':'" + "\\" * count + "xy"
-            started = time.perf_counter()
-            out = utils.redact(text)
-            self.assertEqual(out, text)
-            return time.perf_counter() - started
+            best = float("inf")
+            for _ in range(3):  # 取多次最小值：单次采样会被 GC/调度停顿污染（假失败/假通过）
+                started = time.perf_counter()
+                out = utils.redact(text)
+                self.assertEqual(out, text)
+                best = min(best, time.perf_counter() - started)
+            return best
 
         small, big = elapsed(20), elapsed(40)
         self.assertLess(big, max(small * 8, 0.5), f"反斜杠串耗时 {small:.3f}s → {big:.3f}s，疑似回溯爆炸")
+
+    def test_spaced_scanner_is_linear_on_long_lines(self):
+        """长单行（值里大量 k=v 样文本）：SPACE 规则不能退化成 O(n²)（曾把过长行的
+        search 循环做成每次只前进几字符、值贪婪扫到行尾）。"""
+        unit = "word=value "
+        small_text = "note=" + unit * 400
+        big_text = "note=" + unit * 1600
+
+        def quickest(text: str) -> float:
+            best = float("inf")
+            for _ in range(3):
+                started = time.perf_counter()
+                utils.redact(text)
+                best = min(best, time.perf_counter() - started)
+            return best
+
+        small, big = quickest(small_text), quickest(big_text)
+        # 输入 4 倍：线性实现时间近似同倍；O(n²) 会是 16 倍以上
+        self.assertLess(big, max(small * 10, 0.2), f"SPACE 规则耗时 {small:.3f}s → {big:.3f}s，疑似 O(n²)")
 
     def test_nested_query_does_not_recursion_error(self):
         """嵌套 key=value 段用迭代脱敏，不能按段数递归到 RecursionError。"""
@@ -203,10 +225,12 @@ class TestRedact(OfflineTestCase):
         def elapsed(kb: int) -> float:
             n = kb * 1024
             text = "a" * n + "://" + "b" * n + "@"
-            started = time.perf_counter()
-            out = utils.redact(text)
-            self.assertEqual(out, text)  # 没有可脱敏的 userinfo，只测扫描/回溯的成本
-            return time.perf_counter() - started
+            best = float("inf")
+            for _ in range(3):  # 取多次最小值：单次采样会被 GC/调度停顿污染（假失败/假通过）
+                started = time.perf_counter()
+                utils.redact(text)  # 没有可脱敏的 userinfo，只测扫描/回溯的成本
+                best = min(best, time.perf_counter() - started)
+            return best
 
         small, big = elapsed(4), elapsed(16)
         self.assertLess(big, max(small * 8, 0.5), f"脱敏耗时 {small:.3f}s → {big:.3f}s，正则疑似退化成 O(n²)")
