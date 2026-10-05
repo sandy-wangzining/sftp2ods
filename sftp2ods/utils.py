@@ -390,7 +390,10 @@ def as_bool(value, default: bool, field: str = "") -> bool:
             f"{where}布尔值无法识别：{value!r}；请写 JSON 的 true/false，"
             f'或字符串 "true"/"false"（也认 0/1、yes/no、on/off）'
         )
-    return bool(value)
+    if isinstance(value, (int, float)):
+        return bool(value)  # 0 → False、1 → True（数字配置的常见写法）
+    # 其它类型（数组/对象）不能 bool() 兜底：[] 会被静默当成 False、绕过 fail-closed 约定
+    raise ConfigError(f"{where}布尔值类型不支持：{type(value).__name__}（{value!r}）；请写 true/false 或 0/1")
 
 
 # MaxCompute 常规标识符：字母/下划线开头 + 字母/数字/下划线
@@ -581,7 +584,9 @@ def redact(text: str, _depth: int = 0) -> str:
         if '\\"' in value:
             try:
                 decoded = json.loads(f'"{value}"')
-            except ValueError:
+            except (ValueError, RecursionError):
+                # RecursionError：值里含超深嵌套（构造性 payload）时 json.loads 会递归爆栈；
+                # 脱敏流程不能反过来把进程打崩，按"反转义失败"处理
                 decoded = None
             if decoded is not None:
                 redacted = redact(decoded, _depth + 1)
@@ -793,7 +798,8 @@ def redact_secrets(values, text: str) -> str:
         # 按字节（不是 chr(b) 的 Latin-1 字符）判断：>=0x80 的字节在 Latin-1 里常恰好是
         # "字母"（0xE5='å'），原样保留会让含中文的密钥生成错误的编码变体、漏遮
         aggressive = "".join(
-            f"%{b:02X}" if not (b < 128 and chr(b).isalnum()) else chr(b) for b in secret.encode("utf-8")
+            f"%{b:02X}" if not (b < 128 and chr(b).isalnum()) else chr(b)
+            for b in secret.encode("utf-8", "surrogatepass")
         )
         for variant in (secret, quote(secret, safe=""), quote_plus(secret), aggressive):
             if variant:

@@ -338,6 +338,22 @@ class TestRetry(OfflineTestCase):
         out = utils.redact_secrets(123456, "charge failed id=123456")
         self.assertNotIn("123456", out)
 
+    def test_as_bool_rejects_container_types(self):
+        """数组/对象不能 bool() 兜底（[] 会被静默当成 False，绕过 fail-closed 约定）。
+        0/1 仍按数字真值处理。"""
+        self.assertFalse(utils.as_bool(0, default=True, field="flag"))
+        self.assertTrue(utils.as_bool(1, default=False, field="flag"))
+        for bad in ([], {}, ["x"]):
+            with self.assertRaises(SystemExit) as ctx:
+                utils.as_bool(bad, default=False, field="flag")
+            self.assertIn("类型不支持", str(ctx.exception))
+
+    def test_redact_survives_recursion_error_from_json(self):
+        """反转义时 json.loads 抛 RecursionError（超深嵌套）不能打穿脱敏流程。"""
+        with mock.patch.object(utils.json, "loads", side_effect=RecursionError("too deep")):
+            out = utils.redact('{"k": "v\"x"}')
+        self.assertIsInstance(out, str)
+
     def test_first_backoff_respects_max_delay(self):
         """base_delay 配得比 max_delay 大时首次退避也不能超上限（原来只有后续退避夹取）。"""
         slept = []

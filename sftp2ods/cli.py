@@ -211,7 +211,7 @@ def _lock_path(job_path: Path) -> Path:
     # 撞了会互相阻塞（解锁时还可能删错对方的锁）。
     # 摘要先 resolve（绝对化/展开 ~/消解 .. 与软链接）：同一作业用相对/绝对路径两种写法
     # 原来会落到两把锁上、互斥静默失效（两个进程同删同写一个分区）
-    digest = hashlib.sha256(str(Path(job_path).expanduser().resolve()).encode("utf-8")).hexdigest()[:16]
+    digest = hashlib.sha256(os.fsencode(str(Path(job_path).expanduser().resolve()).encode("utf-8"))).hexdigest()[:16]
     name = f"{stem}-{digest}"
     override = os.environ.get("SFTP2ODS_LOCK_DIR", "").strip()
     if override:
