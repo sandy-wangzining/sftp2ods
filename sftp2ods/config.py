@@ -344,8 +344,15 @@ def _check_unknown_keys(obj: dict, allowed: set, where: str, warnings: list) -> 
 def collect_warnings(job: dict) -> list[str]:
     """收集未知配置项告警（拼写错误提醒），不阻断运行。"""
     warnings: list[str] = []
-    warnings.extend(job.pop(_WARNINGS_KEY, None) or [])
-    _check_unknown_keys(job, JOB_KEYS, "作业", warnings)
+    # 校验阶段挂上来的告警：只读不 pop——同一份 job dict 反复收集要拿到同样的告警
+    # （原来第一次就把键拿走、第二次返回空）。只有 list 形态才算内部通道；
+    # 用户误写的同名键（字符串等）不参与 extend（原来 extend("oops") 会按字符拆成
+    # 4 条假告警），并照常落入下面"不是已知配置项"的扫描
+    pending = job.get(_WARNINGS_KEY)
+    allowed_job_keys = JOB_KEYS | {_WARNINGS_KEY} if isinstance(pending, list) else JOB_KEYS
+    if isinstance(pending, list):
+        warnings.extend(str(item) for item in pending)
+    _check_unknown_keys(job, allowed_job_keys, "作业", warnings)
     sftp = _as_mapping(job.get("sftp"))
     _check_unknown_keys(sftp, SFTP_KEYS, "sftp", warnings)
     _check_unknown_keys(_as_mapping(sftp.get("auth")), SFTP_AUTH_KEYS, "sftp.auth", warnings)

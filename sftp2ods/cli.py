@@ -223,7 +223,7 @@ def _lock_path(job_path: Path) -> Path:
             raise SystemExit(f"SFTP2ODS_LOCK_DIR 指定的锁目录不可用（{exc}）：{base}") from exc
         return base / f"{name}.lock"
     candidates = [ROOT / ".run-locks", Path(tempfile.gettempdir()) / "sftp2ods-locks"]
-    for base in candidates:
+    for index, base in enumerate(candidates):
         try:
             base.mkdir(parents=True, exist_ok=True)
             # 探测文件名必须唯一（mkstemp）：并发启动时别的进程先 unlink 会让探测抛 FileNotFoundError
@@ -237,8 +237,20 @@ def _lock_path(job_path: Path) -> Path:
             # 探测文件删不掉（少见）不该把整个目录判成不可用——否则会静默换目录，
             # 同一作业的两个实例锁在不同路径上，互斥失效
             pass
+        if index > 0:
+            # 退回目录按用户/环境解析（TMPDIR、macOS /var/folders、systemd PrivateTmp）：
+            # 不同身份/环境跑同一作业可能拿到不同目录、互斥静默失效——至少把事实说出来
+            log(
+                f"  提示：工具目录不可写，运行锁放在 {base}；"
+                f"若存在多用户/多环境混跑，请用 SFTP2ODS_LOCK_DIR 固定同一锁目录"
+            )
         return base / f"{name}.lock"
-    return Path(tempfile.gettempdir()) / f"sftp2ods-{name}.lock"
+    fallback = Path(tempfile.gettempdir()) / f"sftp2ods-{name}.lock"
+    log(
+        f"  警告：工具目录与系统临时目录都不可写，运行锁临时退回 {fallback}；"
+        f"请用 SFTP2ODS_LOCK_DIR 指定一个可写的固定锁目录，否则并发保护可能失效"
+    )
+    return fallback
 
 
 def _redact_job(job: dict, text) -> str:
