@@ -333,6 +333,11 @@ class TestRetry(OfflineTestCase):
             utils.retry_call(always_fail, attempts=2, base_delay=0, desc="测试")
         self.assertIn("重试 1 次仍失败", str(ctx.exception))
 
+    def test_redact_secrets_accepts_bare_scalar_values(self):
+        """values 直接传裸标量（数字/字符串，没有列表壳）也不能炸：与单字符串同口径。"""
+        out = utils.redact_secrets(123456, "charge failed id=123456")
+        self.assertNotIn("123456", out)
+
     def test_first_backoff_respects_max_delay(self):
         """base_delay 配得比 max_delay 大时首次退避也不能超上限（原来只有后续退避夹取）。"""
         slept = []

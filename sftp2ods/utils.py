@@ -770,9 +770,10 @@ def redact_secrets(values, text: str) -> str:
     """
     if not text:
         return text
-    if isinstance(values, str):
-        # 单个字符串会被 set() 拆成单字符，全部短于 _SECRET_MIN_LEN 而被跳过——
-        # 值级脱敏静默失效、凭证反而明文进日志；按"只有一个密钥"处理
+    if not isinstance(values, (list, tuple, set, frozenset)):
+        # 单个字符串会被 set() 拆成单字符（值级脱敏静默失效、凭证明文进日志）；
+        # int/None 等标量会让下面的 for 抛 TypeError、把真正的失败原因顶掉。
+        # 一律按"只有一个密钥"包一层
         values = [values]
     text = str(text)  # 与 redact 同样的宽容度：调用方直接传异常对象/数字也不会炸
     # 密钥值先 str 化（与 api2ods 同口径）：job.secrets 里的数字（如 app_id）直接传进来时

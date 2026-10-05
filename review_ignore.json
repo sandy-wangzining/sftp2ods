@@ -55,6 +55,11 @@
       "file": "tests/test_mc.py",
       "title": "墙钟",
       "reason": "误报（2026-10-05 复核）：断言 elapsed < 0.5s，正确实现实测约 0.05s（10 倍裕量）；预算被重置的回归会多睡 1s 轮询、必然超阈值。"
+    },
+    {
+      "file": "sftp2ods/mc.py",
+      "title": "LIFECYCLE",
+      "reason": "误报（2026-10-05 对照阿里云官方文档与官方示例）：MaxCompute 的 CREATE TABLE 子句顺序就是 TBLPROPERTIES 在前、LIFECYCLE 收尾（官方示例 `) TBLPROPERTIES (...) LIFECYCLE 7;`）；本仓库顺序与之相同，与 api2ods 同款且生产实际跑过。"
     }
   ]
 }
