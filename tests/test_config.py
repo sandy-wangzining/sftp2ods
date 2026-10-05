@@ -79,6 +79,54 @@ class TestPlaceholders(OfflineTestCase):
         with self.assertRaises(SystemExit):
             config.deep_substitute("${secrets.k", {"secrets": {"k": "v"}})
 
+    def test_unclosed_placeholder_error_does_not_echo_secret(self):
+        """报错回显的配置值要先过 redact：密码里带 "${" 这类字符时不能把密码写进日志。"""
+        with self.assertRaises(SystemExit) as err:
+            config.deep_substitute("p@ss token=abcd1234${", {"secrets": {}})
+        self.assertNotIn("abcd1234", str(err.exception))
+        self.assertIn("***", str(err.exception))
+
+    def test_credential_field_keeps_literal_placeholder_chars(self):
+        """凭据字段是自由文本：密码里的 "${" 只是字符，不该让整份配置加载失败。"""
+        value = {"password": "p@ss${word", "passphrase": "a${b}c", "user": "${bizdate}"}
+        self.assertEqual(
+            config.deep_substitute(value, {"secrets": {}, "bizdate": "20260918"}),
+            {"password": "p@ss${word", "passphrase": "a${b}c", "user": "20260918"},
+        )
+
+    def test_credential_field_keeps_whole_literal_placeholder(self):
+        """整串 ${...} 但键不存在：凭据字段按字面量保留（密码本身可能就是这个字符串）。"""
+        self.assertEqual(
+            config.deep_substitute({"password": "${secrets.old}"}, {"secrets": {}}),
+            {"password": "${secrets.old}"},
+        )
+
+    def test_credential_field_still_resolves_real_placeholders(self):
+        value = {"password": "${secrets.pw}", "passphrase": "pre-${secrets.pw}"}
+        self.assertEqual(
+            config.deep_substitute(value, {"secrets": {"pw": "S"}}),
+            {"password": "S", "passphrase": "pre-S"},
+        )
+
+    def test_non_credential_field_still_rejects_unclosed(self):
+        with self.assertRaises(SystemExit):
+            config.deep_substitute({"url": "https://x/${bad"}, {"secrets": {}})
+
+    def test_inline_placeholder_null_raises(self):
+        """secrets.x 为 null 时内联解析不能静默变 "None"：与键路径同口径报错。
+
+        普通字段与凭据字段都算——"password": "pre-${secrets.ns}" 拼出 "pre-None"
+        只会让认证失败，报错却指不到配置上。
+        """
+        with self.assertRaises(SystemExit) as ctx:
+            config.deep_substitute({"root": "/data/${secrets.ns}/daily"}, {"secrets": {"ns": None}})
+        self.assertIn("不是标量", str(ctx.exception))
+        with self.assertRaises(SystemExit):
+            config.deep_substitute({"password": "pre-${secrets.ns}"}, {"secrets": {"ns": None}})
+        # 整串占位符解析成 null 同样拒绝（原样进入运行时配置 = 拿着 None 去连目录/主机）
+        with self.assertRaises(SystemExit):
+            config.deep_substitute("${secrets.ns}", {"secrets": {"ns": None}})
+
     def test_comment_keys_not_rendered(self):
         value = {"//说明": "${secrets.not_configured} 的写法", "k": "${bizdate}"}
         self.assertEqual(
@@ -118,9 +166,46 @@ class TestNormalize(OfflineTestCase):
         self.assertTrue(job["missing"]["check"])
         self.assertEqual(job["missing"]["timezone"], "Asia/Shanghai")
 
+    def test_layout_case_is_normalized(self):
+        """布局取值统一小写：validate_job 按 .lower() 校验，运行时也不该按字面量区分大小写。
+
+        不归一化时 `"layout": "DATE_DIR"` 能过校验，但 SftpSource 会按 flat 去列目录
+        （结果为空、报"远端目录下没有任何匹配文件"，与真正的配置错指不到一起）。
+        """
+        job = config.normalize_job(
+            minimal_job(
+                source={
+                    "root": "/d",
+                    "layout": "DATE_DIR",
+                    "file_regex": "x.csv",
+                    "date_dir_regex": "(?P<date>\\d{8})",
+                }
+            )
+        )
+        self.assertEqual(job["source"]["layout"], "date_dir")
+        config.validate_job(job)  # 归一化后照样通过校验
+        # 概要打印也跟着小写口径（否则会显示成"平铺"，与实际行为对不上）
+        summary = "\n".join(config.build_job_summary(job))
+        self.assertIn("日期子目录", summary)
+
     def test_block_type_error(self):
         with self.assertRaises(SystemExit):
             config.check_block_types({"sftp": "oops"})
+
+    def test_missing_check_null_is_displayed_as_default_true(self):
+        """missing.check 显式 null：normalize 会补默认值 True，概要显示要与校验路径一致（开）。"""
+        job = config.normalize_job(minimal_job(missing={"check": None}))
+        self.assertIs(job["missing"]["check"], True)
+        summary = "\n".join(config.build_job_summary(job))
+        self.assertIn("缺文件核对: 开", summary)
+
+    def test_sftp_auth_wrong_type_gives_config_error(self):
+        """sftp.auth 写成字符串：dict("password") 会抛无上下文的裸 ValueError，先给中文报错。"""
+        job = minimal_job()
+        job["sftp"]["auth"] = "password"
+        with self.assertRaises(SystemExit) as err:
+            config.normalize_job(job)
+        self.assertIn("sftp.auth", str(err.exception))
 
 
 class TestValidate(OfflineTestCase):
@@ -286,6 +371,12 @@ class TestValidate(OfflineTestCase):
         warnings = config.collect_warnings(config.normalize_job(job))
         self.assertEqual(warnings, [])
 
+    def test_collect_warnings_non_iterable_columns_do_not_crash(self):
+        """columns 写成非数组（5/true 手误）时收集告警不能裸 TypeError——告警收集早于
+        validate_job，这里跳过、交给校验阶段报「columns 必须是数组」。"""
+        warnings = config.collect_warnings({"parse": {"columns": 5}})
+        self.assertIsInstance(warnings, list)
+
     def test_collect_warnings_sftp_and_auth_type_guard(self):
         """sftp / sftp.auth 不是对象时不能 AttributeError，也不能把字符串拆成逐字符假告警。"""
         warnings = config.collect_warnings({"sftp": "host", "parse": {}})
@@ -359,6 +450,30 @@ class TestProfiles(OfflineTestCase):
         with self.assertRaises(SystemExit):
             config.get_mc_profile_meta({}, job, make_args(mc_profile="prod"))
 
+    def test_non_mapping_source_clean_error_in_download_dir(self):
+        """source 写成字符串时 resolve_download_dir 给中文配置错，不是裸 AttributeError。"""
+        job = minimal_job()
+        job["source"] = "./data"
+        with self.assertRaises(SystemExit) as ctx:
+            config.resolve_download_dir(job, Path("x.json"))
+        self.assertIn("source", str(ctx.exception))
+
+    def test_non_mapping_target_gives_clean_error(self):
+        """target 写成字符串/数组（漏了大括号）时给配置错，不是裸 AttributeError。"""
+        job = minimal_job()
+        job["target"] = "ods.tbl"
+        job.pop("maxcompute", None)  # 没有回退来源时，非对象 target 必须给配置错
+        # resolve_target 是非对象 target 的第一道取值点：给中文配置错而不是裸 AttributeError
+        with self.assertRaises(SystemExit) as ctx:
+            config.resolve_target(job, {}, make_args())
+        self.assertIn("目标项目", str(ctx.exception))
+
+    def test_profiles_comment_keys_are_ignored(self):
+        """profiles 里按约定写 "//" 注释键不能让整个作业报"必须是对象"。"""
+        job = minimal_job()
+        job["profiles"] = {"//": "共享凭证统一放 --config", "prod": {"project": "p2"}}
+        config.validate_job(config.normalize_job(job))  # 不抛
+
 
 class TestResolveTargetAndDirs(OfflineTestCase):
     def test_target_project_from_profile(self):
@@ -375,14 +490,26 @@ class TestResolveTargetAndDirs(OfflineTestCase):
         with self.assertRaises(SystemExit):
             config.resolve_target(job, {}, make_args())
 
+    def test_safe_job_name_keeps_legal_underscores(self):
+        """只含合法字符的名字（含首尾下划线）原样保留：否则下载目录被改名、旧文件不复用。"""
+        self.assertEqual(config.safe_job_name({"job": "recon_"}, Path("x.json")), "recon_")
+
     def test_download_dir_default(self):
         job = minimal_job()
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "jobs" / "demo.json"
             self.assertEqual(config.resolve_download_dir(job, path), path.parent / "download" / "demo")
-            # 作业名里的不安全字符会被过滤
+            # 作业名里的不安全字符会被过滤，并补名字哈希（防"对账A"与"A"这类归一后撞名
+            # 的作业共用下载目录互串文件）
             job["job"] = "a/b c"
-            self.assertEqual(config.resolve_download_dir(job, path), path.parent / "download" / "a_b_c")
+            filtered = config.resolve_download_dir(job, path)
+            self.assertTrue(filtered.name.startswith("a_b_c-"), filtered)
+            job["job"] = "对账A"
+            dirty = config.resolve_download_dir(job, path)
+            job["job"] = "A"
+            plain = config.resolve_download_dir(job, path)
+            self.assertNotEqual(dirty, plain, "归一后同名的两个作业不能共用下载目录")
+            self.assertEqual(plain, path.parent / "download" / "A")  # 干净名字保持原名不变
 
     def test_download_dir_relative_and_absolute(self):
         job = minimal_job()

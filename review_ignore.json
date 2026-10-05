@@ -1,0 +1,60 @@
+{
+  "//说明": "代码审查抑制名单：这里只放「已人工实证为误报」的条目，命中后不进报告主清单、不进飞书、不进裁判。每条都必须写明实证结论与日期；真实缺陷不要放进来。",
+  "suppress": [
+    {
+      "file": "sftp2ods/cli.py",
+      "title": "detach_log_sink",
+      "reason": "误报（2026-10-05 实证）：_detach_log_sink 委托的 utils.remove_log_sink（utils.py:75）内部已 handle.close()，句柄不泄漏。"
+    },
+    {
+      "file": "sftp2ods/mc.py",
+      "title": "reopen",
+      "reason": "误报（2026-10-05 对照 pyodps 0.13.2 源码）：create_upload_session 里 upload_id = upload_ids.get(partition) if not reopen else None——reopen=True 恰是「新建会话」，代码与注释一致。"
+    },
+    {
+      "file": "sftp2ods/config.py",
+      "title": "混用 SystemExit",
+      "reason": "误报（2026-10-05 复核）：本仓库 ConfigError 继承 SystemExit（utils.py:36），两种抛法退出行为一致，cli 按次捕获；属有意设计而非混用缺陷。"
+    },
+    {
+      "file": "sftp2ods/config.py",
+      "title": "sftp.auth.type",
+      "reason": "误报（2026-10-05 复核）：运行期 SftpSource.__init__ 同样 .lower() 再比较（sftp.py:154、234），大小写不会走错认证分支。"
+    },
+    {
+      "file": "sftp2ods/init_wizard.py",
+      "title": "SftpSource",
+      "reason": "误报（2026-10-05 两次实证）：SftpSource 不持有长连接——list_files/download 都经 _run 建连、finally 关闭（sftp.py:289-300），重试不会累积泄漏的 SSD 会话。"
+    },
+    {
+      "file": "tests/test_wizard.py",
+      "title": "Mock(wraps",
+      "reason": "误报（2026-10-05 实证）：Mock(wraps=os) 的属性访问返回包装对应属性的 Mock，调用路径（replace/fdopen/fsync）会真实执行；生产写盘用 tempfile.mkstemp+os.fdopen+os.chmod+os.replace，全文件无 os.open/O_* 常量访问，chmod 分支按预期触发。"
+    },
+    {
+      "file": "tests/test_cli.py",
+      "title": "sys.path",
+      "reason": "误报（2026-10-05 复核）：文件头注释即为此写明——只在路径缺失时 append（不插最前），按 README 在仓库根运行时本地包本来就在最前；pip install -e 的 .pth 也指向同一份代码，不存在验证另一版本。"
+    },
+    {
+      "file": "tests/test_utils.py",
+      "title": "墙钟",
+      "reason": "误报（2026-10-05 复核）：断言是相对判据 big < max(small*8, 0.5s)，8 倍裕量 + 0.5s 下限，负载下不会假失败（同族两条一并）。"
+    },
+    {
+      "file": "tests/test_utils.py",
+      "title": "挂钟",
+      "reason": "误报（2026-10-05 复核）：同「墙钟」条——模型换词重复报的同一处，实证见上（相对判据 + 宽松下限）。"
+    },
+    {
+      "file": "tests/test_parse.py",
+      "title": "挂钟",
+      "reason": "误报（2026-10-05 复核）：阈值 5 秒对毫秒级操作有约千倍裕量，负载下不会假失败；真退化成巨型整数运算时仍会被抓住。"
+    },
+    {
+      "file": "tests/test_mc.py",
+      "title": "墙钟",
+      "reason": "误报（2026-10-05 复核）：断言 elapsed < 0.5s，正确实现实测约 0.05s（10 倍裕量）；预算被重置的回归会多睡 1s 轮询、必然超阈值。"
+    }
+  ]
+}

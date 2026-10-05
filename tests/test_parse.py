@@ -7,6 +7,7 @@ import copy
 import decimal
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -393,11 +394,33 @@ class TestIterRows(SpecTestCase):
         self.assertEqual(len(got), 1)
         self.assertEqual(stats["skipped"], 1)
 
+    def test_skip_column_missing_header_is_error(self):
+        """skip_if_empty 的列不在文件表头时，按"空值"跳过会把所有行跳掉、整段写 0 行——
+        必须显式报错（先删后填的流程下等于清空分区）。"""
+        cols = [dict(c, required=False) for c in COLUMNS]
+        path = self.make_file(
+            "a.csv",
+            csv_bytes([c["header"] for c in COLUMNS if c["name"] != "order_id"], [["1", "2", "3"]]),
+        )
+        s = spec(cols, skip_if_empty=["order_id"])
+        with self.assertRaises(RuntimeError) as ctx:
+            self.rows_of(path, s)
+        self.assertIn("skip_if_empty", str(ctx.exception))
+
     def test_empty_file(self):
         path = self.make_file("a.csv", b"")
         stats = {"skipped": 0, "rows": 0}
         self.assertEqual(self.rows_of(path, spec(COLUMNS), stats), [])
         self.assertEqual(stats["rows"], 0)
+
+    def test_empty_file_with_footer_is_error(self):
+        """配置了合计行时空文件必须中止：截断成 0 字节是最常见的故障形态，
+        静默写 0 行在先删后填的流程下等于清空分区。"""
+        path = self.make_file("a.csv", b"")
+        s = spec(COLUMNS, footer={"sum": ["settlement_amount"]})
+        with self.assertRaises(RuntimeError) as ctx:
+            self.rows_of(path, s)
+        self.assertIn("空文件", str(ctx.exception))
 
     def test_header_only(self):
         path = self.make_file("a.csv", csv_bytes([c["header"] for c in COLUMNS], []))
@@ -421,7 +444,57 @@ class TestFooter(SpecTestCase):
             all_rows.append(footer)
         return self.make_file("a.csv", csv_bytes([c["header"] for c in self.COLS], all_rows))
 
+    def test_footer_row_may_differ_in_column_count(self):
+        """合计行是人写的汇总行，列数常与数据行不一致：识别必须排在列数校验之前，
+        不能被 strict_columns 误判成"列结构变了"整份中止。"""
+        cols = list(self.COLS) + [{"header": "Extra", "name": "extra", "type": "string"}]
+        path = self.make_file(
+            "a.csv",
+            csv_bytes(
+                [c["header"] for c in cols],
+                [["a", "1.5", "x"], ["b", "2.5", "y"], ["", "4.0"]],
+            ),
+        )
+        s = spec(cols, footer={"sum": ["amount"]})
+        got = self.rows_of(path, s)
+        self.assertEqual(len(got), 2)
+        self.assertEqual(got[1][1], decimal.Decimal("2.5"))
+
+    def test_footer_row_may_be_longer_than_header(self):
+        """合计行带尾随分隔符（解析出 3 列而表头 2 列）也要先按合计行识别：
+        "多于表头"的校验只作用于数据行，不能把合法文件中止。"""
+        path = self.make_file(
+            "a.csv",
+            csv_bytes(
+                [c["header"] for c in self.COLS],
+                [["a", "1.5"], ["b", "2.5"], ["", "4.0", ""]],
+            ),
+        )
+        s = spec(self.COLS, footer={"sum": ["amount"]})
+        got = self.rows_of(path, s)
+        self.assertEqual(len(got), 2)
+        self.assertEqual(got[1][1], decimal.Decimal("2.5"))
+
+    def test_footer_sum_may_exceed_column_range(self):
+        """合计是派生值：多行之和天然可以超出单列 decimal(p,s) 范围（两行 99999999.99
+        的合法和就超 decimal(10,2)），不能按数据行的范围校验把合法文件中止。"""
+        cols = [
+            {"header": "Name", "name": "name", "type": "string"},
+            {"header": "Amount", "name": "amount", "type": "decimal(10,2)"},
+        ]
+        path = self.make_file(
+            "a.csv",
+            csv_bytes(
+                [c["header"] for c in cols],
+                [["a", "99999999.99"], ["b", "99999999.99"], ["", "199999999.98"]],
+            ),
+        )
+        s = spec(cols, footer={"sum": ["amount"]})
+        got = self.rows_of(path, s)
+        self.assertEqual(len(got), 2)
+
     def test_footer_skipped_and_validated(self):
+
         path = self.make(
             [["a", "1.5"], ["b", "2.5"]],
             footer=["", "4.0"],
@@ -430,6 +503,27 @@ class TestFooter(SpecTestCase):
         got = self.rows_of(path, s)
         self.assertEqual(len(got), 2)
         self.assertEqual(got[1][1], decimal.Decimal("2.5"))
+
+    def test_footer_dirty_number_is_rejected_like_data_rows(self):
+        """合计行的数字口径与数据行一致：下划线/非 ASCII 脏值同样拒绝（Decimal 也接受它们）。"""
+        for raw, must in (("1_0", "下划线"), ("１２３", "非 ASCII")):
+            path = self.make([["a", raw], ["b", raw]], footer=["", raw])
+            s = spec(self.COLS, footer={"sum": ["amount"]})
+            with self.assertRaises(RuntimeError) as ctx:
+                self.rows_of(path, s)
+            self.assertIn(must, str(ctx.exception))
+
+    def test_footer_value_out_of_decimal_range_is_rejected(self):
+        """合计行也要过 decimal(p,s) 范围校验：数据行通过、合计行超限时同样报错。"""
+        cols = [
+            {"header": "Name", "name": "name", "type": "string"},
+            {"header": "Amount", "name": "amount", "type": "decimal(5,2)"},
+        ]
+        rows = csv_bytes(["Name", "Amount"], [["a", "1.00"], ["", "12345.67"]])
+        path = self.make_file("f.csv", rows)
+        with self.assertRaises(RuntimeError) as ctx:
+            self.rows_of(path, spec(cols, footer={"sum": ["amount"]}))
+        self.assertIn("合计行", str(ctx.exception))
 
     def test_footer_mismatch_errors(self):
         path = self.make([["a", "1.5"]], footer=["", "9.9"])
@@ -445,6 +539,21 @@ class TestFooter(SpecTestCase):
         with self.assertRaises(RuntimeError) as ctx:
             self.rows_of(path, s)
         self.assertIn("没有合计行", str(ctx.exception))
+
+    def test_footer_requires_config_order_match_file_order(self):
+        """footer 开启时配置第一列必须是文件首列：识别用「文件首列」而校验用「配置第一列」，
+        两套口径在列序不一致时打架（漏检/误报）；直接要求重合并给出可操作的报错。
+        """
+        cols = [
+            {"header": "金额A", "name": "amount_a", "type": "decimal(19,2)"},
+            {"header": "金额B", "name": "amount_b", "type": "decimal(19,2)"},
+            {"header": "单据号", "name": "doc_no", "type": "string"},
+        ]
+        rows = csv_bytes(["单据号", "金额A", "金额B"], [["d1", "1.0", "2.0"], ["", "1.0", "2.0"]])
+        path = self.make_file("o.csv", rows)
+        with self.assertRaises(RuntimeError) as ctx:
+            self.rows_of(path, spec(cols, footer={"sum": ["amount_b"]}))
+        self.assertIn("不是文件首列", str(ctx.exception))
 
     def test_footer_enabled_header_only_is_error(self):
         path = self.make_file("a.csv", csv_bytes([c["header"] for c in self.COLS], []))
@@ -652,6 +761,18 @@ class TestValueRange(SpecTestCase):
             self.rows_of(bad, s)
         self.assertIn("bigint", str(ctx.exception))
 
+    def test_numeric_columns_reject_underscores_and_unicode_digits(self):
+        """三种数值解析都比「报表里的数字」宽松（PEP 515 下划线 int("1_0")==10、
+        Decimal("1_0")==10、Unicode 数字照收），口径要对齐：一律拒，不能静默改值。"""
+        cases = (("1_0", "下划线"), ("１２３", "非 ASCII"))
+        for col_type in ("bigint", "double", "decimal(19,4)"):
+            s = spec([{"header": "n", "name": "n", "type": col_type}])
+            for raw, must in cases:
+                path = self.make_file("dirty.csv", csv_bytes(["n"], [[raw]]))
+                with self.assertRaises(RuntimeError) as ctx:
+                    self.rows_of(path, s)
+                self.assertIn(must, str(ctx.exception))
+
     def test_decimal_trailing_zeros_are_not_rejected(self):
         """尾部补零（decimal(10,2) 下的 1.500）数值上精确可表示，不该被当成"小数位超限"拦下；
         真正会被舍入改值的（1.234）仍要报错。"""
@@ -663,6 +784,21 @@ class TestValueRange(SpecTestCase):
         with self.assertRaises(RuntimeError) as ctx:
             self.rows_of(bad, s)
         self.assertIn("小数位", str(ctx.exception))
+
+    def test_huge_exponent_is_rejected_without_allocating(self):
+        """单元格里 1e-1000000000 这类指数不能触发 10**N 的巨型整数构造。
+
+        修复前按 frac_digits-scale 直接算 10**999999996（4 亿位，数百 MB + 秒级 CPU，
+        再大直接 MemoryError——那还不是可读的 ValueRangeError）。用宽松的墙钟上界兜住
+        "卡死/分配巨大内存"这一类失败模式（正常路径 <10ms，阈值只拦数量级异常）。
+        """
+        s = spec([{"header": "金额", "name": "amount", "type": "decimal(19,4)"}])
+        path = self.make_file("huge.csv", csv_bytes(["金额"], [["1e-1000000000"]]))
+        started = time.perf_counter()
+        with self.assertRaises(RuntimeError) as ctx:
+            self.rows_of(path, s)
+        self.assertIn("小数位", str(ctx.exception))
+        self.assertLess(time.perf_counter() - started, 5.0, "指数路径疑似退化成巨型整数运算")
 
 
 class TestFooterPrecision(SpecTestCase):

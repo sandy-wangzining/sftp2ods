@@ -53,6 +53,19 @@ def date_dir_source(**overrides) -> sftp_mod.SftpSource:
 
 
 class TestSourceConfigGuards(OfflineTestCase):
+    def test_layout_case_is_accepted(self):
+        """`"DATE_DIR"` 这类大小写变体要按 date_dir 处理（与 validate_job 的 .lower() 口径一致）。"""
+        source = flat_source(
+            source={
+                "root": "settlements",
+                "layout": "DATE_DIR",
+                "date_dir_regex": "(?P<date>\\d{8})",
+                "file_regex": "detail_(?P<date>\\d{8})\\.csv",
+            }
+        )
+        self.assertEqual(source.layout, "date_dir")
+        self.assertIsNotNone(source.dir_re)
+
     def test_file_regex_requires_date_group(self):
         """file_regex 缺 (?P<date>) 时必须在配置阶段报错（否则扫描时抛 IndexError，还会被重试）。"""
         with self.assertRaises(SystemExit) as ctx:
@@ -60,15 +73,18 @@ class TestSourceConfigGuards(OfflineTestCase):
         self.assertIn("(?P<date>", str(ctx.exception))
 
     def test_date_dir_regex_requires_date_group(self):
+        """只让 date_dir_regex 非法：file_regex 用合法带组值，断言唯一指向 date_dir_regex
+        的校验（两处都缺 (?P<date>) 时，先触发的 file_regex 校验会让用例假绿）。"""
         with self.assertRaises(SystemExit) as ctx:
             flat_source(
                 source={
                     "root": "/d",
                     "layout": "date_dir",
-                    "file_regex": r"a\.csv",
+                    "file_regex": r"detail_(?P<date>\d{8})\.csv",
                     "date_dir_regex": r"\d{8}",
                 }
             )
+        self.assertIn("date_dir_regex", str(ctx.exception))
         self.assertIn("(?P<date>", str(ctx.exception))
 
 
@@ -190,7 +206,27 @@ class TestScanDateDir(OfflineTestCase):
         self.assertEqual(item.remote, "settlements/20260921/detail_y_20260920_USD.csv")
         self.assertEqual(item.ledger_key, "20260921/detail_y_20260920_USD.csv")
 
-    def test_subdir_listing_failure_skips(self):
+    def test_bad_port_is_config_error(self):
+        """sftp.port 非法值给配置错（原来抛裸 ValueError）；范围也校验。"""
+        for bad in ("abc", 0, 70000):
+            with self.assertRaises(sftp_mod.ConfigError):
+                sftp_mod.SftpSource({"host": "h", "username": "u", "port": bad})
+
+    def test_symlinked_date_dir_is_scanned(self):
+        """指向日期目录的软链（st_mode 是 S_IFLNK）要跟随判断：flat 布局显式支持软链，
+        date_dir 下若直接跳过，整个业务日期会从结果里静默消失。"""
+        fake = FakeSftp()
+        fake.tree["settlements"] = [FakeEntry("20260920", 0, is_dir=True, is_link=True)]
+        fake.tree["settlements/20260920"] = [FakeEntry("detail_x_20260920_USD.csv", 8)]
+        fake.contents["settlements/20260920/detail_x_20260920_USD.csv"] = b"a,b\n1,2\n"
+        source = date_dir_source()
+        with mock.patch.object(sftp_mod.SftpSource, "_connect", connect_to(fake)):
+            files = source.list_files()
+        self.assertEqual(sorted(files), ["20260920"])
+        self.assertEqual(files["20260920"][0].remote, "settlements/20260920/detail_x_20260920_USD.csv")
+
+    def test_empty_subdir_yields_nothing(self):
+        """日期目录存在但没有匹配文件：返回空（列目录失败的两条语义由下面两个用例分别覆盖）。"""
         fake = FakeSftp()
         add_dir(fake, "settlements/20260920")
         source = date_dir_source()
@@ -264,7 +300,7 @@ class TestDownload(OfflineTestCase):
 
     def test_download_size_mismatch_keeps_part(self):
         item = self._item()
-        # 远端列表说 10 字节，实际内容 8 字节 → 拒绝改名
+        # 远端列表声明 999 字节，实际内容 8 字节 → 拒绝改名
         item.size = 999
         with mock.patch.object(sftp_mod.SftpSource, "_connect", connect_to(self.fake)):
             with self.assertRaises(RuntimeError) as ctx:
@@ -318,7 +354,9 @@ class FakeSftpHandle(FakeSftp):
         return self.channel
 
 
-class TestConnect(OfflineTestCase):
+class _ParamikoFixture(OfflineTestCase):
+    """只放 _fake_paramiko 等共用夹具，不含 test_*：避免子类继承父类用例被重复执行。"""
+
     def _fake_paramiko(self):
         module = mock.MagicMock(name="paramiko")
 
@@ -383,6 +421,8 @@ class TestConnect(OfflineTestCase):
         module.SSHClient = SSHClient
         return module, last
 
+
+class TestConnect(_ParamikoFixture):
     def test_password_auth_kwargs(self):
         module, last = self._fake_paramiko()
         source = flat_source()
@@ -526,7 +566,7 @@ class TestScanSafety(OfflineTestCase):
             self.assertEqual(got.read_bytes(), b"a,b\n1,2\n")
 
 
-class TestHostKeyPolicy(TestConnect):
+class TestHostKeyPolicy(_ParamikoFixture):
     """主机指纹校验：默认严格（显式 RejectPolicy + 只认 known_hosts），
     sftp.host_key=auto_accept 显式降级为 AutoAddPolicy。"""
 
@@ -607,16 +647,20 @@ class TestLocalPathWithin(OfflineTestCase):
         self.base.mkdir()
 
     def test_plain_and_nested_within(self):
-        self.assertEqual(sftp_mod.local_path_within(self.base, "a.csv", "a.csv"), self.base / "a.csv")
+        # 两侧都 resolve 后比较：macOS 上临时目录在 /var（符号链接）下，未规范化的路径不相等
         self.assertEqual(
-            sftp_mod.local_path_within(self.base, "20260920/a.csv", "a.csv"),
-            self.base / "20260920" / "a.csv",
+            sftp_mod.local_path_within(self.base, "a.csv", "a.csv").resolve(),
+            (self.base / "a.csv").resolve(),
+        )
+        self.assertEqual(
+            sftp_mod.local_path_within(self.base, "20260920/a.csv", "a.csv").resolve(),
+            (self.base / "20260920" / "a.csv").resolve(),
         )
 
     def test_colon_name_is_allowed(self):
         """远端是 POSIX，文件名带 ":" 合法：不能因为冒号就拒绝（Windows 上它仍在下载目录内）。"""
         key = "report:20260920.csv"
-        self.assertEqual(sftp_mod.local_path_within(self.base, key, key), self.base / key)
+        self.assertEqual(sftp_mod.local_path_within(self.base, key, key).resolve(), (self.base / key).resolve())
 
     def test_parent_traversal_rejected(self):
         with self.assertRaises(FatalSourceError):

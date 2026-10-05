@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -80,11 +81,21 @@ class World:
         return True
 
     def __enter__(self):
-        for patcher in self._patches:
-            patcher.start()
-        self.access_logs.clear()
-        self._log_patch = mock.patch.object(cli_mod, "log", self.access_logs.append)
-        self._log_patch.start()
+        started = []
+        try:
+            for patcher in self._patches:
+                patcher.start()
+                started.append(patcher)
+            self.access_logs.clear()
+            self._log_patch = mock.patch.object(cli_mod, "log", self.access_logs.append)
+            self._log_patch.start()
+            started.append(self._log_patch)
+        except BaseException:
+            # 中途失败要把已启动的 patcher 全部回滚：否则全局 mock 留在原地，
+            # 后续用例对着被 mock 的世界跑，故障点还会指向无关的地方
+            for patcher in reversed(started):
+                patcher.stop()
+            raise
         return self
 
     def __exit__(self, *exc_info):
@@ -112,6 +123,20 @@ class CliTestCase(OfflineTestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
+
+
+class TestWorldHarness(CliTestCase):
+    def test_enter_rolls_back_started_patches_on_failure(self):
+        """__enter__ 中途失败时回滚已启动的 patcher，不能把全局 mock 留在原地污染后续用例。"""
+        world = World(self.tmp)
+        first, second = mock.MagicMock(), mock.MagicMock()
+        second.start.side_effect = RuntimeError("boom")
+        world._patches = [first, second]
+        with self.assertRaises(RuntimeError):
+            with world:
+                pass
+        first.stop.assert_called_once_with()
+        second.stop.assert_not_called()
 
 
 class TestSyncHappyPath(CliTestCase):
@@ -173,6 +198,14 @@ class TestSyncRanges(CliTestCase):
             self.assertIn("pt=20260920", world.table.deleted)
             self.assertIn("pt=20260921", world.table.deleted)
             self.assertNotIn("pt=20260922", world.table.deleted)
+
+    def test_explicit_empty_bizdate_is_arg_error(self):
+        """显式传空 --bizdate（调度脚本 `--bizdate "$pt"` 且 $pt 未定义）不能按"未指定"
+        静默处理：按参数问题报错退出（退出码 2），而不是回退成"处理全部日期"。"""
+        for empty in ("", "   "):
+            msg = cli_mod._check_cli_args(make_args(bizdate=empty))
+            self.assertTrue(msg, "空 bizdate 必须返回错误文案")
+            self.assertIn("日期", msg)
 
     def test_bizdate_with_range_is_rejected(self):
         # 参数互斥在命令行阶段就拦下：退出码 2（参数问题），不进远端流程
@@ -372,10 +405,7 @@ class TestSyncGuards(CliTestCase):
             self.assertEqual(len(world.table.rows_in("20260920")), 1)
             # 源方把文件改坏成"只剩表头"（大小变了 → 台账不命中，会重跑）
             empty = csv_bytes(HEADERS, [])
-            world.fake.contents["/data/report_20260920.csv"] = empty
-            for entry in world.fake.tree["/data"]:
-                if entry.filename == "report_20260920.csv":
-                    entry.st_size = len(empty)
+            world.fake.replace_file("/data/report_20260920.csv", empty)
             self.assertEqual(world.sync(bizdate="20260920"), 1)
             self.assertEqual(len(world.table.rows_in("20260920")), 1, "已有数据被清空了")
             self.assertTrue(any("为避免清空已有数据" in str(line) for line in world.access_logs))
@@ -386,10 +416,7 @@ class TestSyncGuards(CliTestCase):
         with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
             self.assertEqual(world.sync(bizdate="20260920"), 0)
             empty = csv_bytes(HEADERS, [])
-            world.fake.contents["/data/report_20260920.csv"] = empty
-            for entry in world.fake.tree["/data"]:
-                if entry.filename == "report_20260920.csv":
-                    entry.st_size = len(empty)
+            world.fake.replace_file("/data/report_20260920.csv", empty)
             self.assertEqual(world.sync(bizdate="20260920", force=True), 0)
             self.assertEqual(world.table.rows_in("20260920"), [])
 
@@ -407,11 +434,31 @@ class TestSyncGuards(CliTestCase):
             self.assertEqual(world.sync(bizdate="20260920"), 0)
             ledger_path = world.download_dir / state_mod.STATE_FILE_NAME
             ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-            ledger["report_20260920.csv"]["project"] = "other_project"
+            # setdefault + 断言键存在：台账键口径变化时失败信息是"没有该键"，而不是裸 KeyError
+            self.assertIn("report_20260920.csv", ledger)
+            ledger.setdefault("report_20260920.csv", {})["project"] = "other_project"
             ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
             deletes = len(world.table.deleted)
             self.assertEqual(world.sync(bizdate="20260920"), 0)
             self.assertEqual(len(world.table.deleted), deletes + 1)
+
+    def test_corrupted_local_file_is_redownloaded(self):
+        """本地文件被改坏但大小没变（台账 md5 对不上）时必须重新下载：
+
+        原来下载准备阶段按"仅比大小"复用它——损坏数据被重新解析上传、台账 md5 还被覆盖，
+        且永远不会从远端重下。"""
+        data = report([["o1", "1.00"]])
+        with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
+            self.assertEqual(world.sync(bizdate="20260920"), 0)
+            entry = json.loads((world.download_dir / state_mod.STATE_FILE_NAME).read_text(encoding="utf-8"))
+            self.assertIn("report_20260920.csv", entry)
+            local = world.download_dir / "report_20260920.csv"
+            self.assertTrue(local.is_file())
+            local.write_bytes(b"x" * local.stat().st_size)  # 大小不变、内容损坏
+            downloads = len(world.fake.downloaded)
+            self.assertEqual(world.sync(bizdate="20260920"), 0)
+            # 修复后：md5 对不上 → 重新下载
+            self.assertEqual(len(world.fake.downloaded), downloads + 1)
 
     def test_ledger_save_failure_fails_run(self):
         data = report([["o1", "1.00"]])
@@ -665,6 +712,19 @@ class TestMainEntry(CliTestCase):
     def test_negative_sql_timeout_returns_2(self):
         self.assertEqual(cli_mod.main(["--job", "whatever.json", "--sql-timeout", "-1"]), 2)
 
+    def test_empty_systemexit_message_is_not_treated_as_pass(self):
+        """参数校验里捕获到 SystemExit()（空消息）时不能返回空串被当成"校验通过"。"""
+        args = cli_mod.build_parser().parse_args(["--job", "x.json", "--bizdate", "20260101"])
+        with mock.patch.object(cli_mod, "parse_day_arg", side_effect=SystemExit()):
+            problem = cli_mod._check_cli_args(args)
+        self.assertTrue(problem)
+
+    def test_bad_log_file_returns_2(self):
+        """--log-file 指向目录属"参数问题"：按退出码约定报 2（还没做过任何远端操作），
+        不能混进 1（运行失败）让调度按数据故障告警。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(cli_mod.main(["--job", "whatever.json", "--log-file", tmp]), 2)
+
     def test_happy_path(self):
         data = report([["o1", "1.00"]])
         with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
@@ -690,6 +750,13 @@ class TestMainEntry(CliTestCase):
             self.assertEqual(cli_mod.main(["--init"]), 1)
         with mock.patch.object(init_wizard, "run_init", side_effect=KeyboardInterrupt):
             self.assertEqual(cli_mod.main(["--init"]), 130)
+
+    def test_init_unexpected_error_is_logged_not_bare_traceback(self):
+        """向导内部未预期异常：记一笔真实错误（不是"已取消"）并按 1 退出，不抛裸 traceback。"""
+        from sftp2ods import init_wizard
+
+        with mock.patch.object(init_wizard, "run_init", side_effect=ValueError("内部解析出错")):
+            self.assertEqual(cli_mod.main(["--init"]), 1)
 
     def test_check_flag(self):
         data = report([["o1", "1.00"]])
@@ -786,6 +853,22 @@ class TestRedactionHelpers(CliTestCase):
         self.assertNotIn("secret-pw", out)
         self.assertNotIn("abc12345", out)
 
+    def test_prepare_stage_error_masks_config_secrets(self):
+        """凭证只写在 --config 的 secrets 里时，准备阶段的报错也不能回显明文。
+
+        作业文件里只有 ${secrets.tbl} 时，只按 job_raw 收密钥值会漏遮（把配置里的值
+        原样打进日志/--log-file）；这里断言两份配置一起参与值级脱敏。
+        """
+        job = minimal_job(target={"project": "demo_project", "table": "${secrets.tbl}"})
+        config_path = self.tmp / "config.json"
+        config_path.write_text(json.dumps({"secrets": {"tbl": "my table"}}), encoding="utf-8")
+        with World(self.tmp, job=job) as world:
+            rc = cli_mod.main(["--job", str(world.job_path), "--config", str(config_path), "--check"])
+            joined = "\n".join(str(line) for line in world.access_logs)
+        self.assertEqual(rc, 1)
+        self.assertNotIn("my table", joined)
+        self.assertIn("***", joined)
+
 
 class TestPromptSecret(CliTestCase):
     def test_getpass_success(self):
@@ -804,6 +887,29 @@ class TestPromptSecret(CliTestCase):
         with mock.patch.object(cli_mod.getpass, "getpass", side_effect=RuntimeError("boom")):
             with self.assertRaises(RuntimeError):
                 cli_mod.prompt_secret()
+
+
+class TestLockDirOverride(CliTestCase):
+    """SFTP2ODS_LOCK_DIR：把锁钉在固定目录，避免不同身份/TMPDIR 下互斥静默失效。"""
+
+    def test_env_override_pins_location(self):
+        pinned = self.tmp / "shared-locks"
+        with mock.patch.dict(os.environ, {"SFTP2ODS_LOCK_DIR": str(pinned)}):
+            path = cli_mod._lock_path(self.tmp / "jobs" / "demo.json")
+            again = cli_mod._lock_path(self.tmp / "jobs" / "demo.json")
+        self.assertEqual(path.parent, pinned)
+        self.assertEqual(path, again)
+        self.assertTrue(path.name.endswith(".lock"))
+
+    def test_env_override_unusable_fails_loudly(self):
+        """显式指定的锁目录不可用要立刻报错（静默换目录就等于互斥失效）。"""
+        with (
+            mock.patch.dict(os.environ, {"SFTP2ODS_LOCK_DIR": str(self.tmp / "ro" / "locks")}),
+            mock.patch.object(Path, "mkdir", side_effect=OSError("只读")),
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                cli_mod._lock_path(self.tmp / "jobs" / "demo.json")
+        self.assertIn("SFTP2ODS_LOCK_DIR", str(ctx.exception))
 
 
 if __name__ == "__main__":

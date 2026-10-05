@@ -25,10 +25,9 @@ from .utils import ConfigError, as_bool, log
 
 # CSV 单字段默认只允许 128KB，报表类文件很容易超；调到接近 MaxCompute 单列上限
 _CSV_FIELD_LIMIT = 7_000_000
-try:
-    csv.field_size_limit(_CSV_FIELD_LIMIT)
-except OverflowError:  # pragma: no cover - 32 位平台上 C long 装不下
-    csv.field_size_limit(10**7)
+# 7_000_000 远小于任何平台 C long 的上限（32 位也有 2**31-1），不会 OverflowError；
+# 原来那段 except 的"回退值" 10**7 比目标值还大，真溢出时只会再溢出一次（死代码，删掉）
+csv.field_size_limit(_CSV_FIELD_LIMIT)
 
 # 分隔符白名单：自动探测只在这几个里选；显式指定时只允许单个字符
 KNOWN_DELIMITERS = ("\t", ",", ";")
@@ -117,8 +116,12 @@ class Column:
         return self.type
 
     def ddl_comment(self) -> str:
-        """DDL 里的注释文本（单引号转义）。"""
-        return self.comment.replace("'", "''")
+        """DDL 里的注释文本：先转义反斜杠再转义单引号。
+
+        DDL 串里反斜杠本身是转义符：以 "\\" 结尾的注释会吃掉收尾引号、把后面的
+        语句当 SQL 继续解析（与 mc._sql_spec 同一口径）。
+        """
+        return self.comment.replace("\\", "\\\\").replace("'", "''")
 
 
 def build_columns(parse_cfg: dict) -> list[Column]:
@@ -330,6 +333,15 @@ class ParseSpec:
                 f"{filename} 缺少第一列（{self.columns[0].header!r}），无法识别合计行；"
                 f"parse.footer 开启时第一列必须存在"
             )
+        if self.footer_enabled and pos[0] != 0:
+            # 合计行按「文件首列为空」识别，而 parse.footer.sum 的"不能是第一列"校验又按
+            # 「配置第一列」算——配置顺序与文件顺序不一致时两套口径打架（漏检/误报）。
+            # 直接要求两者重合：footer 开启时配置的第一列必须就是文件的第一列。
+            raise RuntimeError(
+                f"{filename} 配置的第一列（{self.columns[0].header!r}）不是文件首列"
+                f"（文件首列是 {header_row[0]!r}）：parse.footer 用「文件首列为空」识别合计行，"
+                f"请把 parse.columns 的顺序调整为与文件表头一致"
+            )
         if stats is not None:
             known = {norm(col.header) for col in self.columns}
             extras = [name.strip() for name in header_row if norm(name) not in known]
@@ -354,6 +366,14 @@ class ParseSpec:
                 continue
             try:
                 text = strip_thousands(raw)
+                if not text.isascii():
+                    # 三种数值解析都比"报表里的数字"宽松：Unicode 数字（"１２３"）int/float/
+                    # Decimal 全部照单全收，静默改值读进来会污染数据，一律拒
+                    raise ValueRangeError(f"取值含非 ASCII 数字：{text!r}")
+                if "_" in text:
+                    # PEP 515 下划线：int("1_0") == 10，Decimal("1_0") == 10 同样接受
+                    # （decimal 列不能豁免——Decimal 并不比 int/float 严格）
+                    raise ValueRangeError(f"取值含下划线（不是合法的报表数字）：{text!r}")
                 if col.kind == "dec":
                     value = decimal.Decimal(text)
                     if not value.is_finite():  # NaN / Infinity 不是合法金额（写库后聚合全废）
@@ -414,6 +434,28 @@ class ParseSpec:
                     content = True
                     if header_pos is None:
                         header_pos, header_len = self.map_header(row, path.name, stats)
+                        if self.skip_indexes:
+                            for index in self.skip_indexes:
+                                if index < len(header_pos) and header_pos[index] < 0:
+                                    col = self.columns[index]
+                                    raise RuntimeError(
+                                        f"{path.name} parse.skip_if_empty 指定的列 {col.header!r}（{col.name}）"
+                                        f"在文件表头中不存在：按「空值跳过」会把所有数据行跳过、整段写入 0 行"
+                                        f"（先删后填的流程下等于清空分区）；请修正列名或从 skip_if_empty 去掉"
+                                    )
+                        continue
+                    if self.footer_enabled and row[0].strip() == "":
+                        # 合计行识别放在列数校验之前：合计行是人写的汇总行，列数常与数据行
+                        # 不一致（`,,1000.00,` 只有几个字段、尾随分隔符又会多出一列），先判
+                        # 列数会把合法文件当"列结构变了"中止。文件首列为空 = 合计行，不入库（否则下游求和翻倍）。
+                        # 用文件第 0 列而不是 header_pos[0]：列名映射不要求配置顺序与文件一致，
+                        # 用后者在"配置列顺序 ≠ 文件列顺序"时会判错列
+                        # （合计行识别不到被当数据行入库，或首个配置列为空的数据行被误丢）
+                        if footer is not None:
+                            raise RuntimeError(
+                                f"{path.name} 出现多行合计行（第 {footer_row_no}、{row_no} 行），格式可能变了"
+                            )
+                        footer, footer_row_no = row, row_no
                         continue
                     if len(row) > header_len:
                         raise RuntimeError(
@@ -426,14 +468,6 @@ class ParseSpec:
                                 f"文件列结构可能变了（确认源文件没问题可改 parse.strict_columns=false 容忍短行）"
                             )
                         row = row + [""] * (header_len - len(row))
-                    if self.footer_enabled and not row[header_pos[0]].strip():
-                        # 首列为空 = 合计行，不入库（否则下游求和翻倍）
-                        if footer is not None:
-                            raise RuntimeError(
-                                f"{path.name} 出现多行合计行（第 {footer_row_no}、{row_no} 行），格式可能变了"
-                            )
-                        footer, footer_row_no = row, row_no
-                        continue
                     values = self.convert_row(row, header_pos, path.name, row_no)
                     # 跳过的行仍计入合计：源文件合计行通常含这些行，只是不写库
                     self._add_footer_sums(sums, values)
@@ -451,6 +485,12 @@ class ParseSpec:
         except csv.Error as exc:
             raise RuntimeError(f"{path.name} 第 {row_no} 行 CSV 解析失败：{exc}；多半是引号未闭合/字段内含未转义的引号")
         if not content:
+            if self.footer_enabled:
+                # 空文件/全空行 + 配置了合计行：原来只警告就返回 0 行，「没有合计行」的
+                # 兜底检查被 content 判断短路——先删后填的流程下等于把分区清空
+                raise RuntimeError(
+                    f"{path.name} 是空文件（没有任何可解析行），但配置了合计行（parse.footer）：文件可能被截断，已中止"
+                )
             log(f"  警告：{path.name} 是空文件（没有任何行）")
             return
         if header_pos is None:  # pragma: no cover - content=True 时不可能走到
@@ -475,17 +515,21 @@ class ParseSpec:
                         )
                     raw = footer[pos].strip() if pos < len(footer) else ""
                     try:
-                        # 与数据行同一套数字口径：千分位必须按 "1,234" 规范写，
-                        # 不能简单 replace(",") —— "1,23"/欧式小数会被静默读成错值
-                        value = decimal.Decimal(strip_thousands(raw)) if raw else decimal.Decimal(0)
+                        # 与数据行同一套"格式"口径：千分位必须按 "1,234" 规范写（不能简单
+                        # replace(",")），非 ASCII/下划线脏值拒收（Decimal 也接受它们）。
+                        # 但不套用列的 decimal(p,s) 范围：合计是派生值，多行之和天然可以
+                        # 超出单列范围（两行 99999999.99 的合法和就超 decimal(10,2)），
+                        # 拦它会把完全合法的文件误判中止
+                        text = strip_thousands(raw)
+                        if not text.isascii() or "_" in text:
+                            raise ValueRangeError(f"取值含非 ASCII 数字或下划线：{text!r}")
+                        value = decimal.Decimal(text) if text else decimal.Decimal(0)
+                        if not value.is_finite():
+                            raise ValueRangeError(f"非有限数 {value}（NaN/Infinity）")
                     except ValueRangeError as exc:
                         raise RuntimeError(f"{path.name} 合计行金额不是合法的数字：{raw!r}（{exc}）")
                     except ArithmeticError:
                         raise RuntimeError(f"{path.name} 合计行金额解析失败，格式可能变了：{footer!r}")
-                    if not value.is_finite():
-                        raise RuntimeError(
-                            f"{path.name} 合计行金额不是有限数（NaN/Infinity），格式可能变了：{footer!r}"
-                        )
                     got.append(value)
                 if got != sums:
                     raise RuntimeError(
@@ -537,7 +581,11 @@ def check_decimal_range(col: Column, value: decimal.Decimal) -> None:
         # 尾部补零（如 decimal(10,2) 下的 "1.500"）数值上精确可表示，不算超限；
         # 只有"去掉多余小数位会改值"的取值才拒绝：value×10^scale 不是整数 ⇔ 会被舍入
         coefficient = int("".join(str(digit) for digit in digits)) if digits else 0
-        if coefficient % 10 ** (frac_digits - col.scale) != 0:
+        shift = frac_digits - col.scale
+        # 先做廉价判断：系数位数不够 shift 位时不可能被 10^shift 整除。不先判位数就直接
+        # 算 10**shift，文件里一个 "1e-1000000000" 就能构造出 4 亿位的大整数（数百 MB 内存
+        # + 秒级 CPU，再过分些直接 MemoryError——那还不是可读的 ValueRangeError）
+        if coefficient and (len(str(coefficient)) <= shift or coefficient % 10**shift != 0):
             raise ValueRangeError(f"小数位 {frac_digits} 位超过 {col.type} 允许的 {col.scale} 位")
     if int_digits > integer_room:
         raise ValueRangeError(f"整数位 {int_digits} 位超过 {col.type} 允许的 {integer_room} 位")

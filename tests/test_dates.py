@@ -64,6 +64,38 @@ class TestEnvBizdate(OfflineTestCase):
         with mock.patch.dict(os.environ, {"SKYNET_BIZDATE": "oops"}, clear=True):
             self.assertIsNone(dates.env_bizdate(strict=False))
 
+    def test_empty_env_is_error_not_unset(self):
+        """变量存在但值为空（export bizdate=$1 且 $1 为空）不能当成"未设置"静默回退处理
+        全部日期：strict 报错；非 strict（只读体检）告警后按未设置继续。"""
+        with mock.patch.dict(os.environ, {"bizdate": ""}, clear=True):
+            with self.assertRaises(SystemExit):
+                dates.env_bizdate()
+            self.assertIsNone(dates.env_bizdate(strict=False))
+        with mock.patch.dict(os.environ, {"SKYNET_BIZDATE": "   "}, clear=True):
+            with self.assertRaises(SystemExit):
+                dates.env_bizdate()
+
+    def test_blank_bizdate_does_not_mask_valid_skynet(self):
+        """bizdate 是空白（空白串在 or 链里是真值）时不能把后面有效的 SKYNET_BIZDATE
+        一起吞掉——按"第一个非空白值"取。"""
+        with mock.patch.dict(os.environ, {"bizdate": "   ", "SKYNET_BIZDATE": "20260920"}, clear=True):
+            self.assertEqual(dates.env_bizdate().isoformat(), "2026-09-20")
+        with mock.patch.dict(os.environ, {"bizdate": "", "SKYNET_BIZDATE": "20260920"}, clear=True):
+            self.assertEqual(dates.env_bizdate().isoformat(), "2026-09-20")
+
+    def test_norm_date_rejects_fullwidth_digits(self):
+        """全角数字不能被"归一化"成全角字符串（字符串比较会把真实日期整段滤掉）：
+        re.ASCII 后按参数错直接报错。"""
+        with self.assertRaises(SystemExit):
+            dates.norm_date("２０２６０９２０", "--bizdate")
+        with self.assertRaises(SystemExit):
+            dates.norm_date("2026０９20", "--start-date")
+
+    def test_fullwidth_digits_are_not_business_days(self):
+        r"""全角数字（中文输入法常见）不是合法业务日：白名单按 ASCII 匹配（Unicode 的 \d 会放行）。"""
+        with self.assertRaises(SystemExit):
+            dates.parse_day_arg("２０２６０９２０")
+
 
 class TestGrace(OfflineTestCase):
     def test_parse(self):
@@ -92,6 +124,14 @@ class TestExpectedLatest(OfflineTestCase):
         now = datetime(2026, 9, 24, 3, 0, tzinfo=timezone.utc)
         self.assertEqual(dates.expected_latest(tz, "02:30", now=now), "20260923")
 
+    def test_naive_now_is_interpreted_in_given_tz_not_host_tz(self):
+        """朴素 datetime 不能走 astimezone()（那会按**本机时区**解释，换台机器结果就变）。"""
+        tz = dates.load_zone("UTC")
+        naive = datetime(2026, 9, 24, 3, 0)  # 无 tzinfo：应按 UTC 解释 → 3:00 ≥ 02:30 → 23 日
+        self.assertEqual(dates.expected_latest(tz, "02:30", now=naive), "20260923")
+        naive_early = datetime(2026, 9, 24, 1, 0)  # 1:00 < 02:30 → 再退一天
+        self.assertEqual(dates.expected_latest(tz, "02:30", now=naive_early), "20260922")
+
 
 class TestFindMissing(OfflineTestCase):
     def test_internal_gap(self):
@@ -100,6 +140,13 @@ class TestFindMissing(OfflineTestCase):
 
     def test_tail_missing(self):
         self.assertEqual(dates.find_missing(["20260901"], "20260901", "20260903"), ["20260902", "20260903"])
+
+    def test_malformed_range_is_config_error(self):
+        """区间写错给配置错，不是裸 ValueError（库调用方可能绕过 CLI 校验）。"""
+        for start, end in (("2026-09-01", "20260903"), ("20260901", "20260903x")):
+            with self.assertRaises(SystemExit) as err:
+                dates.find_missing(["20260901"], start, end)
+            self.assertIn("yyyyMMdd", str(err.exception))
 
 
 class TestPlanDates(OfflineTestCase):

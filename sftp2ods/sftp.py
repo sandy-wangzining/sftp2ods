@@ -141,7 +141,15 @@ class SftpSource:
         self.cfg = dict(cfg or {})
         auth = self.cfg.get("auth") or {}
         self.host = str(self.cfg.get("host") or "")
-        self.port = int(self.cfg.get("port") or 22)
+        # 端口校验给配置错：'abc' 这类非法值原来抛裸 ValueError；显式 0 也按未填处理
+        # （0 不是合法端口，但 `or 22` 会把 0 当成"没填"——两种口径统一成"缺省 22/非法报错"）
+        raw_port = self.cfg.get("port")
+        try:
+            self.port = int(raw_port) if raw_port else 22
+        except (TypeError, ValueError):
+            raise ConfigError(f"sftp.port 必须是整数，实际 {raw_port!r}") from None
+        if not 1 <= self.port <= 65535:
+            raise ConfigError(f"sftp.port 应在 1~65535 之间，实际 {self.port}")
         self.username = str(self.cfg.get("username") or "")
         self.auth_type = str(auth.get("type") or "password").lower()
         self.password = str(auth.get("password") or "")
@@ -152,7 +160,9 @@ class SftpSource:
         self.retry_times = _cfg_or_default(self.cfg, "retry_times", 3, int)
         self.retry_delay = _cfg_or_default(self.cfg, "retry_delay", 10, float)
         source = source_cfg or self.cfg.get("_source") or {}
-        self.layout = str(source.get("layout") or "flat")
+        # 取值统一小写：validate_job / normalize_job 都按小写口径校验，"DATE_DIR" 这类
+        # 写法若按字面量比较会被当成 flat（列目录结果为空），与校验口径不一致
+        self.layout = str(source.get("layout") or "flat").strip().lower()
         root_raw = str(source.get("root") or "").strip()
         self.root = "/" if root_raw == "/" else root_raw.rstrip("/")
         self.download_dir = Path(source.get("download_dir") or ".")
@@ -285,12 +295,12 @@ class SftpSource:
             finally:
                 try:
                     sftp.close()
-                except Exception:  # noqa: BLE001 - 清理失败不掩盖业务结果
-                    pass
+                except Exception as exc:  # noqa: BLE001 - 清理失败不掩盖业务结果，但留一条线索
+                    log(f"  警告：关闭 SFTP 会话失败（{type(exc).__name__}: {exc}）")
                 try:
                     ssh.close()
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001 - 同上：会话泄漏/协议错误要能被察觉
+                    log(f"  警告：关闭 SSH 连接失败（{type(exc).__name__}: {exc}）")
 
         return retry_call(
             _do,
@@ -311,7 +321,9 @@ class SftpSource:
         与两个结算脚本口径一致：空目录是异常，但不是连接错误。
         """
         raw = self._run("列远端文件", self._scan)
-        return {date: sorted(files, key=lambda item: item.name) for date, files in raw.items()}
+        # 按日期升序返回（docstring 承诺的顺序）：_scan 的插入顺序是 READDIR 顺序，
+        # 不能直接透传（下游 max()/遍历的可读性与稳定性）
+        return {date: sorted(files, key=lambda item: item.name) for date, files in sorted(raw.items())}
 
     def _entry_size(self, sftp, entry, remote_path: str) -> int | None:
         """条目大小：软链在 READDIR 里的 st_size 是链接自身（= 目标路径字符串长度），
@@ -346,7 +358,17 @@ class SftpSource:
         if self.layout == "date_dir":
             for entry in entries:
                 if not stat.S_ISDIR(entry.st_mode or 0):
-                    continue
+                    # 指向目录的软链（st_mode 是 S_IFLNK）要跟随判断：flat 布局显式支持
+                    # 软链，date_dir 下若直接跳过，整个业务日期会从结果里静默消失
+                    if not stat.S_ISLNK(entry.st_mode or 0):
+                        continue
+                    try:
+                        followed = sftp.stat(self._join_root(entry.filename))
+                    except Exception as exc:  # noqa: BLE001 - 跟随失败按非目录处理，但要留痕
+                        log(f"  警告：软链日期目录 {entry.filename} 跟随失败（{exc}），已跳过")
+                        continue
+                    if not stat.S_ISDIR(followed.st_mode or 0):
+                        continue
                 match = self.dir_re.fullmatch(entry.filename) if self.dir_re else None
                 if not match:
                     continue

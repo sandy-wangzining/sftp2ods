@@ -36,11 +36,34 @@ SAMPLE_CHOICES = (
 SAMPLE_IDS = ("1", "2", "3")
 
 
+def _ask_bool(ask, echo, prompt: str, default: bool = True, retries: int = 3) -> bool:
+    """y/n 问答：只在认出肯定/否定时返回，其它回答提示后重问。
+
+    原来用 startswith("y") 判定：答"是/有/1"这类肯定说法会被静默当成"否"
+    （合计行开关、缺文件核对被悄悄关掉），既不重问也不提示。
+    """
+    for _ in range(retries):
+        answer = _ask(ask, f"{prompt}？(y/n)", "y" if default else "n").strip().lower()
+        if answer in ("y", "yes", "1", "是", "有", "true"):
+            return True
+        if answer in ("n", "no", "0", "否", "没有", "false"):
+            return False
+        echo(f"   无法识别 {answer!r}：请输入 y 或 n")
+    echo(f"   连续 {retries} 次无法识别，按默认（{'y' if default else 'n'}）处理")
+    return default
+
+
 def _ask(ask, prompt: str, default: str = "") -> str:
     """问一个问题；空输入用默认值。"""
     hint = f"（默认 {default}）" if default else ""
     answer = str(ask(f"{prompt}{hint}：") or "").strip()
     return answer or default
+
+
+def _ask_secret(ask, prompt: str) -> str:
+    """密钥类输入：只去掉尾部换行，不做 strip——首尾空白可能是凭据本身的一部分，
+    getpass 不回显，被改写了用户当场察觉不到（与 api2ods 同款）。"""
+    return str(ask(prompt) or "").rstrip("\r\n")
 
 
 def _default_ask_secret(prompt: str = "") -> str:
@@ -54,7 +77,11 @@ def _default_ask_secret(prompt: str = "") -> str:
     except Exception:  # noqa: BLE001 - 没有 tty 等场景退回普通输入
         # 退回 input() 时输入会明文回显，而向导提示语里写着"输入不回显"——必须显式纠正预期
         print("（警告：当前环境无法隐藏输入，接下来输入的密钥会明文回显）", file=sys.stderr)
-        return input(prompt)
+        try:
+            return input(prompt)
+        except (EOFError, ValueError, RuntimeError) as exc:
+            # stdin 关闭/无输入源：统一翻译成 EOFError（= 取消），与 cli 的输入口径一致
+            raise EOFError("标准输入不可用") from exc
 
 
 def _ask_choice(ask, prompt: str, choices: tuple, default: str = "0", echo=print) -> str:
@@ -65,7 +92,7 @@ def _ask_choice(ask, prompt: str, choices: tuple, default: str = "0", echo=print
     return _ask(ask, "请选择编号", default)
 
 
-def _ask_int(ask, prompt: str, default: int, echo=print, minimum: int | None = None) -> int:
+def _ask_int(ask, prompt: str, default: int, echo=print, minimum: int | None = None, maximum: int | None = None) -> int:
     """问一个整数；回车用默认值，填了非数字/越界值就提示后重问。"""
     for _ in range(3):
         answer = str(_ask(ask, prompt, str(default))).strip()
@@ -76,6 +103,9 @@ def _ask_int(ask, prompt: str, default: int, echo=print, minimum: int | None = N
             continue
         if minimum is not None and value < minimum:
             echo(f"   {value} 必须不小于 {minimum}，请重新填写（如 {default}）")
+            continue
+        if maximum is not None and value > maximum:
+            echo(f"   {value} 不能大于 {maximum}，请重新填写（如 {default}）")
             continue
         return value
     echo(f"   连续三次没填对，先按默认值 {default} 写进配置（之后可以在文件里改）。")
@@ -136,7 +166,9 @@ def _match_columns(headers: list[str], raw: str, echo=print, names=None) -> set[
         token = token.strip()
         if not token:
             continue
-        if token.isdigit():
+        if token.isascii() and token.isdigit():
+            # isdigit() 单独不够：上标数字（"²"）也过 isdigit 但 int() 抛 ValueError，
+            # 而那个异常不在向导的兜底里，会直接 traceback 退出
             index = int(token) - 1
             if 0 <= index < len(headers):
                 result.add(index)
@@ -161,11 +193,15 @@ def _read_local_sample(ask, echo) -> list[str] | None:
         if not path_text:
             echo("   路径不能为空。")
             continue
-        path = Path(path_text).expanduser()
         try:
+            # expanduser 也要在 try 内：解析不了 ~user（本地无该用户 / HOME 未设置）时
+            # 抛 RuntimeError("Could not determine home directory.")，在外面会冒到向导
+            # 顶层被当真实缺陷重抛；读不存在的文件/无权限是 OSError，编码不对是
+            # UnicodeDecodeError——都要走"提示后重试"，不能让整个向导直接终止
+            # （与远端样本路径同口径）
+            path = Path(path_text).expanduser()
             headers = parse_mod.read_header(path)
-        except (ConfigError, OSError) as exc:
-            # 读不存在的文件/无权限是 OSError：也要走"提示后重试"，不能让整个向导直接终止
+        except (ConfigError, OSError, UnicodeDecodeError, RuntimeError) as exc:
             echo(f"   读取失败：{exc}")
             continue
         if headers:
@@ -174,7 +210,7 @@ def _read_local_sample(ask, echo) -> list[str] | None:
 
 
 def _read_remote_sample(ask, echo, sftp_cfg: dict, source_cfg: dict) -> list[str] | None:
-    """连 SFTP 拉一个最新文件、读表头；连接/下载失败给提示并返回 None。"""
+    """连 SFTP 取一个当日文件读表头（同一天多个文件时按名称取第一个）；连接/下载失败给提示并返回 None。"""
     workdir = Path(tempfile.mkdtemp(prefix="sftp2ods-init-"))
     try:
         try:
@@ -191,15 +227,23 @@ def _read_remote_sample(ask, echo, sftp_cfg: dict, source_cfg: dict) -> list[str
             return None
         date = max(files_by_date)
         item = sorted(files_by_date[date], key=lambda it: it.name)[0]
-        echo(f"   最新文件：{date}/{item.name}（{item.size_text}），下载中 ...")
+        echo(f"   取样文件：{date}/{item.name}（{item.size_text}；同一天多个文件时按名称取第一个），下载中 ...")
         try:
             # 与主下载路径同一把锁：落地路径必须落在 base（向导的临时 workdir）之内，
             # 免得"包含性校验"在这里成了例外（远端是 POSIX，名字带 ":" 合法，不能靠禁冒号）。
             local = source.download(item, local_path_within(workdir, item.name, item.name))
-        except Exception as exc:  # noqa: BLE001
+        except (ConfigError, OSError, RuntimeError) as exc:
+            # 与上面的连接块同口径：TypeError/AttributeError 等代码缺陷继续上抛，
+            # 不能被"下载失败"掩盖成"换个样本来源"的提示
             echo(f"   下载失败：{exc}")
             return None
-        return parse_mod.read_header(local)
+        try:
+            return parse_mod.read_header(local)
+        except (ConfigError, OSError, UnicodeDecodeError) as exc:
+            # 与本地样本路径（_read_local_sample）同口径：坏样本给提示后返回 None，
+            # 让 _collect_sample_headers 的三次重选机制生效，而不是终止整个向导
+            echo(f"   读取表头失败：{exc}")
+            return None
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -251,7 +295,7 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         if not host:
             echo("❌ 主机名连续三次为空，已取消。")
             return 1
-        port = _ask_int(ask, "   端口", 22, echo, minimum=1)
+        port = _ask_int(ask, "   端口", 22, echo, minimum=1, maximum=65535)
         username = _ask_nonempty(ask, echo, "   登录名")
         if not username:
             echo("❌ 登录名连续三次为空，已取消。")
@@ -260,14 +304,14 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         auth: dict = {}
         if auth_choice == "2":
             key_file = _ask(ask, "   私钥文件路径", "~/.ssh/id_rsa")
-            passphrase = _ask(ask_secret, "   私钥口令（没有就留空，输入不回显）")
+            passphrase = _ask_secret(ask_secret, "   私钥口令（没有就留空，输入不回显）")
             auth = {"type": "key", "key_file": key_file}
             if passphrase:
                 auth["passphrase"] = passphrase
         else:
             if auth_choice != "1":
                 echo(f"   编号 {auth_choice} 不是有效选项，按「密码」继续。")
-            password = _ask(ask_secret, "   密码（输入不回显）")
+            password = _ask_secret(ask_secret, "   密码（输入不回显）")
             auth = {"type": "password", "password": password}
         sftp_cfg = {"host": host, "port": port, "username": username, "auth": auth}
 
@@ -320,7 +364,7 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
 
         # ---------------------------------------------------------- ⑤ 行级规则
         echo("")
-        footer_value = _ask(ask, "⑦ 文件末尾有没有合计行（首列为空）？(y/n)", "n").lower().startswith("y")
+        footer_value = _ask_bool(ask, echo, "⑦ 文件末尾有没有合计行（首列为空）", default=False)
         skip_field = ""
         if headers:
             skip_raw = _ask(ask, "   有没有「关键字段为空就跳过」的行？（填列名如 order_id，没有留空）")
@@ -331,15 +375,19 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         parse_cfg: dict = {"encoding": "utf-8-sig", "delimiter": "auto", "columns": columns}
         if footer_value:
             sum_names = [col["name"] for col in columns if str(col.get("type", "")).startswith("decimal")]
-            parse_cfg["footer"] = {"sum": sum_names}
             if sum_names:
+                parse_cfg["footer"] = {"sum": sum_names}
                 echo(f"   合计行会按 {len(sum_names)} 个金额列核对“合计 = 数据行之和”（对不上直接报错）。")
+            else:
+                # 写 {"sum": []} 与"没配 footer"等价（运行时按空列表跳过核对）：留着会让用户
+                # 以为配了合计核对，不如明说没启用
+                echo("   提示：当前没有金额（decimal）列，合计行核对未启用。")
         if skip_field:
             parse_cfg["skip_if_empty"] = [skip_field]
 
         # ---------------------------------------------------------- ⑥ 缺文件核对
         echo("")
-        check_missing = _ask(ask, "⑧ 要做缺文件核对吗（每天必须有一个文件）？(y/n)", "y").lower().startswith("y")
+        check_missing = _ask_bool(ask, echo, "⑧ 要做缺文件核对吗（每天必须有一个文件）", default=True)
         missing_cfg: dict = {"check": check_missing}
         if check_missing:
             timezone_name = _ask(ask, "   按哪个时区的昨天核对最新文件？", DEFAULT_TZ)
@@ -352,11 +400,12 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         echo("")
         echo("=== 告警与 MaxCompute 目标 ===")
         # webhook 是凭证（拿到就能往群里发消息），按密钥类处理、不回显
-        webhook = _ask(ask_secret, "⑨ 飞书告警 webhook（可留空，输入不回显）")
+        webhook = _ask_secret(ask_secret, "⑨ 飞书告警 webhook（可留空，输入不回显）")
         project = _ask(ask, "⑩ MaxCompute 项目名", "my_project")
-        table = _ask(ask, "   目标表名（建议 <层级>_<业务域>_<过程>_di）", f"ods_{job_name}_di")
+        # 作业名允许连字符（用于文件名），但 MaxCompute 表名不允许：默认表名先把连字符换成下划线
+        table = _ask(ask, "   目标表名（建议 <层级>_<业务域>_<过程>_di）", f"ods_{job_name.replace('-', '_')}_di")
         ak = _ask(ask, "   阿里云 AccessKeyId")
-        sk = _ask(ask_secret, "   阿里云 AccessKeySecret（输入不回显）")
+        sk = _ask_secret(ask_secret, "   阿里云 AccessKeySecret（输入不回显）")
         endpoint = _ask(ask, "   endpoint", DEFAULT_ENDPOINT)
 
         # ---------------------------------------------------------- ⑧ 组装并写出
@@ -383,26 +432,67 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
             )
         try:
             target_path.parent.mkdir(parents=True, exist_ok=True)
-            # 文件含 SFTP 密码/AK-SK/webhook 明文：先按 0600 创建再写入（write_text 会先按
-            # 默认 umask（通常 0644）创建，再 chmod 之间存在同机其他用户可读的窗口期）
-            fd = os.open(target_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(json.dumps(job, ensure_ascii=False, indent=2) + "\n")
+            # 文件含 SFTP 密码/AK-SK/webhook 明文：写同目录临时文件（mkstemp，默认 0600）
+            # 再 rename 顶替。原来 O_TRUNC 直接覆盖目标：打开瞬间旧配置就没了，写入
+            # 失败/被 kill 时磁盘上只剩 0 字节或半截 JSON，重跑还得靠人救。
+            # 已存在的旧文件先把权限收紧（符号链接跳过：chmod 会跟随链接改到真实文件上）
+            if os.name != "nt" and target_path.exists() and not target_path.is_symlink():
+                try:
+                    os.chmod(target_path, 0o600)
+                except OSError:
+                    pass
+            fd, tmp_name = tempfile.mkstemp(prefix=f".{target_path.name}.", suffix=".tmp", dir=str(target_path.parent))
+            tmp_path = Path(tmp_name)
+            try:
+                try:
+                    handle = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+                except Exception:
+                    try:
+                        os.close(fd)  # fdopen 失败时 fd 还没被接管：显式关闭，否则泄漏到进程退出
+                    except OSError:
+                        pass
+                    raise
+                with handle:
+                    handle.write(json.dumps(job, ensure_ascii=False, indent=2) + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp_path, target_path)
+            except BaseException:
+                # 含 BaseException（Ctrl+C/SystemExit）：临时文件里是含密钥的完整配置，
+                # 中断也必须清掉，否则会在 jobs/ 里残留且向导声称"未生成任何文件"
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+                raise
             if os.name != "nt":
-                os.chmod(target_path, 0o600)  # 已存在文件的旧权限一并收紧（Windows 忽略）
+                # 兜底收紧（mkstemp 本就是 0600）。失败只警告：os.replace 已经完成，
+                # 让 chmod 的 OSError 落到下面的 except 会报"写文件失败（原文件未改动）"——
+                # 与磁盘状态完全相反（新配置已落盘）
+                try:
+                    os.chmod(target_path, 0o600)
+                except OSError as exc:
+                    echo(f"   ⚠️ 权限收紧失败（{exc}）：文件已生成，请手工 chmod 600 {target_path}")
         except OSError as exc:
-            # 只有"写文件"这一段失败才叫写文件失败（读取类 OSError 在各自的交互里已处理）
+            # 只有"写文件"这一段失败才叫写文件失败（读取类 OSError 在各自的交互里已处理）；
+            # 旧配置此时原样未动
             echo("")
-            echo(f"写文件失败：{exc}")
+            echo(f"写文件失败（原文件未改动）：{exc}")
             return 1
 
-        echo("")
-        echo(f"✅ 已生成：{target_path}")
-        echo("下一步：")
-        echo("  1) 打开文件核对（尤其 sftp.auth、source.file_regex、parse.columns 的列头与类型）")
-        echo(f"  2) 体检：  sftp2ods --job {target_path.name} --check")
-        echo(f"  3) 试跑：  sftp2ods --job {target_path.name} --bizdate 20260920 --dry-run")
-        echo(f"  4) 正式：  sftp2ods --job {target_path.name} --bizdate ${{bizdate}}")
+        try:
+            echo("")
+            echo(f"✅ 已生成：{target_path}")
+            echo("下一步：")
+            echo("  1) 打开文件核对（尤其 sftp.auth、source.file_regex、parse.columns 的列头与类型）")
+            echo(f"  2) 体检：  sftp2ods --job {target_path.name} --check")
+            echo(f"  3) 试跑：  sftp2ods --job {target_path.name} --bizdate 20260920 --dry-run")
+            echo(f"  4) 正式：  sftp2ods --job {target_path.name} --bizdate ${{bizdate}}")
+        except KeyboardInterrupt:
+            # 文件已在 os.replace 时写全：中断只打断收尾提示，不能返回 130 让调用方
+            # 以为失败、更不能再报"未生成任何文件"（含密钥的文件其实已在磁盘上）
+            echo("")
+            echo(f"✅ 已生成：{target_path}（Ctrl+C 落在收尾阶段，文件已写全）")
         return 0
     except ConfigError as exc:
         echo("")
@@ -413,8 +503,10 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         echo("")
         echo(f"文件操作失败：{exc}")
         return 1
-    except (EOFError, ValueError):
-        # stdin 被关闭（`sftp2ods --init <&-`、CI 里没接管道）时 input() 抛的是 ValueError / RuntimeError
+    except EOFError:
+        # stdin 关闭/无输入源（`sftp2ods --init <&-`、CI 里没接管道）：cli 的输入包装层
+        # 把 ValueError/RuntimeError 一并翻译成 EOFError 才走到这里。这里**只**认 EOFError——
+        # 以前连 ValueError 一起吞，向导内部真正的 ValueError 会被误报成"已取消"
         echo("")
         echo("已取消，未生成任何文件。")
         return 1

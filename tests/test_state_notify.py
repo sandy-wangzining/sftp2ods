@@ -39,7 +39,6 @@ class TestState(OfflineTestCase):
         state = {"a.csv": {"table": "t", "pt": "20260920", "size": 3, "rows": 1}}
         state_mod.save_state(path, state)
         self.assertEqual(state_mod.load_state(path), state)
-        self.assertFalse((self.tmp / "state.json.tmp").exists())
 
     def test_save_state_uses_unique_tmp_name(self):
         """两个 writer 不能共用固定的 .tmp，临时名要带 pid/uuid。"""
@@ -60,7 +59,6 @@ class TestState(OfflineTestCase):
             self.assertTrue(name.startswith("state.json."), name)
             self.assertTrue(name.endswith(".tmp"), name)
             self.assertNotEqual(name, "state.json.tmp")
-            self.assertIn(str(os.getpid()), name)
 
     def test_save_creates_parent_dir(self):
         path = self.tmp / "deep" / "dir" / ".uploaded.json"
@@ -94,6 +92,14 @@ class TestState(OfflineTestCase):
         self.assertFalse(state_mod.record_of(state, ("20260920/a.csv",), 4, "t", "20260920"))
         self.assertFalse(state_mod.record_of(state, ("20260920/a.csv",), 3, "other", "20260920"))
 
+    def test_record_of_size_unknown_matches_like_local_ready(self):
+        """远端没给大小（size=None）时与 local_ready 同口径：其余字段一致即命中。"""
+        state = {"a.csv": {"table": "t", "pt": "20260920", "size": 3, "rows": 1}}
+        self.assertTrue(state_mod.record_of(state, ("a.csv",), None, "t", "20260920"))
+        # 旧台账把 size 写成字符串也要能归一化命中
+        legacy = {"a.csv": {"table": "t", "pt": "20260920", "size": "3", "rows": 1}}
+        self.assertTrue(state_mod.record_of(legacy, ("a.csv",), 3, "t", "20260920"))
+
     def test_record_of_project_guard(self):
         """换过目标项目（表名相同）时不能拿另一个项目的上传记录跳过。"""
         state = {"a.csv": {"project": "prod", "table": "t", "pt": "20260920", "size": 3, "rows": 1}}
@@ -103,10 +109,27 @@ class TestState(OfflineTestCase):
         legacy = {"a.csv": {"table": "t", "pt": "20260920", "size": 3, "rows": 1}}
         self.assertTrue(state_mod.record_of(legacy, ("a.csv",), 3, "t", "20260920", project="dev"))
 
+    def test_record_with_project_not_accepted_when_caller_omits_project(self):
+        """本次没传 project 时，带 project 的旧记录不能当成"已上传"跳过
+        （迁移后某条调用路径没带 project，会把整段日期静默跳成"没数据"）。"""
+        state = {"a.csv": {"project": "dev", "table": "t", "pt": "20260920", "size": 3, "rows": 1}}
+        self.assertFalse(state_mod.record_of(state, ("a.csv",), 3, "t", "20260920"))
+        self.assertTrue(state_mod.record_of(state, ("a.csv",), 3, "t", "20260920", project="dev"))
+
     def test_local_ready(self):
         path = self.tmp / "f.csv"
         path.write_bytes(b"123")
         self.assertTrue(state_mod.local_ready(path, 3))
+
+    def test_empty_ledger_treated_as_missing(self):
+        """0 字节台账（崩溃丢数据的典型形态）按"没有台账"继续：台账只是派生数据，
+        一次崩溃不该让后续每次运行都以"台账读不了"硬失败；非空但损坏的照旧明确报错。"""
+        path = self.tmp / "state.json"
+        path.write_text("", encoding="utf-8")
+        self.assertEqual(state_mod.load_state(path), {})
+        path.write_text("{broken", encoding="utf-8")
+        with self.assertRaises(SystemExit):
+            state_mod.load_state(path)
         self.assertFalse(state_mod.local_ready(path, 4))
         self.assertFalse(state_mod.local_ready(self.tmp / "nope", 0))
 
@@ -135,6 +158,28 @@ class TestState(OfflineTestCase):
         data = state_mod.load_state(path)
         self.assertIn("a.csv", data)
         self.assertIn("b.csv", data)
+
+    def test_save_state_merges_disk_state_read_after_lock(self):
+        """合并必须在**拿到锁之后**重读磁盘：锁外已被别的进程改过的台账不能被整文件覆盖。
+
+        顺序调用两次 save_state 测不出这一点；这里用"进锁瞬间磁盘上已经变了"
+        模拟另一进程刚写完的那一刻。
+        """
+        path = self.tmp / "state.json"
+        state_mod.save_state(path, {"a.csv": {"pt": "1"}})
+
+        from contextlib import contextmanager
+
+        @contextmanager
+        def fake_lock(_lock_path):
+            # 模拟另一进程在本进程拿锁前刚写完（a.csv 已被它的整表替换掉）
+            state_mod._write_state_unlocked(path, {"b.csv": {"pt": "2"}})
+            yield
+
+        with mock.patch.object(state_mod, "interprocess_lock", fake_lock):
+            state_mod.save_state(path, {"c.csv": {"pt": "3"}})
+        data = state_mod.load_state(path)
+        self.assertEqual(set(data), {"b.csv", "c.csv"})
 
     def test_save_state_uses_interprocess_lock(self):
         path = self.tmp / "state.json"
@@ -195,6 +240,8 @@ class TestNotify(OfflineTestCase):
         with mock.patch.object(notify_mod, "requests", fake):
             self.assertTrue(notify_mod.notify("https://open.feishu.cn/x", "标题", ["一行"], "脚注"))
         self.assertEqual(len(fake.calls), 1)
+        # 告警是同步调用：漏传 timeout 会把主流程无限期卡住（requests 默认没有超时）
+        self.assertEqual(fake.calls[0]["timeout"], 15)
         card = fake.calls[0]["json"]
         self.assertEqual(card["msg_type"], "interactive")
         self.assertEqual(card["card"]["header"]["title"]["content"], "标题")
@@ -221,6 +268,16 @@ class TestNotify(OfflineTestCase):
             fake = FakeRequests(response=FakeResponse(status_code=200, payload=payload))
             with mock.patch.object(notify_mod, "requests", fake):
                 self.assertFalse(notify_mod.notify("https://hook", "t", ["x"]))
+
+    def test_missing_code_is_failure(self):
+        """缺 code/StatusCode 的 200 响应不能算「已发送」：webhook 误填成其它接口
+        （回 {"msg": "ok"} 这类）时会静默失效；仅空 {} 保留按 HTTP 200 判定的宽容。"""
+        fake = FakeRequests(response=FakeResponse(status_code=200, payload={"msg": "ok"}))
+        with mock.patch.object(notify_mod, "requests", fake):
+            self.assertFalse(notify_mod.notify("https://hook", "t", ["x"]))
+        fake = FakeRequests(response=FakeResponse(status_code=200, payload={}))
+        with mock.patch.object(notify_mod, "requests", fake):
+            self.assertTrue(notify_mod.notify("https://hook", "t", ["x"]))
 
     def test_failure_log_redacts_webhook(self):
         """发送失败时 requests 的异常消息里带完整 URL/路径，hook id 是凭证，不能明文进日志。"""

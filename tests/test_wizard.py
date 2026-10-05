@@ -135,6 +135,23 @@ class TestWizardHappyPath(WizardTestCase):
         self.assertEqual(job["target"]["table"], "ods_demo_di")
         self.assertEqual(job["maxcompute"]["project"], "my_project")
 
+    def test_footer_without_amount_column_is_not_written(self):
+        """选了合计行核对但没有金额（decimal）列：不写空 footer、只提示未启用
+        （空列表与"没配"等价，留着会让用户以为配了核对）。"""
+        tail = []
+        for question, answer in self.common_tail():
+            if question == "金额":
+                answer = ""  # 没有金额列
+            elif question == "整数":
+                answer = "2"  # 第 2 列按整数处理
+            elif question == "合计行":
+                answer = "y"  # 仍选择做合计核对
+            tail.append((question, answer))
+        rc, _ = self.run_wizard(self.base_script() + tail)
+        self.assertEqual(rc, 0)
+        raw = json.loads(self.out_path.read_text(encoding="utf-8"))
+        self.assertNotIn("footer", raw["parse"])
+
     def test_no_sample_placeholder(self):
         script = self.base_script(sample_choice="3")
         # 占位表头名 + 没有 skip 问题，直接接尾部规则
@@ -260,7 +277,8 @@ class TestWizardSampleErrors(WizardTestCase):
         """读本地样本失败（不存在/无权限等 OSError）要提示后重试，不能直接终止向导。"""
         asks = iter([str(self.tmp / "no_such_file.csv"), str(self.csv_path)])
         echoes: list = []
-        headers = init_wizard._read_local_sample(lambda p="": next(asks), echoes.append)
+        # next(asks, "")：问答次数一旦增加会得到明确的"读取失败"而非裸 StopIteration
+        headers = init_wizard._read_local_sample(lambda p="": next(asks, ""), echoes.append)
         self.assertEqual(headers, ["Order ID", "Settlement amount", "Created time"])
         self.assertTrue(any("读取失败" in str(line) for line in echoes), echoes)
 
@@ -270,6 +288,36 @@ class TestWizardSampleErrors(WizardTestCase):
         with mock.patch.object(sftp_mod.SftpSource, "__init__", side_effect=TypeError("bug")):
             with self.assertRaises(TypeError):
                 init_wizard._read_remote_sample(lambda p="": p, lambda *_a, **_k: None, {}, {})
+
+    def test_remote_sample_bad_header_returns_none_like_local(self):
+        """远端样本读表头失败（编码/格式异常）与本地样本同口径：提示后返回 None，
+        让 _collect_sample_headers 的三次重选机制生效，而不是把整个向导打挂。"""
+        fake = FakeSftp()
+        add_file(fake, "/statements/report_20260920.csv", csv_bytes(["Order ID"], [["o1"]]))
+        sftp_cfg = {"host": "h", "port": 22, "username": "u", "auth": {"type": "password", "password": "p"}}
+        source_cfg = {"root": "/statements", "layout": "flat", "file_regex": "report_(?P<date>\\d{8})\\.csv"}
+        echoes: list = []
+        with (
+            mock.patch.object(sftp_mod.SftpSource, "_connect", connect_to(fake)),
+            mock.patch.object(
+                init_wizard.parse_mod, "read_header", side_effect=config.ConfigError("不是 utf-8-sig 编码")
+            ),
+        ):
+            got = init_wizard._read_remote_sample(lambda p="": p, echoes.append, sftp_cfg, source_cfg)
+        self.assertIsNone(got)
+        self.assertTrue(any("读取表头失败" in str(line) for line in echoes), echoes)
+
+    def test_unexpected_value_error_is_not_reported_as_cancel(self):
+        """向导内部的 ValueError 不能被顶层当成"用户取消"（那会把真实错误吞成"已取消"）。"""
+
+        class BoomAsk:
+            def __call__(self, prompt=""):
+                raise ValueError("内部解析出错")
+
+        with self.assertRaises(ValueError):
+            init_wizard.run_init(
+                out_path=str(self.out_path), ask=BoomAsk(), ask_secret=BoomAsk(), echo=lambda *_a, **_k: None
+            )
 
     def test_write_failure_returns_1_with_clean_message(self):
         """写文件失败（磁盘满/权限）按退出码 1 汇报，不是裸 traceback。"""
@@ -281,6 +329,89 @@ class TestWizardSampleErrors(WizardTestCase):
             )
         self.assertEqual(rc, 1)
         self.assertFalse(self.out_path.exists())
+
+    def test_unknown_yn_answer_is_reasked(self):
+        """y/n 问答答"随便"这类无法识别的说法不能静默当成"否"：提示后重问；
+        常见中文肯定（是/有/1）按是处理。"""
+        echoes: list = []
+        asks = iter(["随便", "y"])
+        got = init_wizard._ask_bool(lambda p="": next(asks, ""), echoes.append, "测试项", default=False)
+        self.assertTrue(got)
+        self.assertTrue(any("无法识别" in str(line) for line in echoes), echoes)
+        self.assertTrue(init_wizard._ask_bool(lambda p="": "有", echoes.append, "测试项", default=False))
+        self.assertFalse(init_wizard._ask_bool(lambda p="": "n", echoes.append, "测试项", default=True))
+
+    def test_secret_answers_not_stripped(self):
+        """密钥类输入只去尾部换行：首尾空白可能是凭据的一部分（与 api2ods 同款）。"""
+        self.assertEqual(init_wizard._ask_secret(lambda prompt="": " pw123 \n", "密码"), " pw123 ")
+        self.assertEqual(init_wizard._ask_secret(lambda prompt="": "tok ", "Token"), "tok ")
+
+    def test_local_sample_expanduser_error_retries(self):
+        """~user 解析不了（本地无该用户 / HOME 未设置）时 expanduser 抛 RuntimeError：
+        提示后重试，不能以裸 traceback 终止整个向导。"""
+        echoes: list = []
+        real_expand = Path.expanduser
+        calls = {"n": 0}
+
+        def flaky_expanduser(self):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("Could not determine home directory.")
+            return real_expand(self)
+
+        asks = iter(["~notexist/sample.csv", str(self.csv_path)])
+        with mock.patch.object(Path, "expanduser", flaky_expanduser):
+            headers = init_wizard._read_local_sample(lambda p="": next(asks, ""), echoes.append)
+        self.assertEqual(headers, ["Order ID", "Settlement amount", "Created time"])
+        self.assertTrue(any("读取失败" in str(line) for line in echoes), echoes)
+
+    def test_chmod_failure_after_write_still_reports_success(self):
+        """os.replace 已完成、收尾 chmod 失败（只读挂载等）不能报"写文件失败（原文件未改动）"：
+        新配置已在磁盘上，如实报成功 + 警告手工 chmod。"""
+        script = self.base_script() + self.common_tail()
+        asks = ScriptedAsk(script)
+        echoes: list = []
+        # os.name 按 posix 走：chmod 收紧分支在 Windows 上本来就不执行
+        fake_os = mock.Mock(wraps=init_wizard.os)
+        fake_os.name = "posix"
+        fake_os.chmod.side_effect = OSError("read-only fs")
+        with mock.patch.object(init_wizard, "os", fake_os):
+            rc = init_wizard.run_init(
+                out_path=str(self.out_path),
+                ask=asks,
+                ask_secret=asks,
+                echo=lambda *a: echoes.append(" ".join(str(x) for x in a)),
+            )
+        self.assertEqual(rc, 0)
+        self.assertTrue(self.out_path.is_file())
+        self.assertTrue(any("权限收紧失败" in line for line in echoes), echoes)
+
+    def test_keyboard_interrupt_cleans_tmp_file(self):
+        """Ctrl+C 落在写盘途中（fsync）：含明文密钥的临时文件必须清掉，
+        向导的"未生成任何文件"才属实（清理原来只接 Exception，中断会留下 .tmp）。"""
+        script = self.base_script() + self.common_tail()
+        asks = ScriptedAsk(script)
+        with mock.patch.object(init_wizard.os, "fsync", side_effect=KeyboardInterrupt):
+            rc = init_wizard.run_init(
+                out_path=str(self.out_path), ask=asks, ask_secret=asks, echo=lambda *_a, **_k: None
+            )
+        self.assertEqual(rc, 130)  # Ctrl+C 一律 130（与问答阶段的中断同一约定）
+        self.assertFalse(self.out_path.exists())
+        self.assertEqual(list(self.out_path.parent.glob(f".{self.out_path.name}.*.tmp")), [])
+
+    def test_write_failure_keeps_existing_job_file(self):
+        """写入失败（磁盘满/中断）时已有配置必须原样保留：原来是 O_TRUNC 直接覆盖，
+        打开瞬间旧文件就没了，失败后磁盘上只剩 0 字节或半截 JSON。"""
+        self.out_path.parent.mkdir(parents=True, exist_ok=True)
+        self.out_path.write_text('{"job": "old"}', encoding="utf-8")
+        script = self.base_script() + self.common_tail()
+        asks = ScriptedAsk(script)
+        with mock.patch.object(init_wizard.os, "fsync", side_effect=OSError("disk full")):
+            rc = init_wizard.run_init(
+                out_path=str(self.out_path), ask=asks, ask_secret=asks, echo=lambda *_a, **_k: None
+            )
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.out_path.read_text(encoding="utf-8"), '{"job": "old"}')
 
 
 class TestWizardRemoteSampleGuard(WizardTestCase):

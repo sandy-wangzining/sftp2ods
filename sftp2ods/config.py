@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -18,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 from . import parse as parse_mod
 from .dates import DEFAULT_TZ, load_zone, parse_grace
-from .utils import ConfigError, as_bool, redact, require_identifier
+from .utils import ConfigError, _is_sensitive_key, as_bool, redact, require_identifier
 
 ALLOWED_SFTP_AUTH_TYPES = ("password", "key")
 ALLOWED_LAYOUTS = ("flat", "date_dir")
@@ -138,10 +139,28 @@ def resolve_placeholder(name: str, context: dict):
     return node
 
 
-def deep_substitute(value, context: dict):
+def _inline_scalar(value, name: str) -> str:
+    """内联占位符（"a${secrets.x}b"）的解析结果转字符串。
+
+    None/容器不能 str() 成 "None"/"['a']" 混进配置——secrets.x 为 null（模板注入失败）
+    时静默转成 "None"，校验全过、运行期去连一个叫 "None" 的目录/主机，报错指不到配置上。
+    """
+    if value is None or isinstance(value, (list, dict, tuple, set)):
+        raise ConfigError(
+            f"占位符 ${{{name}}} 解析结果不是标量（{type(value).__name__}），"
+            f"无法内联进字符串——检查对应的 secrets/占位符配置"
+        )
+    return str(value)
+
+
+def deep_substitute(value, context: dict, *, literal_ok: bool = False):
     """递归替换配置里的占位符（字符串里可混写，如 'Bearer ${secrets.x}'）。
 
     找不到的占位符直接报错（不静默留空，避免密钥没配却悄悄连不上）。
+
+    literal_ok=True 用于凭据字段（键名含 password/passphrase 等）的值：密码是自由文本，
+    里面出现 "${" 只是密码的一个字符，能解析的占位符照常解析、畸形或未知的原样保留——
+    不能因为密码长什么样就让整份作业加载失败。
     """
     if isinstance(value, dict):
         result = {}
@@ -152,24 +171,62 @@ def deep_substitute(value, context: dict):
                 result[key] = item
                 continue
             new_key = deep_substitute(key, context) if isinstance(key, str) else key
-            result[str(new_key)] = deep_substitute(item, context)
+            if isinstance(key, str) and not isinstance(new_key, str):
+                # 整串占位符解析成非字符串（如 ${secrets.lst} 是列表）：str() 会把键静默
+                # 变成 "['a', 'b']" 这种没人认得的字符串
+                raise ConfigError(
+                    f"配置的键 {redact(key)!r} 解析结果不是字符串（{type(new_key).__name__}），无法作为 JSON 键"
+                )
+            if str(new_key) in result:
+                # 替换后键名撞车（"a" 与 "${secrets.b}" 都解析成同一个键）：静默覆盖会让
+                # 前一个配置项凭空消失，必须报错
+                raise ConfigError(f"占位符替换后键名冲突：{redact(str(new_key))!r}（源键 {redact(str(key))!r}）")
+            result[str(new_key)] = deep_substitute(
+                item, context, literal_ok=isinstance(key, str) and _is_sensitive_key(key)
+            )
         return result
     if isinstance(value, list):
-        return [deep_substitute(item, context) for item in value]
+        return [deep_substitute(item, context, literal_ok=literal_ok) for item in value]
     if not isinstance(value, str):
         return value
 
     match = _PLACEHOLDER_RE.fullmatch(value)
     if match:
-        return resolve_placeholder(match.group(1), context)
+        try:
+            resolved = resolve_placeholder(match.group(1), context)
+        except SystemExit:
+            # 凭据字段整串恰好长成 ${...}（密码本身就是这个字面量、或模板没改干净）：
+            # 与下面的内联容错同口径，按字面量保留——不能同一段文本多一个字符就换个行为
+            if literal_ok:
+                return value
+            raise
+        if resolved is None:
+            # 整串解析成 null（secrets.x 没配好）会原样进入运行时配置：与内联路径的
+            # _inline_scalar 同口径拒绝；容器/数字是合法的整串结果，放行
+            raise ConfigError(f"占位符 ${{{match.group(1)}}} 解析成了 null，请检查对应的 secrets 配置")
+        return resolved
+
+    if literal_ok:
+
+        def _replace_tolerant(m: re.Match) -> str:
+            try:
+                resolved = resolve_placeholder(m.group(1), context)
+            except SystemExit:
+                return m.group(0)  # 未知键：按字面量保留
+            return _inline_scalar(resolved, m.group(1))
+
+        # 未闭合的 "${" 正则匹配不到，sub 会原样保留；成对但未知的占位符也按字面量留下
+        return _PLACEHOLDER_RE.sub(_replace_tolerant, value)
 
     if value.count("${") != len(_PLACEHOLDER_RE.findall(value)):
+        # 回显前过 redact：这段文本会进日志，而配置值本身可能就是密钥
+        # （密码里带 "${" 这类字符时，原样回显等于把密码写进日志）
         raise SystemExit(
-            f"配置里有未闭合或写法不对的占位符：{value[:120]!r}（应形如 ${{secrets.键名}}，${{ 与 }} 必须成对）"
+            f"配置里有未闭合或写法不对的占位符：{redact(value[:120])!r}（应形如 ${{secrets.键名}}，${{ 与 }} 必须成对）"
         )
 
     def _replace(m: re.Match) -> str:
-        return str(resolve_placeholder(m.group(1), context))
+        return _inline_scalar(resolve_placeholder(m.group(1), context), m.group(1))
 
     return _PLACEHOLDER_RE.sub(_replace, value)
 
@@ -213,34 +270,48 @@ def normalize_job(job: dict) -> dict:
         _fill_default(sftp, "io_timeout", 600)
         _fill_default(sftp, "retry_times", 3)
         _fill_default(sftp, "retry_delay", 10)
-        auth = dict(sftp.get("auth") or {})
+        raw_auth = sftp.get("auth")
+        # 类型守卫：dict("password") 会抛 "dictionary update sequence element #0 has length 1"
+        # 这种无上下文的裸 ValueError（normalize_job 先于 validate_job 执行，先拦在这里）
+        if raw_auth is not None and not isinstance(raw_auth, dict):
+            raise ConfigError(
+                f"作业配置的 sftp.auth 必须是对象（键值对），实际 {type(raw_auth).__name__}：{_show(raw_auth)}"
+            )
+        auth = dict(raw_auth or {})
         if auth:
-            auth.setdefault("type", "password")
+            _fill_default(auth, "type", "password")
             sftp["auth"] = auth
         job["sftp"] = sftp
     source = dict(job.get("source") or {})
     if source:
-        source.setdefault("layout", "flat")
+        # 与 sftp 块同口径：JSON null / 空串也当未配置补默认值（"layout": null 不会静默留在 None）
+        _fill_default(source, "layout", "flat")
+        # 布局取值统一小写后再写回：validate_job 按 .lower() 校验，而 SftpSource 是按字面量
+        # 比较的——只写 "DATE_DIR" 这类大小写变体时，校验能过、运行时却按 flat 列目录
+        # （结果为空、报"远端目录下没有任何匹配文件"，与真正的配置错指不到一起）。
+        source["layout"] = str(source.get("layout") or "flat").strip().lower()
         job["source"] = source
     parse_cfg = dict(job.get("parse") or {})
     if parse_cfg:
-        parse_cfg.setdefault("encoding", "utf-8-sig")
-        parse_cfg.setdefault("delimiter", "auto")
-        parse_cfg.setdefault("on_missing_header", "error")
-        parse_cfg.setdefault("strict_columns", True)
-        parse_cfg.setdefault("empty_as", "null")
+        # 与 sftp 块同口径：JSON null / 空串也当未配置补默认值
+        # （setdefault 对已存在的 null 不生效，"strict_columns": null 会一路传成 None）
+        _fill_default(parse_cfg, "encoding", "utf-8-sig")
+        _fill_default(parse_cfg, "delimiter", "auto")
+        _fill_default(parse_cfg, "on_missing_header", "error")
+        _fill_default(parse_cfg, "strict_columns", True)
+        _fill_default(parse_cfg, "empty_as", "null")
         job["parse"] = parse_cfg
     target = dict(job.get("target") or {})
     if target:
-        target.setdefault("allow_empty", True)
+        _fill_default(target, "allow_empty", True)
         job["target"] = target
     missing = dict(job.get("missing") or {})
-    missing.setdefault("check", True)
-    missing.setdefault("timezone", DEFAULT_TZ)
+    _fill_default(missing, "check", True)
+    _fill_default(missing, "timezone", DEFAULT_TZ)
     job["missing"] = missing
     notify = dict(job.get("notify") or {})
     if notify:
-        notify.setdefault("enabled", True)
+        _fill_default(notify, "enabled", True)
         job["notify"] = notify
     return job
 
@@ -284,7 +355,10 @@ def collect_warnings(job: dict) -> list[str]:
     _check_unknown_keys(_as_mapping(job.get("notify")), NOTIFY_KEYS, "notify", warnings)
     parse_cfg = _as_mapping(job.get("parse"))
     _check_unknown_keys(parse_cfg, parse_mod.PARSE_KEYS, "parse", warnings)
-    for index, col in enumerate(parse_cfg.get("columns") or []):
+    columns = parse_cfg.get("columns")
+    # 告警收集早于 validate_job：columns 写成非数组（5、true 这类手误）时不能裸 TypeError
+    # 崩掉，交给校验阶段报"columns 必须是数组"（与 build_job_summary 的守卫同口径）
+    for index, col in enumerate(columns if isinstance(columns, (list, tuple)) else []):
         if isinstance(col, dict):
             _check_unknown_keys(col, parse_mod.COLUMN_KEYS, f"parse.columns[{index}]", warnings)
     footer = parse_cfg.get("footer")
@@ -303,8 +377,8 @@ def _require_number(
         raise ConfigError(f"{where} 必须是{'整数' if integer else '数字'}，实际 {value!r}")
     try:
         number = float(value)
-    except (TypeError, ValueError):
-        raise ConfigError(f"{where} 必须是{'整数' if integer else '数字'}，实际 {value!r}")
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{where} 必须是{'整数' if integer else '数字'}，实际 {value!r}") from exc
     if not math.isfinite(number):
         raise ConfigError(f"{where} 必须是有限数字（不能是 NaN/Infinity），实际 {value!r}")
     if integer and number != int(number):
@@ -440,6 +514,10 @@ def validate_job(job: dict) -> None:
         if block in job and not isinstance(job[block], dict):
             raise ConfigError(f"作业配置的 {block} 必须是对象")
     for key, value in (job.get("profiles") or {}).items():
+        if str(key).startswith(("//", "#")):
+            # 注释键约定（同 _check_unknown_keys / deep_substitute）：不能按"必须是对象"报错，
+            # 否则用户在 profiles 里写一行注释就让整个作业跑不起来
+            continue
         if not isinstance(value, dict):
             raise ConfigError(
                 f"作业配置的 profiles.{key} 必须是对象（键值对），实际 {type(value).__name__}：{_show(value)}"
@@ -469,7 +547,8 @@ def get_mc_profile_meta(config: dict, job: dict, args) -> dict:
 
     查找顺序：作业文件的 profiles.<名> / maxcompute → --config 文件的 profiles.<名> / maxcompute。
     """
-    name = str(getattr(args, "mc_profile", "") or (job.get("target") or {}).get("profile") or "default").strip()
+    # target 写成字符串/数组（漏了大括号）时不能裸 AttributeError：与摘要/告警收集同口径
+    name = str(getattr(args, "mc_profile", "") or _as_mapping(job.get("target")).get("profile") or "default").strip()
     available: list[str] = []
     for source, where in ((job, "作业配置"), (config, "--config 文件")):
         profiles = _profile_source(source, where)
@@ -497,7 +576,7 @@ def get_mc_profile_meta(config: dict, job: dict, args) -> dict:
 
 def resolve_target(job: dict, config: dict, args) -> tuple[str, str]:
     """解析目标表信息 → (project, table)。"""
-    target = job.get("target") or {}
+    target = _as_mapping(job.get("target"))
     profile = get_mc_profile_meta(config, job, args)
     project = str(target.get("project") or profile.get("project") or "")
     if not project:
@@ -509,13 +588,34 @@ def resolve_target(job: dict, config: dict, args) -> tuple[str, str]:
 
 
 def safe_job_name(job: dict, job_path: Path) -> str:
-    """作业名（用于下载目录名）：过滤成安全字符；没配 job 时用文件名。"""
+    """作业名（用于下载目录名）：过滤成安全字符；没配 job 时用文件名。
+
+    过滤后为空（全中文/全符号的作业名，本项目里很常见）时用名字哈希做后缀，
+    不能一律退化成 "job"：多个这样的作业会共用同一个下载目录，互相扫到对方的
+    文件（旧文件被当成本次数据、重名文件被去重跳过），错误数据写进目标表
+    还看不出来。
+    """
     raw = str(job.get("job") or job_path.stem or "job")
-    return re.sub(r"[^0-9A-Za-z_\-]", "_", raw).strip("_") or "job"
+    if re.fullmatch(r"[0-9A-Za-z_\-]+", raw):
+        # 只含合法字符（含首尾下划线）一律原样保留：再 strip 会把 "recon_" 改成
+        # "recon-<hash>"，注释承诺的"已有下载目录不受影响"就不成立
+        return raw
+    cleaned = re.sub(r"[^0-9A-Za-z_\-]", "_", raw)
+    if cleaned and cleaned == raw:
+        return cleaned
+    # 过滤后与原名不一致（含全中文/全符号名）时补名字哈希，两个原因：
+    # ① 全中文名过滤后为空，退化成常量会共用下载目录；
+    # ② 部分 ASCII 的名字会"折叠"——"对账A" 与 "A" 都归一到 "A"，两个作业互扫对方文件。
+    # 名字本身就是 [0-9A-Za-z_-] 时保持原名，已有下载目录不受影响。
+    digest = hashlib.md5(raw.encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
+    return f"{cleaned or 'job'}-{digest}"
 
 
 def resolve_download_dir(job: dict, job_path: Path) -> Path:
     """下载目录：source.download_dir（相对路径按作业文件所在目录）或默认 <作业目录>/download/<作业名>。"""
+    # source 写成字符串（漏大括号）时要给中文配置错而不是裸 AttributeError：
+    # check_block_types 是标准的类型守卫；_as_mapping 会静默退化成空、把问题拖到后面
+    check_block_types(job)
     source = job.get("source") or {}
     raw = str(source.get("download_dir") or "").strip()
     if raw:
@@ -531,19 +631,24 @@ def build_context_doc() -> str:
 
 def build_job_summary(job: dict) -> list[str]:
     """体检/启动时打印的作业概要（调用方负责整体脱敏）。"""
-    sftp = job.get("sftp") or {}
-    source = job.get("source") or {}
-    parse_cfg = job.get("parse") or {}
-    target = job.get("target") or {}
-    missing = job.get("missing") or {}
+    # 概要打印早于 check_block_types/validate_job：块写成字符串时 "str".get 是裸 AttributeError，
+    # 统一走 _as_mapping 退化成空（与未知键扫描同口径）
+    sftp = _as_mapping(job.get("sftp"))
+    source = _as_mapping(job.get("source"))
+    parse_cfg = _as_mapping(job.get("parse"))
+    target = _as_mapping(job.get("target"))
+    missing = _as_mapping(job.get("missing"))
     columns = parse_cfg.get("columns") or []
+    if not isinstance(columns, (list, tuple)):
+        # "columns": 5 这类非可迭代值会让下面的 for 抛裸 TypeError（概要打印早于校验）
+        columns = []
     # 列元素可能是非对象（配置校验会拦，但概要打印是更早的路径）：加类型守卫，别崩在 AttributeError
     amount_count = sum(
         1 for col in columns if isinstance(col, dict) and str(col.get("type") or "").lower().startswith("decimal")
     )
-    layout_cn = "日期子目录" if str(source.get("layout") or "flat") == "date_dir" else "平铺"
+    layout_cn = "日期子目录" if str(source.get("layout") or "flat").strip().lower() == "date_dir" else "平铺"
     window = "无（默认全部日期）"
-    if missing.get("check", True):
+    if as_bool(missing.get("check"), default=True, field="missing.check"):
         window = f"{missing.get('timezone') or DEFAULT_TZ} 昨天"
         if missing.get("grace"):
             window += f"（{missing['grace']} 前再退一天）"
@@ -551,10 +656,11 @@ def build_job_summary(job: dict) -> list[str]:
         f"  作业      : {job.get('job') or '(未命名)'}"
         + (f" —— {job['description']}" if job.get("description") else ""),
         f"  SFTP      : {sftp.get('username')}@{sftp.get('host')}:{sftp.get('port') or 22}"
-        f"（认证 {((sftp.get('auth') or {}).get('type') or 'password')}）",
+        f"（认证 {(_as_mapping(sftp.get('auth')).get('type') or 'password')}）",
         f"  远端      : {source.get('root')}（{layout_cn}；{source.get('file_regex')}）",
         f"  解析      : {len(columns)} 列（其中金额/小数列 {amount_count} 个）"
         f"，encoding={parse_cfg.get('encoding') or 'utf-8-sig'}，delimiter={parse_cfg.get('delimiter') or 'auto'}",
-        f"  目标      : pt=文件日期（每个日期一个分区），allow_empty={target.get('allow_empty', True)}",
-        f"  缺文件核对: {'开' if missing.get('check', True) else '关'}（预期最新 = {window}）",
+        f"  目标      : pt=文件日期（每个日期一个分区），"
+        f"allow_empty={as_bool(target.get('allow_empty'), default=True, field='target.allow_empty')}",
+        f"  缺文件核对: {'开' if as_bool(missing.get('check'), default=True, field='missing.check') else '关'}（预期最新 = {window}）",
     ]
