@@ -801,7 +801,13 @@ def redact_secrets(values, text: str) -> str:
             f"%{b:02X}" if not (b < 128 and chr(b).isalnum()) else chr(b)
             for b in secret.encode("utf-8", "surrogatepass")
         )
-        for variant in (secret, quote(secret, safe=""), quote_plus(secret), aggressive):
+        try:
+            encoded_forms = (quote(secret, safe=""), quote_plus(secret))
+        except UnicodeError:
+            # 含孤立代理字符的密钥（surrogateescape 解出的路径名被登记为敏感值）：
+            # quote 内部 strict 编码会抛——跳过编码变体，绝不让脱敏反过来打崩业务
+            encoded_forms = ()
+        for variant in (secret, *encoded_forms, aggressive):
             if variant:
                 text = text.replace(variant, "***")
     return redact(text)

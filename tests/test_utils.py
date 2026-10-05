@@ -333,6 +333,13 @@ class TestRetry(OfflineTestCase):
             utils.retry_call(always_fail, attempts=2, base_delay=0, desc="测试")
         self.assertIn("重试 1 次仍失败", str(ctx.exception))
 
+    def test_redact_survives_surrogate_secret(self):
+        """含孤立代理字符的密钥（surrogateescape 路径名）：脱敏不能抛 UnicodeEncodeError。"""
+        secret = "sk-abc" + chr(0xDCE9) + "xyz"
+        out = utils.redact_secrets([secret], "err: " + secret + " end")
+        self.assertIsInstance(out, str)
+        self.assertNotIn(secret, out)
+
     def test_redact_secrets_accepts_bare_scalar_values(self):
         """values 直接传裸标量（数字/字符串，没有列表壳）也不能炸：与单字符串同口径。"""
         out = utils.redact_secrets(123456, "charge failed id=123456")
@@ -351,7 +358,7 @@ class TestRetry(OfflineTestCase):
     def test_redact_survives_recursion_error_from_json(self):
         """反转义时 json.loads 抛 RecursionError（超深嵌套）不能打穿脱敏流程。"""
         with mock.patch.object(utils.json, "loads", side_effect=RecursionError("too deep")):
-            out = utils.redact('{"k": "v\"x"}')
+            out = utils.redact('{"k": "v"x"}')
         self.assertIsInstance(out, str)
 
     def test_first_backoff_respects_max_delay(self):
