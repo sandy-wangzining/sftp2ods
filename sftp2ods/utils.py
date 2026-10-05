@@ -391,7 +391,11 @@ def as_bool(value, default: bool, field: str = "") -> bool:
             f'或字符串 "true"/"false"（也认 0/1、yes/no、on/off）'
         )
     if isinstance(value, (int, float)):
-        return bool(value)  # 0 → False、1 → True（数字配置的常见写法）
+        # 数字写法只认 0/1（文档承诺的范围）：NaN/2.5 这类笔误与 "flase" 同口径报错，
+        # 不能 bool() 放行——allow_empty: NaN 被静默当 True 会在 0 行时清空已有分区
+        if value in (0, 1):
+            return bool(value)
+        raise ConfigError(f"{where}布尔值无法识别：{value!r}；数字写法只认 0/1，其余请写 true/false")
     # 其它类型（数组/对象）不能 bool() 兜底：[] 会被静默当成 False、绕过 fail-closed 约定
     raise ConfigError(f"{where}布尔值类型不支持：{type(value).__name__}（{value!r}）；请写 true/false 或 0/1")
 
