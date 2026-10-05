@@ -491,6 +491,28 @@ class TestLogSink(OfflineTestCase):
         with mock.patch("builtins.print", side_effect=BrokenPipeError("closed")):
             utils.log("业务还在跑")  # 不抛即通过
 
+    def test_log_sink_write_happens_outside_lock(self):
+        """慢 sink（NFS/满盘）只该拖慢这条日志，不该占住全局锁卡死其它线程。"""
+        seen = {}
+
+        class Probe:
+            def write(self, *_a):
+                seen["locked"] = utils._lock.locked()
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        probe = Probe()
+        utils.add_log_sink(probe)
+        try:
+            utils.log("hello")
+        finally:
+            utils.remove_log_sink(probe)
+        self.assertIs(seen["locked"], False)
+
     def test_broken_sink_is_closed_when_dropped(self):
         """写失败的 sink 被摘掉时必须顺手关闭：只从列表移除的话句柄会挂到进程退出。"""
 

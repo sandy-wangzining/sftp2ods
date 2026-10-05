@@ -7,6 +7,11 @@
 
 ### 修复
 
+- **日志写入不再持有全局锁（可靠性）**：log() 原来在模块级锁内执行 stdout 与 --log-file
+  的 write/flush——慢速目标（管道被压满、NFS/满盘上的日志盘）会把其它线程的 log_once /
+  add_log_sink / remove_log_sink 一起卡死，整个进程表现为停滞；现在锁内只做 sink 快照，
+  写入全部在锁外（写失败摘除仍在锁内，且不覆盖并发新加进来的 sink）。
+
 - **redact_secrets 接受裸标量 values（健壮性）**：`secrets` 直接写成数字（`secrets: 123456`）
   时，原来 `for v in 123456` 抛 TypeError、把真正的失败原因顶掉；现在与单字符串同口径按
   "只有一个密钥"处理（与 api2ods / feishu2ods 同款）。

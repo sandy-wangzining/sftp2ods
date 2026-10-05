@@ -144,41 +144,43 @@ def log(message: str) -> None:
     # 带时区偏移的本地时间：跨时区/夏令时排障时能和调度系统、服务端日志对齐
     stamp = _dt.datetime.now(_dt.timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S%z")
     line = f"[{stamp}] {message}"
-    with _lock:
+    # print 与 sink 写入都放在锁外：慢速目标（管道被压满、NFS/满盘上的 --log-file）
+    # 只会拖慢这条日志本身，不该把全局 _lock 占住——否则其它线程的 log_once /
+    # add_log_sink / remove_log_sink 会一起卡死，整个进程表现为停滞
+    try:
         try:
+            print(line, flush=True)
+        except UnicodeEncodeError:
+            encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+            safe = line.encode(encoding, "replace").decode(encoding, "replace")
+            print(safe, flush=True)
+    except (OSError, ValueError, RuntimeError, AttributeError):
+        # stdout 断管/已关闭（BrokenPipeError、`| head` 提前退出；属性缺失等极端形态
+        # 会抛 RuntimeError/AttributeError）：日志函数不能反过来把业务打挂
+        pass
+    with _lock:
+        sinks = list(_sinks)  # 快照：写的时候不持锁
+    failed_exc = None
+    broken: list = []
+    for handle in sinks:
+        try:
+            handle.write(line + "\n")
+            handle.flush()
+        except Exception as exc:  # noqa: BLE001 - 日志文件问题不影响主流程，但必须可见一次
+            failed_exc = exc
+            broken.append(handle)
+    if failed_exc is not None:
+        with _lock:
+            # 从当前列表里剔除写坏的（不用写前快照覆盖：期间新加的 sink 不能丢）
+            _sinks[:] = [handle for handle in _sinks if handle not in broken]
+        # 摘掉的同时把句柄关掉：只从列表里移除的话句柄会一直挂到进程退出（写坏的
+        # 文件句柄本就不可再用，留着只是泄漏）
+        for handle in broken:
             try:
-                print(line, flush=True)
-            except UnicodeEncodeError:
-                encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
-                safe = line.encode(encoding, "replace").decode(encoding, "replace")
-                print(safe, flush=True)
-        except (OSError, ValueError, RuntimeError, AttributeError):
-            # stdout 断管/已关闭（BrokenPipeError、`| head` 提前退出；属性缺失等极端形态
-            # 会抛 RuntimeError/AttributeError）：日志函数不能反过来把业务打挂
-            pass
-        failed_exc = None
-        alive = []
-        broken: list = []
-        for handle in _sinks:
-            try:
-                handle.write(line + "\n")
-                handle.flush()
-                alive.append(handle)
-            except Exception as exc:  # noqa: BLE001 - 日志文件问题不影响主流程，但必须可见一次
-                failed_exc = exc
-                broken.append(handle)
-        if failed_exc is not None:
-            _sinks[:] = alive
-            # 摘掉的同时把句柄关掉：只从列表里移除的话句柄会一直挂到进程退出（写坏的
-            # 文件句柄本就不可再用，留着只是泄漏）
-            for handle in broken:
-                try:
-                    handle.close()
-                except Exception:  # noqa: BLE001 - 关闭失败不影响主流程
-                    pass
-        sink_exc = failed_exc
-    if sink_exc is not None:
-        _warn_log_sink_once(sink_exc)
+                handle.close()
+            except Exception:  # noqa: BLE001 - 关闭失败不影响主流程
+                pass
+        _warn_log_sink_once(failed_exc)
 
 
 class RunLock:
