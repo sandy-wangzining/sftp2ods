@@ -521,14 +521,21 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
             echo(f"写文件失败（原文件未改动）：{exc}")
             return 1
 
+        # 后续命令里的 --job 必须给真实可用的路径：CLI 按当前目录解析 --job（没有 jobs/
+        # 兜底），自定义 --init-out 时只给文件名，用户照抄会报"找不到作业文件"。
+        # 相对当前目录的写法最直观（默认场景算出来就是 jobs/<名>.json）
+        try:
+            job_arg = os.path.relpath(target_path)
+        except ValueError:  # Windows 跨盘符时无法计算相对路径
+            job_arg = str(target_path.resolve())
         try:
             echo("")
             echo(f"✅ 已生成：{target_path}")
             echo("下一步：")
             echo("  1) 打开文件核对（尤其 sftp.auth、source.file_regex、parse.columns 的列头与类型）")
-            echo(f"  2) 体检：  sftp2ods --job {target_path.name} --check")
-            echo(f"  3) 试跑：  sftp2ods --job {target_path.name} --bizdate 20260920 --dry-run")
-            echo(f"  4) 正式：  sftp2ods --job {target_path.name} --bizdate ${{bizdate}}")
+            echo(f"  2) 体检：  sftp2ods --job {job_arg} --check")
+            echo(f"  3) 试跑：  sftp2ods --job {job_arg} --bizdate 20260920 --dry-run")
+            echo(f"  4) 正式：  sftp2ods --job {job_arg} --bizdate ${{bizdate}}")
         except KeyboardInterrupt:
             # 文件已在 os.replace 时写全：中断只打断收尾提示，不能返回 130 让调用方
             # 以为失败、更不能再报"未生成任何文件"（含密钥的文件其实已在磁盘上）

@@ -319,6 +319,27 @@ class TestWizardFailurePaths(WizardTestCase):
         self.assertEqual(raw["sftp"]["auth"]["type"], "key")
         self.assertNotIn("passphrase", raw["sftp"]["auth"])
 
+    def test_followup_commands_use_usable_job_path(self):
+        """自定义 --init-out 时后续命令必须给可用路径（CLI 按当前目录解析 --job、
+        没有 jobs/ 兜底）：只给文件名的话用户照抄会报"找不到作业文件"。"""
+        script = self.base_script() + self.common_tail()
+        asks = ScriptedAsk(script)
+        echoes: list = []
+        rc = init_wizard.run_init(
+            out_path=str(self.out_path),
+            ask=asks,
+            ask_secret=asks,
+            echo=lambda *a: echoes.append(" ".join(str(x) for x in a)),
+        )
+        self.assertEqual(rc, 0)
+        joined = "\n".join(echoes)
+        try:
+            expected = os.path.relpath(self.out_path)
+        except ValueError:  # Windows 跨盘符：实现里同款退回绝对路径
+            expected = str(self.out_path.resolve())
+        self.assertIn(f"--job {expected} --check", joined)
+        self.assertNotIn(f"--job {self.out_path.name} --check", joined)
+
 
 class TestWizardSecretInput(WizardTestCase):
     """密钥类输入必须走不回显入口（原来走 input()，密码/口令/webhook 明文回显在终端）。"""
