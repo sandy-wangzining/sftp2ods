@@ -457,6 +457,17 @@ class TestRunLock(OfflineTestCase):
             with utils.RunLock(path) as lock:
                 self.assertTrue(lock.path.is_file())
 
+    def test_interprocess_lock_open_failure_gives_systemexit(self):
+        """台账锁文件打不开（权限 / O_NOFOLLOW 拒符号链接）给可读 SystemExit，
+        与 RunLock 同口径，而不是裸 OSError traceback。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.lock"
+            with mock.patch("builtins.open", side_effect=OSError("permission denied")):
+                with self.assertRaises(SystemExit) as ctx:
+                    with utils.interprocess_lock(path):
+                        pass
+        self.assertIn("台账锁文件", str(ctx.exception))
+
 
 class TestTryLockErrno(OfflineTestCase):
     def _fcntl_mod(self):

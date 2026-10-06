@@ -255,9 +255,14 @@ def _lock_path(job_path: Path) -> Path:
     return fallback
 
 
-def _redact_job(job: dict, text) -> str:
-    """作业上下文下的脱敏：先按配置里的密钥值遮，再走形态规则兜底。"""
-    return redact_secrets(collect_secret_values(job), str(text))
+def _redact_job(job: dict, text, config: dict | None = None) -> str:
+    """作业上下文下的脱敏：按作业（连同 --config）里的密钥值遮，再走形态规则兜底。
+
+    凭证常只写在 --config 的 secrets/maxcompute 里、作业文件只写 ${secrets.xxx}：
+    SDK 异常回显出的 AK/密码来自 config 那份明文，只收作业文件的密钥值会漏遮。
+    """
+    nodes = (job,) if config is None else (job, config)
+    return _redact_configs(str(text), *nodes)
 
 
 def _redact_configs(text, *nodes) -> str:
@@ -352,7 +357,7 @@ def run_check(job: dict, config: dict, args, job_path: Path, config_path: Path |
     """体检：配置概要 + SFTP 真实列目录 + 目标表结构。新接一个源时先跑这个。"""
     log("== 作业概要 ==")
     for line in build_job_summary(job):
-        log(_redact_job(job, line))
+        log(_redact_job(job, line, config))
 
     log("")
     log("== SFTP 连通性（真实列目录） ==")
@@ -387,7 +392,7 @@ def run_check(job: dict, config: dict, args, job_path: Path, config_path: Path |
     except SystemExit:
         raise
     except Exception as exc:  # noqa: BLE001
-        log(f"  ❌ {_redact_job(job, exc)}")
+        log(f"  ❌ {_redact_job(job, exc, config)}")
         return 1
 
     log("")
@@ -411,10 +416,10 @@ def run_check(job: dict, config: dict, args, job_path: Path, config_path: Path |
             mc_mod.verify_table_schema(table, table_name, parse_spec.columns)
             log(f"  ✅ {table_name} 结构符合（{len(parse_spec.columns)} 列 + pt）")
     except SystemExit as exc:
-        log(f"  ❌ {_redact_job(job, exc)}")
+        log(f"  ❌ {_redact_job(job, exc, config)}")
         return 1
     except Exception as exc:  # noqa: BLE001
-        log(f"  ❌ 连接/校验失败：{_redact_job(job, exc)}")
+        log(f"  ❌ 连接/校验失败：{_redact_job(job, exc, config)}")
         return 1
 
     log("")
@@ -458,7 +463,7 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
     except SystemExit:
         raise
     except Exception as exc:  # noqa: BLE001 - 连接/列目录失败统一按失败退出
-        log(f"❌ 列远端文件失败：{_redact_job(job, exc)}")
+        log(f"❌ 列远端文件失败：{_redact_job(job, exc, config)}")
         return 1
 
     if not files_by_date:
@@ -478,7 +483,7 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
             for item in date_files:
                 sftp_mod.local_path_within(download_dir, item.ledger_key, item.name)
     except FatalSourceError as exc:
-        log(f"❌ {_redact_job(job, exc)}")
+        log(f"❌ {_redact_job(job, exc, config)}")
         return 1
 
     missing_cfg = job.get("missing") or {}
@@ -604,7 +609,7 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
         except SystemExit:
             raise
         except Exception as exc:  # noqa: BLE001
-            log(f"❌ 连接/建表失败：{_redact_job(job, exc)}")
+            log(f"❌ 连接/建表失败：{_redact_job(job, exc, config)}")
             return 1
 
     # ---- ③ 逐日期：跳过已上传 → 下载 → 解析 → 写 pt → 校验 ----
@@ -671,12 +676,12 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
             try:
                 local_paths.append(source.download(item, download_dir / item.ledger_key))
             except FatalSourceError as exc:
-                log(f"❌ {_redact_job(job, exc)}")
+                log(f"❌ {_redact_job(job, exc, config)}")
                 return 1
             except (ConfigError, OSError, RuntimeError) as exc:
                 # 只接预期的下载/连接类错误（FatalSourceError 与重试耗尽都是 RuntimeError 子类）；
                 # TypeError/AttributeError 这类代码缺陷继续上抛，不能被"下载失败"掩盖成数据问题
-                log(f"❌ 下载 {item.name} 失败：{_redact_job(job, exc)}")
+                log(f"❌ 下载 {item.name} 失败：{_redact_job(job, exc, config)}")
                 return 1
 
         # 先完整解析一遍数行数（表头校验、合计行校验都在这趟完成；坏文件在写库前就拦住）。
@@ -706,7 +711,7 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
         except SystemExit:
             raise
         except Exception as exc:  # noqa: BLE001
-            log(f"❌ 解析失败：{_redact_job(job, exc)}")
+            log(f"❌ 解析失败：{_redact_job(job, exc, config)}")
             return 1
         rows = sum(file_rows)
         total_rows += rows
@@ -725,7 +730,7 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
                 try:
                     existing = mc_mod.count_partition(o, project, table_name, date, timeout=args.sql_timeout)
                 except Exception as exc:  # noqa: BLE001 - 查询失败按写库失败处理（宁可不写）
-                    log(f"❌ pt={date} 写前查询现有分区行数失败：{_redact_job(job, exc)}")
+                    log(f"❌ pt={date} 写前查询现有分区行数失败：{_redact_job(job, exc, config)}")
                     return 1
                 if existing:
                     log(
@@ -752,7 +757,7 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
         except SystemExit:
             raise
         except Exception as exc:  # noqa: BLE001 - 写库/Tunnel 失败统一按失败退出（调度可告警）
-            log(f"❌ 写库失败：{_redact_job(job, exc)}")
+            log(f"❌ 写库失败：{_redact_job(job, exc, config)}")
             return 1
         if verified != rows:
             log(f"❌ {date} 写后校验不一致：写入 {rows:,}，查询 {verified:,}")
@@ -899,7 +904,7 @@ def main(argv: list[str] | None = None) -> int:
         for warning in collect_warnings(job):  # 未知字段告警（拼写错误提示）
             # 此时 job 已经过 render_job，明文密钥就在 job 里：与其它所有来自 job 的输出
             # 同口径做值级脱敏，防止告警文本里带上字段值（拼错的键名旁边常跟着取值）
-            log(f"⚠️ {_redact_job(job, warning)}")
+            log(f"⚠️ {_redact_job(job, warning, config)}")
 
         if args.check:
             try:
@@ -912,7 +917,7 @@ def main(argv: list[str] | None = None) -> int:
             with RunLock(_lock_path(job_path)):  # 同机同一作业互斥；不同作业可并行
                 return run_sync(job, config, args, job_path, bizdate=bizdate, config_path=config_path)
         except SystemExit as exc:
-            log(f"❌ {_redact_job(job, exc)}")
+            log(f"❌ {_redact_job(job, exc, config)}")
             return 1
         except KeyboardInterrupt:
             log("已中断（本次未完成；重跑同一命令即可，先删再填、幂等）")

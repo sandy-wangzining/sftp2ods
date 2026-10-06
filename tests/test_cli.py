@@ -862,6 +862,15 @@ class TestRedactionHelpers(CliTestCase):
         self.assertNotIn("secret-pw", out)
         self.assertNotIn("abc12345", out)
 
+    def test_redact_job_includes_config_secrets(self):
+        """异常文本里回显的 --config 明文也要遮：凭证常只写 --config（作业文件里是
+        ${secrets.xxx}），SDK 报错回显的 AK/密码来自 config 那份，只收作业文件的密钥值会漏遮。"""
+        job = minimal_job()
+        config = {"maxcompute": {"access_key_secret": "cfgs-ec-ret-abcdef12"}}
+        out = cli_mod._redact_job(job, "boom: cfgs-ec-ret-abcdef12", config)
+        self.assertNotIn("cfgs-ec-ret-abcdef12", out)
+        self.assertIn("***", out)
+
     def test_prepare_stage_error_masks_config_secrets(self):
         """凭证只写在 --config 的 secrets 里时，准备阶段的报错也不能回显明文。
 

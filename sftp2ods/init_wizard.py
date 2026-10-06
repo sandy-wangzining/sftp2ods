@@ -276,6 +276,7 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
     """
     root = Path(workdir) if workdir else Path.cwd()
     ask_secret = ask_secret or _default_ask_secret
+    written_path: Path | None = None  # os.replace 成功后的落盘路径（外层中断分支据它区分"文件已写全/未生成"）
     try:
         echo("=== sftp2ods 配置向导（直接回车用默认值；随时 Ctrl+C 取消）===")
         echo("")
@@ -312,11 +313,17 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
             if auth_choice != "1":
                 echo(f"   编号 {auth_choice} 不是有效选项，按「密码」继续。")
             password = _ask_secret(ask_secret, "   密码（输入不回显）")
-            while not password.strip():
-                # 空密码写进配置 = 一份必然连不上的作业、向导却报"已生成成功"：
-                # 直接重问（Ctrl+C/EOF 走既有取消出口）
+            # 空密码写进配置 = 一份必然连不上的作业、向导却报"已生成成功"：
+            # 重问但限次（与 _ask_nonempty 同为 3 次）——不能无上限循环：
+            # 输入源持续给空白行（管道/自动应答）时会一直刷屏不退出
+            for _ in range(2):
+                if password.strip():
+                    break
                 echo("   密码不能为空（认证类型选了密码）：请重新输入，或 Ctrl+C 取消后改用密钥认证")
                 password = _ask_secret(ask_secret, "   密码（输入不回显）")
+            if not password.strip():
+                echo("❌ 密码连续三次为空，已取消（可改用密钥认证，或稍后在作业文件里补密码）。")
+                return 1
             auth = {"type": "password", "password": password}
         sftp_cfg = {"host": host, "port": port, "username": username, "auth": auth}
 
@@ -411,6 +418,11 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         table = _ask(ask, "   目标表名（建议 <层级>_<业务域>_<过程>_di）", f"ods_{job_name.replace('-', '_')}_di")
         ak = _ask(ask, "   阿里云 AccessKeyId")
         sk = _ask_secret(ask_secret, "   阿里云 AccessKeySecret（输入不回显）")
+        if not ak or not sk:
+            # 允许留空（凭证也可以只放 --config），但必须说清后果：不然向导照报
+            # "已生成成功"，用户到 --check 才发现是一份跑不起来的配置
+            echo("   ⚠️ AccessKeyId/AccessKeySecret 未填全：作业文件里没有可用凭证，")
+            echo("      运行前需在 --config 的 maxcompute 块提供（或重新运行向导补齐）。")
         endpoint = _ask(ask, "   endpoint", DEFAULT_ENDPOINT)
 
         # ---------------------------------------------------------- ⑧ 组装并写出
@@ -462,6 +474,7 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
                     handle.flush()
                     os.fsync(handle.fileno())
                 os.replace(tmp_path, target_path)
+                written_path = target_path
             except BaseException:
                 # 含 BaseException（Ctrl+C/SystemExit）：临时文件里是含密钥的完整配置，
                 # 中断也必须清掉，否则会在 jobs/ 里残留且向导声称"未生成任何文件"
@@ -516,9 +529,14 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         echo("已取消，未生成任何文件。")
         return 1
     except KeyboardInterrupt:
-        # Ctrl+C 按 README 的退出码约定报 130，与同步流程保持一致
+        # Ctrl+C 按 README 的退出码约定报 130，与同步流程保持一致。
+        # os.replace 已完成时文件已落盘（含明文密钥），不能再报"未生成任何文件"——
+        # 那会让操作者以为磁盘上没有这份配置，与内层收尾提示的"文件已写全"自相矛盾
         echo("")
-        echo("已取消，未生成任何文件。")
+        if written_path is not None:
+            echo(f"✅ 已生成：{written_path}（Ctrl+C 落在收尾阶段，文件已写全）")
+        else:
+            echo("已取消，未生成任何文件。")
         return 130
     except RuntimeError as exc:  # "lost sys.stdin"（没有标准输入）
         if "stdin" not in str(exc):

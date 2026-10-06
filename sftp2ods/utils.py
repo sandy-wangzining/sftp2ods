@@ -351,7 +351,12 @@ def interprocess_lock(path: Path):
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if nofollow:
         open_kwargs["opener"] = lambda p, flags, _nf=nofollow: os.open(p, flags | _nf, 0o600)
-    fh = open(path, "a+", **open_kwargs)
+    try:
+        fh = open(path, "a+", **open_kwargs)
+    except (OSError, UnicodeError) as exc:
+        # 与 RunLock 同口径：权限/O_NOFOLLOW 这类错误给可读的 SystemExit，
+        # 而不是裸 OSError traceback
+        raise SystemExit(f"无法打开台账锁文件 {path}（{exc}）；请检查该路径所在目录是否存在/可写") from exc
     try:
         _acquire_lock(fh, blocking=True)
         try:

@@ -264,6 +264,16 @@ class TestValidate(OfflineTestCase):
         job["sftp"]["auth"] = {"type": "key"}
         self.assert_invalid(job, "sftp.auth.key_file")
         job = minimal_job()
+        # 容器/数字不能被真值判断放行（会原样传进 paramiko/SFTP 层）
+        job["sftp"]["auth"] = {"type": "password", "password": ["not", "a", "string"]}
+        self.assert_invalid(job, "sftp.auth.password 必须是字符串")
+        job = minimal_job()
+        job["sftp"]["auth"] = {"type": "key", "key_file": {"path": "~/.ssh/x"}}
+        self.assert_invalid(job, "sftp.auth.key_file 必须是字符串")
+        job = minimal_job()
+        job["sftp"]["auth"] = {"type": "key", "key_file": "~/.ssh/x", "passphrase": 123}
+        self.assert_invalid(job, "sftp.auth.passphrase 必须是字符串")
+        job = minimal_job()
         job["sftp"]["auth"] = {"type": "key", "key_file": "~/.ssh/x"}
         validated(job)
 

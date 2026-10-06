@@ -444,10 +444,22 @@ def validate_job(job: dict) -> None:
     auth_type = str(auth.get("type") or "password").lower()
     if auth_type not in ALLOWED_SFTP_AUTH_TYPES:
         raise ConfigError(f"sftp.auth.type 不支持：{auth_type}（可用 {'/'.join(ALLOWED_SFTP_AUTH_TYPES)}）")
-    if auth_type == "password" and not auth.get("password"):
-        raise ConfigError("sftp.auth.type=password 必须给 sftp.auth.password")
-    if auth_type == "key" and not auth.get("key_file"):
-        raise ConfigError("sftp.auth.type=key 必须给 sftp.auth.key_file（私钥路径，如 ~/.ssh/clink_sftp）")
+    if auth_type == "password":
+        password = auth.get("password")
+        if password is None or password == "":
+            raise ConfigError("sftp.auth.type=password 必须给 sftp.auth.password")
+        if not isinstance(password, str):
+            # 只报类型名、不报取值：password 是密钥，明文不能进错误消息/日志
+            raise ConfigError(f"sftp.auth.password 必须是字符串，实际 {type(password).__name__}")
+    if auth_type == "key":
+        key_file = auth.get("key_file")
+        if not isinstance(key_file, str):
+            raise ConfigError(f"sftp.auth.key_file 必须是字符串（私钥路径），实际 {type(key_file).__name__}")
+        if not key_file.strip():
+            raise ConfigError("sftp.auth.type=key 必须给 sftp.auth.key_file（私钥路径，如 ~/.ssh/clink_sftp）")
+    passphrase = auth.get("passphrase")
+    if passphrase is not None and not isinstance(passphrase, str):
+        raise ConfigError(f"sftp.auth.passphrase 必须是字符串，实际 {type(passphrase).__name__}")
     host_key = str(sftp.get("host_key") or "").strip().lower()
     if host_key not in ("", "auto_accept"):
         raise ConfigError(

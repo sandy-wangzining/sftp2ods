@@ -205,9 +205,67 @@ class TestWizardFailurePaths(WizardTestCase):
         self.assertEqual(rc, 130)
         self.assertFalse(self.out_path.exists())
 
+    def test_keyboard_interrupt_after_replace_reports_written(self):
+        """os.replace 已完成后才 Ctrl+C（如收尾 chmod 阶段）不能再说"未生成任何文件"：
+        含明文密钥的配置已经在磁盘上，该报"文件已写全"（与内层收尾提示自相矛盾会误导操作者）。"""
+        script = self.base_script() + self.common_tail()
+        asks = ScriptedAsk(script)
+        echoes: list = []
+        fake_os = mock.Mock(wraps=init_wizard.os)
+        fake_os.name = "posix"  # chmod 收紧分支只在 posix 执行（Windows 上本来就不走）
+        fake_os.chmod.side_effect = KeyboardInterrupt
+        with mock.patch.object(init_wizard, "os", fake_os):
+            rc = init_wizard.run_init(
+                out_path=str(self.out_path),
+                ask=asks,
+                ask_secret=asks,
+                echo=lambda *a: echoes.append(" ".join(str(x) for x in a)),
+            )
+        self.assertEqual(rc, 130)
+        self.assertTrue(self.out_path.is_file())
+        joined = "\n".join(echoes)
+        self.assertIn("已写全", joined)
+        self.assertNotIn("未生成任何文件", joined)
+
+    def test_empty_password_three_times_cancels(self):
+        """密码连续三次为空要取消并返回 1：原来是无上限 while，输入源持续给空白行
+        （管道/自动应答）时会一直刷屏不退出。"""
+        script = [
+            ("作业名", "x"),
+            ("主机名", "h"),
+            ("端口", "22"),
+            ("登录名", "u"),
+            ("请选择编号", "1"),  # 认证 = 密码
+            ("密码", ""),
+            ("密码", ""),
+            ("密码", ""),
+        ]
+        rc, _ = self.run_wizard(script)
+        self.assertEqual(rc, 1)
+        self.assertFalse(self.out_path.exists())
+
     def test_out_path_is_directory(self):
         with self.assertRaises(SystemExit):
             self.run_wizard(self.base_script() + self.common_tail(), out_path=self.tmp)
+
+    def test_empty_aksk_warns_before_success(self):
+        """AK/SK 留空时仍可生成（凭证可以只放 --config），但必须明确提示作业文件里
+        没有可用凭证——不能静默报"已生成成功"，让用户到 --check 才发现跑不起来。"""
+        script = [
+            (frag, "" if frag in ("AccessKeyId", "AccessKeySecret") else val)
+            for frag, val in self.base_script() + self.common_tail()
+        ]
+        echoes: list = []
+        ask = ScriptedAsk(script)
+        rc = init_wizard.run_init(
+            out_path=str(self.out_path),
+            ask=ask,
+            ask_secret=ask,
+            echo=lambda *a: echoes.append(" ".join(str(x) for x in a)),
+        )
+        self.assertEqual(rc, 0)
+        joined = "\n".join(echoes)
+        self.assertIn("AccessKeyId/AccessKeySecret 未填全", joined)
 
 
 class TestWizardSecretInput(WizardTestCase):

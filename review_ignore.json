@@ -65,6 +65,16 @@
       "file": "tests/test_utils.py",
       "title": "sys.path",
       "reason": "误报（2026-10-05 复核，与 tests/test_cli.py 同口径）：只在路径缺失时 append（不插最前），按 README 在仓库根运行时本地包本来就在最前；pip install -e 的 .pth 也指向同一份代码。"
+    },
+    {
+      "file": "tests/test_config.py",
+      "title": "sys.path",
+      "reason": "误报（2026-10-06 复核，与 tests/test_cli.py、test_utils.py 同口径）：只在路径缺失时 append（不插最前），按 README 在仓库根运行时本地包本来就在最前；pip install -e 的 .pth 也指向同一份代码。"
+    },
+    {
+      "file": "sftp2ods/cli.py",
+      "title": "吞成返回码 1",
+      "reason": "误报（2026-10-06 对照 README「退出码」表）：1 = 运行失败（配置错、连接/下载失败……），--check 里捕获的 SystemExit 正是配置/连接类错误，按文档就是 1；2 只限「命令行参数问题且没做过任何远端操作」，而 --check 会真实列远端目录，前提不成立。"
     }
   ]
 }
