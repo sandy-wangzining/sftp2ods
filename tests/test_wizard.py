@@ -286,6 +286,39 @@ class TestWizardFailurePaths(WizardTestCase):
         joined = "\n".join(echoes)
         self.assertIn("AccessKeyId/AccessKeySecret 未填全", joined)
 
+    def test_blank_webhook_and_sk_are_treated_as_unset(self):
+        """webhook/sk 的纯空白输入不能算"已配置"：webhook 是 URL、AK/SK 是固定格式凭据，
+        空白只可能是误输入——否则生成一份必然发不出告警/必然认证失败的作业却报成功。"""
+        script = [
+            (frag, "   " if frag == "webhook" else (" " if frag == "AccessKeySecret" else val))
+            for frag, val in self.base_script() + self.common_tail()
+        ]
+        echoes: list = []
+        ask = ScriptedAsk(script)
+        rc = init_wizard.run_init(
+            out_path=str(self.out_path),
+            ask=ask,
+            ask_secret=ask,
+            echo=lambda *a: echoes.append(" ".join(str(x) for x in a)),
+        )
+        self.assertEqual(rc, 0)
+        raw = json.loads(self.out_path.read_text(encoding="utf-8"))
+        self.assertNotIn("notify", raw)
+        self.assertEqual(raw["maxcompute"]["access_key_secret"], "")
+        self.assertTrue(any("AccessKeyId/AccessKeySecret 未填全" in e for e in echoes), echoes)
+
+    def test_blank_passphrase_is_treated_as_unset(self):
+        """私钥口令纯空白 = 没填：不写 passphrase 字段（与密码分支的 strip 判空同口径）。"""
+        script = [item for item in self.base_script() + self.common_tail() if item[0] != "密码"]
+        idx = next(i for i, item in enumerate(script) if item[0] == "请选择编号")
+        script[idx] = ("请选择编号", "2")  # 认证 = 私钥
+        script[idx + 1 : idx + 1] = [("私钥文件路径", "~/.ssh/id_rsa"), ("私钥口令", "   ")]
+        rc, _ = self.run_wizard(script)
+        self.assertEqual(rc, 0)
+        raw = json.loads(self.out_path.read_text(encoding="utf-8"))
+        self.assertEqual(raw["sftp"]["auth"]["type"], "key")
+        self.assertNotIn("passphrase", raw["sftp"]["auth"])
+
 
 class TestWizardSecretInput(WizardTestCase):
     """密钥类输入必须走不回显入口（原来走 input()，密码/口令/webhook 明文回显在终端）。"""

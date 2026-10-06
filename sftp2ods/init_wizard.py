@@ -309,7 +309,9 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
             key_file = _ask(ask, "   私钥文件路径", "~/.ssh/id_rsa")
             passphrase = _ask_secret(ask_secret, "   私钥口令（没有就留空，输入不回显）")
             auth = {"type": "key", "key_file": key_file}
-            if passphrase:
+            if passphrase.strip():
+                # 判空按去空白后的值（" " 与"没填"同义）；存储保持原值：口令首尾空白
+                # 可能是凭据本体（与密码分支同一口径）
                 auth["passphrase"] = passphrase
         else:
             if auth_choice != "1":
@@ -413,13 +415,17 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         # ---------------------------------------------------------- ⑦ 告警与目标表
         echo("")
         echo("=== 告警与 MaxCompute 目标 ===")
-        # webhook 是凭证（拿到就能往群里发消息），按密钥类处理、不回显
-        webhook = _ask_secret(ask_secret, "⑨ 飞书告警 webhook（可留空，输入不回显）")
+        # webhook 是凭证（拿到就能往群里发消息），按密钥类处理、不回显；但它是 URL，
+        # 首尾空白只可能是粘贴误带入——strip 后再判空/写入（不是密码那种"空白可能是本体"）
+        webhook = _ask_secret(ask_secret, "⑨ 飞书告警 webhook（可留空，输入不回显）").strip()
         project = _ask(ask, "⑩ MaxCompute 项目名", "my_project")
         # 作业名允许连字符（用于文件名），但 MaxCompute 表名不允许：默认表名先把连字符换成下划线
         table = _ask(ask, "   目标表名（建议 <层级>_<业务域>_<过程>_di）", f"ods_{job_name.replace('-', '_')}_di")
-        ak = _ask(ask, "   阿里云 AccessKeyId")
-        sk = _ask_secret(ask_secret, "   阿里云 AccessKeySecret（输入不回显）")
+        ak = _ask(ask, "   阿里云 AccessKeyId")  # _ask 已 strip
+        # sk 走 _ask_secret（不 strip）：AK/SK 是固定格式的凭据（生成的 LTAI…/base64），
+        # 首尾空白只可能是粘贴误带入——去掉后再判空/写入，否则 " " 会绕过下面的
+        # "未填全"告警、生成一份必然 SignatureDoesNotMatch 的作业却报"已生成成功"
+        sk = _ask_secret(ask_secret, "   阿里云 AccessKeySecret（输入不回显）").strip()
         if not ak or not sk:
             # 允许留空（凭证也可以只放 --config），但必须说清后果：不然向导照报
             # "已生成成功"，用户到 --check 才发现是一份跑不起来的配置

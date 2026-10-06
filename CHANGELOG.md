@@ -35,6 +35,11 @@
   （`header.strip()`）与"读到 N 列"展示行（`join`）原来会抛 AttributeError/TypeError
   traceback、丢掉已填的密码与 AK/SK；现在与 slugify 的 `str(header or "")` 同口径兜底。
 
+- **密钥类输入的空白值不再当成"已配置"（正确性）**：webhook（URL）与 AK/SK（固定
+  格式凭据）的首尾空白只可能是粘贴误带入，strip 后再判空/写入——`" "` 不再绕过
+  "凭证未填全"的告警、也不会生成必然发不出告警/必然认证失败的作业；私钥口令判空
+  同口径（存储保持原值：口令首尾空白可能是凭据本体，与密码分支一致）。
+
 - **`sftp.auth` 的凭据字段显式要求字符串（正确性）**：`password` / `key_file` /
   `passphrase` 只做真值判断时，JSON 对象/数组也能通过校验、运行期才在 paramiko 层
   崩；与 `source.root`、`sftp.host`、`sftp.username` 同口径在配置阶段拒绝（错误消息
