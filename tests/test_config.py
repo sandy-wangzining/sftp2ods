@@ -227,8 +227,14 @@ class TestValidate(OfflineTestCase):
         job["sftp"]["host"] = ""
         self.assert_invalid(job, "sftp.host")
         job = minimal_job()
+        job["sftp"]["host"] = ["10.0.0.1"]
+        self.assert_invalid(job, "sftp.host 必须是字符串")
+        job = minimal_job()
         job["sftp"]["username"] = ""
         self.assert_invalid(job, "sftp.username")
+        job = minimal_job()
+        job["sftp"]["username"] = 42
+        self.assert_invalid(job, "sftp.username 必须是字符串")
 
     def test_sftp_port_and_retry(self):
         job = minimal_job()
@@ -275,6 +281,13 @@ class TestValidate(OfflineTestCase):
         job = minimal_job()
         job["source"]["root"] = ""
         self.assert_invalid(job, "source.root")
+        job = minimal_job()
+        # 容器/数字不能被 str() 兜底拼成非空字符串放行（运行期才在 SFTP 层崩）
+        job["source"]["root"] = ["/statements", "/settlements"]
+        self.assert_invalid(job, "source.root 必须是字符串")
+        job = minimal_job()
+        job["source"]["root"] = 123
+        self.assert_invalid(job, "source.root 必须是字符串")
         job = minimal_job()
         job["source"]["layout"] = "nested"
         self.assert_invalid(job, "source.layout")
@@ -494,6 +507,11 @@ class TestResolveTargetAndDirs(OfflineTestCase):
     def test_safe_job_name_keeps_legal_lowercase_name(self):
         """只含合法字符且全小写的名字（含首尾下划线）原样保留：否则下载目录被改名、旧文件不复用。"""
         self.assertEqual(config.safe_job_name({"job": "recon_"}, Path("x.json")), "recon_")
+
+    def test_safe_job_name_keeps_caseless_name(self):
+        """不含大小写字符的名字（纯数字/纯下划线）也原样保留：islower() 对它们返回 False。"""
+        self.assertEqual(config.safe_job_name({"job": "20240101"}, Path("x.json")), "20240101")
+        self.assertEqual(config.safe_job_name({"job": "___"}, Path("x.json")), "___")
 
     def test_safe_job_name_case_folds_to_distinct_dirs(self):
         """含大写字母的名字补哈希：大小写不敏感文件系统上 Recon/recon 不能共用一个下载目录。"""

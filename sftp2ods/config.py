@@ -421,9 +421,15 @@ def validate_job(job: dict) -> None:
     sftp = job.get("sftp") or {}
     if not sftp:
         raise ConfigError("作业配置缺少 sftp 块（host / username / auth）")
-    if not sftp.get("host"):
+    host = sftp.get("host")
+    if not isinstance(host, str):
+        raise ConfigError(f"sftp.host 必须是字符串（SFTP 主机），实际 {type(host).__name__}")
+    if not host.strip():
         raise ConfigError("作业配置缺少 sftp.host（SFTP 主机）")
-    if not sftp.get("username"):
+    username = sftp.get("username")
+    if not isinstance(username, str):
+        raise ConfigError(f"sftp.username 必须是字符串（SFTP 登录名），实际 {type(username).__name__}")
+    if not username.strip():
         raise ConfigError("作业配置缺少 sftp.username（SFTP 登录名）")
     _require_number(sftp.get("port"), "sftp.port", minimum=1, maximum=65535, integer=True)
     _require_number(sftp.get("connect_timeout"), "sftp.connect_timeout", minimum=0)
@@ -453,7 +459,14 @@ def validate_job(job: dict) -> None:
     source = job.get("source") or {}
     if not source:
         raise ConfigError("作业配置缺少 source 块（root / layout / file_regex）")
-    if not str(source.get("root") or "").strip():
+    root = source.get("root")
+    if not isinstance(root, str):
+        # str() 兜底会把 ["/a", "/b"] 这种容器拼成非空字符串放行，运行期才在 SFTP 层
+        # 崩成 TypeError/列错目录；与 download_dir 同口径在配置阶段显式拒掉
+        raise ConfigError(
+            f"source.root 必须是字符串目录路径，实际 {type(root).__name__}（如 /statements 或 settlements）"
+        )
+    if not root.strip():
         raise ConfigError("作业配置缺少 source.root（远端目录，如 /statements 或 settlements）")
     layout = str(source.get("layout") or "flat").lower()
     if layout not in ALLOWED_LAYOUTS:
@@ -606,9 +619,12 @@ def safe_job_name(job: dict, job_path: Path) -> str:
     """
     raw = str(job.get("job") or job_path.stem or "job")
     cleaned = re.sub(r"[^0-9A-Za-z_\-]", "_", raw)
-    if cleaned and cleaned == raw and raw.islower():
-        # 只含合法字符且全小写：原样保留（再 strip 会把 "recon_" 改成 "recon-<hash>"，
-        # 注释承诺的"已有下载目录不受影响"就不成立）。含大写字母的名字必须补哈希：
+    if cleaned and cleaned == raw and raw == raw.lower():
+        # 只含合法字符且不含大写字母：原样保留（再 strip 会把 "recon_" 改成 "recon-<hash>"，
+        # 注释承诺的"已有下载目录不受影响"就不成立）。判定不能用 raw.islower()：它对
+        # 没有大小写字符的名字（"20240101"、"___"）返回 False，会把这类名字也错误地
+        # 补哈希——下载目录改名后旧文件不复用，每次重下、目录持续堆积。
+        # 含大写字母的名字必须补哈希：
         # Windows/macOS 默认文件系统大小写不敏感，"Recon" 与 "recon" 会落到同一个
         # 下载目录、互相扫到对方的文件——名字层面的安全过滤不能漏掉这一维度
         return raw
