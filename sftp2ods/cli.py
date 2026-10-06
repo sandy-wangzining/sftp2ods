@@ -530,10 +530,17 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
         # 返回 0 会让人以为"补数成功"，比失败更危险（本家族红线：宁可失败不可静默丢数）。
         # 与 1.4.0「显式单日缺文件 → 失败」同口径，--force 是"我知道这段可能没数"的显式放行开关。
         # proc_dates 只看"远端有没有文件"，与台账无关——区间内文件都已上传时它是非空、不会误判。
+        # 远端目录一个文件都没有时，"数据范围"没有意义：直接取 min/max 会 ValueError
+        # （配置写错/源方还没上传时正好走这一支，崩溃会盖掉真正要给的提示）
+        data_range = (
+            f"{min(all_dates)} ~ {max(all_dates)}"
+            if all_dates
+            else "无（远端目录当前没有任何匹配文件，请检查 source 配置）"
+        )
         log(
             f"❌ 【{job_name}】补数区间在远端没有任何匹配文件"
             f"（--start-date {start or '-'}，--end-date {end or '-'}）；"
-            f"远端数据范围 {min(all_dates)} ~ {max(all_dates)}，本区间不会有任何产出。"
+            f"远端数据范围 {data_range}，本区间不会有任何产出。"
             f"若源方确实不产数、确认要空跑，请加 --force 明确继续"
         )
         return 1

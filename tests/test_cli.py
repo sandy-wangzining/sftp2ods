@@ -139,6 +139,15 @@ class TestWorldHarness(CliTestCase):
         second.stop.assert_not_called()
 
 
+class TestBackfillEmptyRemote(CliTestCase):
+    def test_empty_remote_with_range_reports_cleanly(self):
+        """远端一个文件都没有 + 显式区间：干净报"区间没有匹配文件"，不能 min() 空序列崩溃。"""
+        with World(self.tmp) as world:
+            rc = world.sync(start_date="2026-09-01", end_date="2026-09-02")
+        self.assertEqual(rc, 1)
+        self.assertTrue(any("没有任何匹配文件" in line for line in world.access_logs), world.access_logs[-3:])
+
+
 class TestSyncHappyPath(CliTestCase):
     def test_write_skip_and_force(self):
         data = report([["o1", "1.50"], ["o2", "2.50"]])
