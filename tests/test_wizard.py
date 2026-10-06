@@ -476,6 +476,28 @@ class TestWizardSampleErrors(WizardTestCase):
         self.assertFalse(self.out_path.exists())
         self.assertEqual(list(self.out_path.parent.glob(f".{self.out_path.name}.*.tmp")), [])
 
+    def test_tmp_cleanup_failure_is_warned_not_silent(self):
+        """清理含明文密钥的临时文件失败（被占用/权限变化）必须醒目提示残留路径：
+        否则向导一边报"未生成任何文件"、磁盘上却留着含明文密码/AK-SK 的 .tmp。"""
+        script = self.base_script() + self.common_tail()
+        asks = ScriptedAsk(script)
+        echoes: list = []
+        with (
+            mock.patch.object(init_wizard.os, "replace", side_effect=OSError("locked")),
+            mock.patch.object(Path, "unlink", side_effect=OSError("busy")),
+        ):
+            rc = init_wizard.run_init(
+                out_path=str(self.out_path),
+                ask=asks,
+                ask_secret=asks,
+                echo=lambda *a: echoes.append(" ".join(str(x) for x in a)),
+            )
+        self.assertEqual(rc, 1)
+        joined = "\n".join(echoes)
+        self.assertIn("清理临时文件失败", joined)
+        # 残留确实存在（unlink 被模拟失败）——提示里给的路径就是它
+        self.assertNotEqual(list(self.out_path.parent.glob(f".{self.out_path.name}.*.tmp")), [])
+
     def test_write_failure_keeps_existing_job_file(self):
         """写入失败（磁盘满/中断）时已有配置必须原样保留：原来是 O_TRUNC 直接覆盖，
         打开瞬间旧文件就没了，失败后磁盘上只剩 0 字节或半截 JSON。"""

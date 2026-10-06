@@ -485,8 +485,11 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
                 # 中断也必须清掉，否则会在 jobs/ 里残留且向导声称"未生成任何文件"
                 try:
                     tmp_path.unlink()
-                except OSError:
-                    pass
+                except OSError as exc:
+                    # 清理失败（Windows 上文件被占用/目录权限变化）不能静默：临时文件里是
+                    # 含明文密钥的完整配置，向导下面还会打印"未生成任何文件"——不提示
+                    # 残留路径，没人会去删这个文件
+                    echo(f"   ⚠️ 清理临时文件失败（{exc}）：{tmp_path} 仍含明文密钥，请手工删除")
                 raise
             if os.name != "nt":
                 # 兜底收紧（mkstemp 本就是 0600）。失败只警告：os.replace 已经完成，

@@ -22,6 +22,10 @@
   `--init-out` 时，默认路径会对已含 root 的相对路径再拼一次 root，静默生成到
   `build/out/build/out/jobs/` 的嵌套目录、调用方按约定路径找不到文件；现在只拼一次。
 
+- **临时文件清理失败不再静默（安全性）**：写盘失败/中断时若含明文密钥的 `.tmp`
+  也删不掉（被占用/权限变化），向导原来静默 pass 并继续声称"未生成任何文件"；
+  现在醒目提示残留路径，提醒手工删除。
+
 - **`sftp.auth` 的凭据字段显式要求字符串（正确性）**：`password` / `key_file` /
   `passphrase` 只做真值判断时，JSON 对象/数组也能通过校验、运行期才在 paramiko 层
   崩；与 `source.root`、`sftp.host`、`sftp.username` 同口径在配置阶段拒绝（错误消息
