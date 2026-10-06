@@ -18,6 +18,10 @@
   AK/SK 留空时明确提示"作业文件里没有可用凭证，需在 --config 提供"，不再静默报
   "已生成成功"、让用户到 `--check` 才发现配置跑不起来。
 
+- **向导默认输出路径不再二次拼接（正确性）**：`workdir` 传相对路径且没给
+  `--init-out` 时，默认路径会对已含 root 的相对路径再拼一次 root，静默生成到
+  `build/out/build/out/jobs/` 的嵌套目录、调用方按约定路径找不到文件；现在只拼一次。
+
 - **`sftp.auth` 的凭据字段显式要求字符串（正确性）**：`password` / `key_file` /
   `passphrase` 只做真值判断时，JSON 对象/数组也能通过校验、运行期才在 paramiko 层
   崩；与 `source.root`、`sftp.host`、`sftp.username` 同口径在配置阶段拒绝（错误消息

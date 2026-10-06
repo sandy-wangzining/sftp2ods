@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -247,6 +248,24 @@ class TestWizardFailurePaths(WizardTestCase):
     def test_out_path_is_directory(self):
         with self.assertRaises(SystemExit):
             self.run_wizard(self.base_script() + self.common_tail(), out_path=self.tmp)
+
+    def test_relative_workdir_path_is_not_double_joined(self):
+        """workdir 传相对路径且 --init-out 留空时，默认输出只拼一次 root：
+        原来会对已含 root 的相对路径再拼一次，静默生成到 build/out/build/out/jobs/ 下。"""
+        script = self.base_script() + self.common_tail()
+        asks = ScriptedAsk(script)
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                rc = init_wizard.run_init(
+                    workdir=Path("build/out"), ask=asks, ask_secret=asks, echo=lambda *_a, **_k: None
+                )
+            finally:
+                os.chdir(cwd)  # Windows 上必须先把 CWD 移出 tmp，否则 TemporaryDirectory 清理失败
+            self.assertEqual(rc, 0)
+            self.assertTrue((Path(tmp) / "build" / "out" / "jobs" / "demo_sftp.json").is_file())
+            self.assertFalse((Path(tmp) / "build" / "out" / "build").exists())
 
     def test_empty_aksk_warns_before_success(self):
         """AK/SK 留空时仍可生成（凭证可以只放 --config），但必须明确提示作业文件里

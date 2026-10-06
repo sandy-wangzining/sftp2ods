@@ -75,6 +75,11 @@
       "file": "sftp2ods/cli.py",
       "title": "吞成返回码 1",
       "reason": "误报（2026-10-06 对照 README「退出码」表）：1 = 运行失败（配置错、连接/下载失败……），--check 里捕获的 SystemExit 正是配置/连接类错误，按文档就是 1；2 只限「命令行参数问题且没做过任何远端操作」，而 --check 会真实列远端目录，前提不成立。"
+    },
+    {
+      "file": "sftp2ods/init_wizard.py",
+      "title": "未捕获的 re.error",
+      "reason": "误报（2026-10-06 实证）：SftpSource.__init__ 已把 re.error 转成 ConfigError（sftp.py:170-172 与 177-179），_read_remote_sample 的 except (ConfigError, OSError, RuntimeError)（init_wizard.py:219）会接住、提示「连接/列目录失败」并返回 None 走三次重选；list_files 只用已编译的 self.file_re.fullmatch，不会再抛。实测 SftpSource(cfg, file_regex='broken_(') 抛 ConfigError 而非 re.error。"
     }
   ]
 }

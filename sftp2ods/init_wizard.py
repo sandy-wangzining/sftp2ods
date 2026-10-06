@@ -440,9 +440,14 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         if webhook:
             job["notify"] = {"webhook": webhook}
 
-        target_path = Path(out_path) if out_path else root / "jobs" / f"{job_name}.json"
-        if not target_path.is_absolute():
-            target_path = root / target_path
+        if out_path:
+            target_path = Path(out_path)
+            if not target_path.is_absolute():
+                target_path = root / target_path
+        else:
+            # 默认路径只用 root 拼一次：root 本身可能是相对路径（workdir 传相对值时），
+            # 不能再走「相对就拼 root」的通用分支——那会拼成 root/root/jobs/... 的嵌套
+            target_path = root / "jobs" / f"{job_name}.json"
         if target_path.is_dir():
             raise SystemExit(
                 f"--init-out 指向的是目录，需要给文件名：{target_path}（例如 {target_path / (job_name + '.json')}）"
