@@ -14,7 +14,7 @@ body:
     id: current
     attributes:
       label: 现在的配置为什么表达不了
-      description: 贴出最接近的作业配置片段和实际文件样例
+      description: 贴出最接近的作业配置片段和实际文件样例（密钥/口令请先脱敏）
     validations:
       required: true
   - type: textarea

@@ -262,7 +262,7 @@ def normalize_job(job: dict) -> dict:
     """把作业配置补齐成"带默认值"的完整形态（让用户配置尽量短）。"""
     job = dict(job)
     check_block_types(job)
-    sftp = dict(job.get("sftp") or {})
+    sftp = dict(_as_mapping(job.get("sftp")) or {})
     if sftp:
         # JSON null / 空串不能靠 setdefault：键已存在时不会补默认值，None 会一路传到连接层
         _fill_default(sftp, "port", 22)
@@ -282,7 +282,7 @@ def normalize_job(job: dict) -> dict:
             _fill_default(auth, "type", "password")
             sftp["auth"] = auth
         job["sftp"] = sftp
-    source = dict(job.get("source") or {})
+    source = dict(_as_mapping(job.get("source")) or {})
     if source:
         # 与 sftp 块同口径：JSON null / 空串也当未配置补默认值（"layout": null 不会静默留在 None）
         _fill_default(source, "layout", "flat")
@@ -291,7 +291,7 @@ def normalize_job(job: dict) -> dict:
         # （结果为空、报"远端目录下没有任何匹配文件"，与真正的配置错指不到一起）。
         source["layout"] = str(source.get("layout") or "flat").strip().lower()
         job["source"] = source
-    parse_cfg = dict(job.get("parse") or {})
+    parse_cfg = dict(_as_mapping(job.get("parse")) or {})
     if parse_cfg:
         # 与 sftp 块同口径：JSON null / 空串也当未配置补默认值
         # （setdefault 对已存在的 null 不生效，"strict_columns": null 会一路传成 None）
@@ -301,15 +301,15 @@ def normalize_job(job: dict) -> dict:
         _fill_default(parse_cfg, "strict_columns", True)
         _fill_default(parse_cfg, "empty_as", "null")
         job["parse"] = parse_cfg
-    target = dict(job.get("target") or {})
+    target = dict(_as_mapping(job.get("target")) or {})
     if target:
         _fill_default(target, "allow_empty", True)
         job["target"] = target
-    missing = dict(job.get("missing") or {})
+    missing = dict(_as_mapping(job.get("missing")) or {})
     _fill_default(missing, "check", True)
     _fill_default(missing, "timezone", DEFAULT_TZ)
     job["missing"] = missing
-    notify = dict(job.get("notify") or {})
+    notify = dict(_as_mapping(job.get("notify")) or {})
     if notify:
         _fill_default(notify, "enabled", True)
         job["notify"] = notify

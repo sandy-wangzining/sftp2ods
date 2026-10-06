@@ -131,7 +131,9 @@ class FakeSftp:
         if path not in self.tree:
             # 与 paramiko 的真实行为一致：目录不存在是 ENOENT（只有这种才当"空目录"）
             raise OSError(errno.ENOENT, "No such file", path)
-        return list(self.tree[path])  # 返回副本：被测代码就地 sort/append 不该污染假 SFTP
+        # 列表与元素都返回副本（浅拷贝）：被测代码就地 sort/append 或改 entry 属性
+        # 都不该污染假 SFTP 的内部状态
+        return [copy.copy(entry) for entry in self.tree[path]]
 
     def stat(self, path):
         """跟随软链的 stat（paramiko SFTPClient.stat 的语义，对应 lstat 版是 listdir_attr）。"""

@@ -312,6 +312,11 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
             if auth_choice != "1":
                 echo(f"   编号 {auth_choice} 不是有效选项，按「密码」继续。")
             password = _ask_secret(ask_secret, "   密码（输入不回显）")
+            while not password.strip():
+                # 空密码写进配置 = 一份必然连不上的作业、向导却报"已生成成功"：
+                # 直接重问（Ctrl+C/EOF 走既有取消出口）
+                echo("   密码不能为空（认证类型选了密码）：请重新输入，或 Ctrl+C 取消后改用密钥认证")
+                password = _ask_secret(ask_secret, "   密码（输入不回显）")
             auth = {"type": "password", "password": password}
         sftp_cfg = {"host": host, "port": port, "username": username, "auth": auth}
 

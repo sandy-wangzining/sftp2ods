@@ -77,15 +77,17 @@ def remove_log_sink(handle) -> None:
     if handle is None:
         return
     with _lock:
+        # close 放进锁内：log() 的快照取在锁内——这样"摘除+关闭"与"取快照"互斥，
+        # 缩小"取完快照后句柄被关"的竞态窗口（锁外关会把窗口开到整个写入过程）
         if handle in _sinks:
             _sinks.remove(handle)
-    try:
-        handle.close()
-    except ValueError:
-        # 句柄已经被关过（同一进程里 main 多次调用时 _detach 会跑两遍）
-        pass
-    except Exception:  # noqa: BLE001 - 关闭失败不影响主流程
-        pass
+        try:
+            handle.close()
+        except ValueError:
+            # 句柄已经被关过（同一进程里 main 多次调用时 _detach 会跑两遍）
+            pass
+        except Exception:  # noqa: BLE001 - 关闭失败不影响主流程
+            pass
 
 
 _logged_once: set = set()

@@ -33,8 +33,9 @@ def validated(job: dict) -> dict:
 
 class TestLoadJson(OfflineTestCase):
     def test_missing_file(self):
-        with self.assertRaises(SystemExit):
-            config.load_json_file(Path("no_such_file_xyz.json"), "作业配置文件")
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit):
+                config.load_json_file(Path(tmp) / "no_such_file_xyz.json", "作业配置文件")
 
     def test_bom_and_valid(self):
         with tempfile.TemporaryDirectory() as tmp:

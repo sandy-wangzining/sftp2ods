@@ -33,7 +33,7 @@ def notify(
         "card": {
             "config": {"wide_screen_mode": True},
             "header": {"template": "red", "title": {"tag": "plain_text", "content": title}},
-            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)}}],
+            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(str(x) for x in lines)}}],
         },
     }
     if footer:
