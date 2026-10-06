@@ -560,6 +560,70 @@ class TestLogSink(OfflineTestCase):
             utils.remove_log_sink(probe)
         self.assertIs(seen["locked"], False)
 
+    def test_closed_sink_is_dropped_silently(self):
+        """句柄被并发 remove_log_sink 关闭（收尾场景）：写它不应触发"写失败"告警。"""
+
+        class Closed:
+            encoding = "utf-8"
+
+            def write(self, *_a):
+                raise ValueError("I/O operation on closed file")
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        sink = Closed()
+        utils.add_log_sink(sink)
+        try:
+            with mock.patch.object(utils, "_warn_log_sink_once") as warn:
+                utils.log("hello")
+            warn.assert_not_called()
+            self.assertNotIn(sink, utils._sinks)
+        finally:
+            utils.remove_log_sink(sink)
+
+    def test_sink_encoding_failure_degrades_not_drops(self):
+        """句柄编码写不了某些字符：replace 降级继续写，不永久摘除整个日志文件。"""
+
+        class GbkOnly:
+            encoding = "gbk"
+
+            def __init__(self):
+                self.data = ""
+
+            def write(self, text):
+                if any(ord(ch) > 255 for ch in text):
+                    raise UnicodeEncodeError("gbk", text, 0, 1, "illegal multibyte sequence")
+                self.data += text
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        sink = GbkOnly()
+        utils.add_log_sink(sink)
+        try:
+            utils.log("hello ✅")  # emoji 在 gbk 里编码不了
+            self.assertIn("hello", sink.data)
+            self.assertIn(sink, utils._sinks)  # 没有被摘除
+        finally:
+            utils.remove_log_sink(sink)
+
+    def test_add_log_sink_deduplicates(self):
+        """同一句柄重复登记只留一份：否则 remove 只摘/关第一个、残留已关闭句柄误报。"""
+        handle = mock.MagicMock()
+        utils.add_log_sink(handle)
+        utils.add_log_sink(handle)
+        try:
+            self.assertEqual(utils._sinks.count(handle), 1)
+        finally:
+            utils.remove_log_sink(handle)
+
     def test_broken_sink_is_closed_when_dropped(self):
         """写失败的 sink 被摘掉时必须顺手关闭：只从列表移除的话句柄会挂到进程退出。"""
 

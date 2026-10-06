@@ -491,9 +491,16 @@ class TestResolveTargetAndDirs(OfflineTestCase):
         with self.assertRaises(SystemExit):
             config.resolve_target(job, {}, make_args())
 
-    def test_safe_job_name_keeps_legal_underscores(self):
-        """只含合法字符的名字（含首尾下划线）原样保留：否则下载目录被改名、旧文件不复用。"""
+    def test_safe_job_name_keeps_legal_lowercase_name(self):
+        """只含合法字符且全小写的名字（含首尾下划线）原样保留：否则下载目录被改名、旧文件不复用。"""
         self.assertEqual(config.safe_job_name({"job": "recon_"}, Path("x.json")), "recon_")
+
+    def test_safe_job_name_case_folds_to_distinct_dirs(self):
+        """含大写字母的名字补哈希：大小写不敏感文件系统上 Recon/recon 不能共用一个下载目录。"""
+        upper = config.safe_job_name({"job": "Recon"}, Path("x.json"))
+        lower = config.safe_job_name({"job": "recon"}, Path("x.json"))
+        self.assertNotEqual(upper, lower)
+        self.assertEqual(lower, "recon")
 
     def test_download_dir_default(self):
         job = minimal_job()
@@ -510,7 +517,8 @@ class TestResolveTargetAndDirs(OfflineTestCase):
             job["job"] = "A"
             plain = config.resolve_download_dir(job, path)
             self.assertNotEqual(dirty, plain, "归一后同名的两个作业不能共用下载目录")
-            self.assertEqual(plain, path.parent / "download" / "A")  # 干净名字保持原名不变
+            # 含大写字母的名字也补哈希：大小写不敏感文件系统上 "A" 与 "a" 会同目录
+            self.assertTrue(plain.name.startswith("A-"), plain)
 
     def test_download_dir_relative_and_absolute(self):
         job = minimal_job()

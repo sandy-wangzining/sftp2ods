@@ -605,13 +605,13 @@ def safe_job_name(job: dict, job_path: Path) -> str:
     还看不出来。
     """
     raw = str(job.get("job") or job_path.stem or "job")
-    if re.fullmatch(r"[0-9A-Za-z_\-]+", raw):
-        # 只含合法字符（含首尾下划线）一律原样保留：再 strip 会把 "recon_" 改成
-        # "recon-<hash>"，注释承诺的"已有下载目录不受影响"就不成立
-        return raw
     cleaned = re.sub(r"[^0-9A-Za-z_\-]", "_", raw)
-    if cleaned and cleaned == raw:
-        return cleaned
+    if cleaned and cleaned == raw and raw.islower():
+        # 只含合法字符且全小写：原样保留（再 strip 会把 "recon_" 改成 "recon-<hash>"，
+        # 注释承诺的"已有下载目录不受影响"就不成立）。含大写字母的名字必须补哈希：
+        # Windows/macOS 默认文件系统大小写不敏感，"Recon" 与 "recon" 会落到同一个
+        # 下载目录、互相扫到对方的文件——名字层面的安全过滤不能漏掉这一维度
+        return raw
     # 过滤后与原名不一致（含全中文/全符号名）时补名字哈希，两个原因：
     # ① 全中文名过滤后为空，退化成常量会共用下载目录；
     # ② 部分 ASCII 的名字会"折叠"——"对账A" 与 "A" 都归一到 "A"，两个作业互扫对方文件。

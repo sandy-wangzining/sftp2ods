@@ -68,7 +68,10 @@ def add_log_sink(handle) -> None:
     """把日志再写一份到文件（--log-file），句柄由调用方负责关闭。"""
     global _log_sink_warned
     with _lock:
-        _sinks.append(handle)
+        # 去重：同一句柄重复登记时，remove 只会摘/关第一个，残留的已关闭句柄会让
+        # 此后每次 log() 都走"写坏"误报路径
+        if handle not in _sinks:
+            _sinks.append(handle)
         _log_sink_warned = False
 
 
@@ -166,12 +169,21 @@ def log(message: str) -> None:
     broken: list = []
     for handle in sinks:
         try:
-            handle.write(line + "\n")
+            try:
+                handle.write(line + "\n")
+            except UnicodeEncodeError:
+                # 与 print 同款降级：句柄编码覆盖不到的字符（生僻字/emoji）replace 后再写，
+                # 不能因一条日志把日志文件的后续输出（含最终失败原因）永久掐掉
+                encoding = getattr(handle, "encoding", None) or "utf-8"
+                handle.write(line.encode(encoding, "replace").decode(encoding, "replace") + "\n")
             handle.flush()
+        except ValueError:
+            # 句柄已被并发 remove_log_sink 关闭（收尾场景）：不是"写坏"，静默剔除
+            broken.append(handle)
         except Exception as exc:  # noqa: BLE001 - 日志文件问题不影响主流程，但必须可见一次
             failed_exc = exc
             broken.append(handle)
-    if failed_exc is not None:
+    if broken:
         with _lock:
             # 从当前列表里剔除写坏的（不用写前快照覆盖：期间新加的 sink 不能丢）
             _sinks[:] = [handle for handle in _sinks if handle not in broken]
@@ -182,6 +194,7 @@ def log(message: str) -> None:
                 handle.close()
             except Exception:  # noqa: BLE001 - 关闭失败不影响主流程
                 pass
+    if failed_exc is not None:
         _warn_log_sink_once(failed_exc)
 
 
