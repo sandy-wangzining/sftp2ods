@@ -31,6 +31,10 @@
   落盘成功后的收尾提示写 stdout 失败（`--init | head` 的 `BrokenPipeError`）不再被
   报成"文件操作失败"、也不会逃出向导（文件已生成就是成功）。
 
+- **表头脏数据不再打挂向导（正确性）**：样本表头含空列名/非字符串时，列匹配
+  （`header.strip()`）与"读到 N 列"展示行（`join`）原来会抛 AttributeError/TypeError
+  traceback、丢掉已填的密码与 AK/SK；现在与 slugify 的 `str(header or "")` 同口径兜底。
+
 - **`sftp.auth` 的凭据字段显式要求字符串（正确性）**：`password` / `key_file` /
   `passphrase` 只做真值判断时，JSON 对象/数组也能通过校验、运行期才在 paramiko 层
   崩；与 `source.root`、`sftp.host`、`sftp.username` 同口径在配置阶段拒绝（错误消息

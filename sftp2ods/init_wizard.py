@@ -176,7 +176,7 @@ def _match_columns(headers: list[str], raw: str, echo=print, names=None) -> set[
                 echo(f"   列号 {token} 超出范围（1~{len(headers)}），已忽略")
             continue
         lowered = token.lower()
-        matches = [i for i, header in enumerate(headers) if header.strip().lower() == lowered]
+        matches = [i for i, header in enumerate(headers) if str(header or "").strip().lower() == lowered]
         if names:
             matches += [i for i, name in enumerate(names) if str(name).lower() == lowered]
         if matches:
@@ -262,7 +262,9 @@ def _collect_sample_headers(ask, echo, sftp_cfg: dict, source_cfg: dict) -> list
         else:
             return None
         if headers:
-            echo(f"   读到 {len(headers)} 列：{'、'.join(headers[:6])}{' 等' if len(headers) > 6 else ''}")
+            echo(
+                f"   读到 {len(headers)} 列：{'、'.join(str(h or '') for h in headers[:6])}{' 等' if len(headers) > 6 else ''}"
+            )
             return headers
         echo("   没拿到表头，可以重选来源。")
     return None

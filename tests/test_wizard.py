@@ -615,6 +615,24 @@ class TestSlugAndColumns(OfflineTestCase):
         self.assertEqual(init_wizard._match_columns(headers, "1, Amount"), {0, 1})
         self.assertEqual(init_wizard._match_columns(headers, "9"), set())
 
+    def test_match_columns_tolerates_non_string_headers(self):
+        """表头含 None/数字（空列名等脏数据）时不能抛 AttributeError 打挂向导：
+        与 slugify 的 str(header or "") 同口径。"""
+        self.assertEqual(init_wizard._match_columns([None, "Order ID", 123], "1, Order ID"), {0, 1})
+
+    def test_collect_sample_headers_tolerates_non_string_headers(self):
+        """表头展示行（'读到 N 列：…'）不能因非字符串表头 join 抛 TypeError。"""
+        echoes: list = []
+        with mock.patch.object(init_wizard, "_read_local_sample", return_value=[None, "Order ID", 123]):
+            headers = init_wizard._collect_sample_headers(
+                lambda p="": "2",  # ⑤ 表头来源 = 本地 CSV
+                lambda *a: echoes.append(" ".join(str(x) for x in a)),
+                {},
+                {},
+            )
+        self.assertEqual(headers, [None, "Order ID", 123])
+        self.assertTrue(any("读到 3 列" in e for e in echoes), echoes)
+
 
 if __name__ == "__main__":
     unittest.main()
