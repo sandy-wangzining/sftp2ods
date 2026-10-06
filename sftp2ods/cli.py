@@ -177,7 +177,9 @@ def _open_log_file(path_text: str):
     """打开 --log-file 指定的日志文件（追加、UTF-8、父目录自动创建）；没指定返回 None。"""
     if not path_text:
         return None
-    path = Path(path_text)
+    # 展开 ~：调度平台把参数写成 "~/logs/x.log"（带引号时 shell 不展开）时，
+    # 字面量 "~" 会在 CWD 下建目录、日志落错位置（排障时以为进程没跑）
+    path = Path(path_text).expanduser()
     if path.is_dir():
         raise SystemExit(f"--log-file 指向的是目录，需要给文件名：{path}（如 {path / 'run.log'}）")
     try:
