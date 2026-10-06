@@ -483,13 +483,20 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
             except BaseException:
                 # 含 BaseException（Ctrl+C/SystemExit）：临时文件里是含密钥的完整配置，
                 # 中断也必须清掉，否则会在 jobs/ 里残留且向导声称"未生成任何文件"
-                try:
-                    tmp_path.unlink()
-                except OSError as exc:
-                    # 清理失败（Windows 上文件被占用/目录权限变化）不能静默：临时文件里是
-                    # 含明文密钥的完整配置，向导下面还会打印"未生成任何文件"——不提示
-                    # 残留路径，没人会去删这个文件
-                    echo(f"   ⚠️ 清理临时文件失败（{exc}）：{tmp_path} 仍含明文密钥，请手工删除")
+                if not tmp_path.exists():
+                    # os.replace 已把 tmp 移走、只是中断恰好落在 written_path 赋值之前：
+                    # 配置已完整落盘，记下状态（外层按"文件已写全"报告），没有 tmp 要清
+                    written_path = target_path
+                else:
+                    try:
+                        tmp_path.unlink()
+                    except FileNotFoundError:
+                        pass  # 竞态：文件已经不在了，没有残留
+                    except OSError as exc:
+                        # 清理失败（Windows 上文件被占用/目录权限变化）不能静默：临时文件里是
+                        # 含明文密钥的完整配置，向导下面还会打印"未生成任何文件"——不提示
+                        # 残留路径，没人会去删这个文件
+                        echo(f"   ⚠️ 清理临时文件失败（{exc}）：{tmp_path} 仍含明文密钥，请手工删除")
                 raise
             if os.name != "nt":
                 # 兜底收紧（mkstemp 本就是 0600）。失败只警告：os.replace 已经完成，
@@ -517,18 +524,33 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         except KeyboardInterrupt:
             # 文件已在 os.replace 时写全：中断只打断收尾提示，不能返回 130 让调用方
             # 以为失败、更不能再报"未生成任何文件"（含密钥的文件其实已在磁盘上）
-            echo("")
-            echo(f"✅ 已生成：{target_path}（Ctrl+C 落在收尾阶段，文件已写全）")
+            try:
+                echo("")
+                echo(f"✅ 已生成：{target_path}（Ctrl+C 落在收尾阶段，文件已写全）")
+            except OSError:
+                pass  # stdout 同时关了就静默：文件已落盘，结论不因提示写不出去而改变
+        except OSError:
+            # 收尾提示写 stdout 失败（管道对端退出/终端关闭，BrokenPipeError 是 OSError
+            # 子类）：配置已在 os.replace 时完整落盘，这段 IO 失败不影响结果——不能落进
+            # 外层"文件操作失败"分支（会报出与磁盘状态相反的结论），也不能逃出 run_init
+            pass
         return 0
     except ConfigError as exc:
         echo("")
         echo(f"配置不合法：{exc}")
         return 1
     except OSError as exc:
-        # 兜底（临时目录创建失败等写文件之外的 OSError）：给一句人话而不是裸 traceback
-        echo("")
-        echo(f"文件操作失败：{exc}")
-        return 1
+        # 兜底（临时目录创建失败等写文件之外的 OSError）：给一句人话而不是裸 traceback。
+        # 文件已在 os.replace 时落盘的话不能再报"文件操作失败"（与磁盘状态相反）
+        try:
+            echo("")
+            if written_path is not None:
+                echo(f"✅ 已生成：{written_path}（后续提示阶段出错：{exc}）")
+            else:
+                echo(f"文件操作失败：{exc}")
+        except OSError:
+            pass  # stdout 也关了：不影响磁盘状态与结论
+        return 0 if written_path is not None else 1
     except EOFError:
         # stdin 关闭/无输入源（`sftp2ods --init <&-`、CI 里没接管道）：cli 的输入包装层
         # 把 ValueError/RuntimeError 一并翻译成 EOFError 才走到这里。这里**只**认 EOFError——
@@ -540,11 +562,14 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         # Ctrl+C 按 README 的退出码约定报 130，与同步流程保持一致。
         # os.replace 已完成时文件已落盘（含明文密钥），不能再报"未生成任何文件"——
         # 那会让操作者以为磁盘上没有这份配置，与内层收尾提示的"文件已写全"自相矛盾
-        echo("")
-        if written_path is not None:
-            echo(f"✅ 已生成：{written_path}（Ctrl+C 落在收尾阶段，文件已写全）")
-        else:
-            echo("已取消，未生成任何文件。")
+        try:
+            echo("")
+            if written_path is not None:
+                echo(f"✅ 已生成：{written_path}（Ctrl+C 落在收尾阶段，文件已写全）")
+            else:
+                echo("已取消，未生成任何文件。")
+        except OSError:
+            pass  # stdout 同时关了就静默：不影响磁盘状态与退出码
         return 130
     except RuntimeError as exc:  # "lost sys.stdin"（没有标准输入）
         if "stdin" not in str(exc):

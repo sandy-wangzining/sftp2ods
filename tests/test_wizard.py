@@ -498,6 +498,52 @@ class TestWizardSampleErrors(WizardTestCase):
         # 残留确实存在（unlink 被模拟失败）——提示里给的路径就是它
         self.assertNotEqual(list(self.out_path.parent.glob(f".{self.out_path.name}.*.tmp")), [])
 
+    def test_interrupt_right_after_replace_reports_written(self):
+        """os.replace 成功但 Ctrl+C 恰落在 written_path 赋值前（字节码间投递）：
+        tmp 已被移走——既不能误报"清理失败/残留密钥"，也不能报"未生成任何文件"。"""
+        script = self.base_script() + self.common_tail()
+        asks = ScriptedAsk(script)
+        echoes: list = []
+        real_replace = init_wizard.os.replace
+
+        def replace_then_interrupt(src, dst):
+            real_replace(src, dst)
+            raise KeyboardInterrupt
+
+        with mock.patch.object(init_wizard.os, "replace", new=replace_then_interrupt):
+            rc = init_wizard.run_init(
+                out_path=str(self.out_path),
+                ask=asks,
+                ask_secret=asks,
+                echo=lambda *a: echoes.append(" ".join(str(x) for x in a)),
+            )
+        self.assertEqual(rc, 130)
+        self.assertTrue(self.out_path.is_file())
+        joined = "\n".join(echoes)
+        self.assertIn("已写全", joined)
+        self.assertNotIn("未生成任何文件", joined)
+        self.assertNotIn("清理临时文件失败", joined)
+
+    def test_broken_stdout_after_write_is_not_reported_as_failure(self):
+        """落盘成功后收尾提示写 stdout 失败（`--init | head` 的 BrokenPipeError）不算失败：
+        返回 0、不报"文件操作失败"，BrokenPipeError 也不逃出 run_init。"""
+        script = self.base_script() + self.common_tail()
+        asks = ScriptedAsk(script)
+        echoes: list = []
+
+        def broken_after_write(*a):
+            text = " ".join(str(x) for x in a)
+            if "已生成" in text:
+                raise BrokenPipeError("stdout closed")
+            echoes.append(text)
+
+        rc = init_wizard.run_init(out_path=str(self.out_path), ask=asks, ask_secret=asks, echo=broken_after_write)
+        self.assertEqual(rc, 0)
+        self.assertTrue(self.out_path.is_file())
+        joined = "\n".join(echoes)
+        self.assertNotIn("文件操作失败", joined)
+        self.assertNotIn("未生成任何文件", joined)
+
     def test_write_failure_keeps_existing_job_file(self):
         """写入失败（磁盘满/中断）时已有配置必须原样保留：原来是 O_TRUNC 直接覆盖，
         打开瞬间旧文件就没了，失败后磁盘上只剩 0 字节或半截 JSON。"""
