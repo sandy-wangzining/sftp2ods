@@ -4,14 +4,19 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# 只在路径缺失时追加（不插到最前面）：避免把仓库根/tests 目录置于标准库与第三方库
+# 之前遮蔽同名模块；按 README 在仓库根运行（或 CI 里 pip install -e .）时，
+# 本地包本来就在搜索路径最前（python -m 会把当前目录放在 sys.path[0]）
+for _path in (Path(__file__).resolve().parents[1], Path(__file__).resolve().parent):
+    if str(_path) not in sys.path:
+        sys.path.append(str(_path))
 
 from _helpers import (  # noqa: E402
     FakeOdps,
@@ -35,6 +40,10 @@ from sftp2ods import state as state_mod  # noqa: E402
 from sftp2ods.utils import FatalSourceError, RunLock, collect_secret_values, redact_secrets  # noqa: E402
 
 HEADERS = ["Order ID", "Settlement amount"]
+
+# mc.write_partition 的调用顺序：第 1 次 batches_factory() 是写前单格大小检查，
+# 第 2 次才是真正写库（见 mc.write_partition._do）。改实现时同步改这里。
+WRITE_PHASE_CALL_INDEX = 2
 
 
 def report(rows) -> bytes:
@@ -72,11 +81,21 @@ class World:
         return True
 
     def __enter__(self):
-        for patcher in self._patches:
-            patcher.start()
-        self.access_logs.clear()
-        self._log_patch = mock.patch.object(cli_mod, "log", self.access_logs.append)
-        self._log_patch.start()
+        started = []
+        try:
+            for patcher in self._patches:
+                patcher.start()
+                started.append(patcher)
+            self.access_logs.clear()
+            self._log_patch = mock.patch.object(cli_mod, "log", self.access_logs.append)
+            self._log_patch.start()
+            started.append(self._log_patch)
+        except BaseException:
+            # 中途失败要把已启动的 patcher 全部回滚：否则全局 mock 留在原地，
+            # 后续用例对着被 mock 的世界跑，故障点还会指向无关的地方
+            for patcher in reversed(started):
+                patcher.stop()
+            raise
         return self
 
     def __exit__(self, *exc_info):
@@ -104,6 +123,29 @@ class CliTestCase(OfflineTestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
+
+
+class TestWorldHarness(CliTestCase):
+    def test_enter_rolls_back_started_patches_on_failure(self):
+        """__enter__ 中途失败时回滚已启动的 patcher，不能把全局 mock 留在原地污染后续用例。"""
+        world = World(self.tmp)
+        first, second = mock.MagicMock(), mock.MagicMock()
+        second.start.side_effect = RuntimeError("boom")
+        world._patches = [first, second]
+        with self.assertRaises(RuntimeError):
+            with world:
+                pass
+        first.stop.assert_called_once_with()
+        second.stop.assert_not_called()
+
+
+class TestBackfillEmptyRemote(CliTestCase):
+    def test_empty_remote_with_range_reports_cleanly(self):
+        """远端一个文件都没有 + 显式区间：干净报"区间没有匹配文件"，不能 min() 空序列崩溃。"""
+        with World(self.tmp) as world:
+            rc = world.sync(start_date="2026-09-01", end_date="2026-09-02")
+        self.assertEqual(rc, 1)
+        self.assertTrue(any("没有任何匹配文件" in line for line in world.access_logs), world.access_logs[-3:])
 
 
 class TestSyncHappyPath(CliTestCase):
@@ -165,6 +207,14 @@ class TestSyncRanges(CliTestCase):
             self.assertIn("pt=20260920", world.table.deleted)
             self.assertIn("pt=20260921", world.table.deleted)
             self.assertNotIn("pt=20260922", world.table.deleted)
+
+    def test_explicit_empty_bizdate_is_arg_error(self):
+        """显式传空 --bizdate（调度脚本 `--bizdate "$pt"` 且 $pt 未定义）不能按"未指定"
+        静默处理：按参数问题报错退出（退出码 2），而不是回退成"处理全部日期"。"""
+        for empty in ("", "   "):
+            msg = cli_mod._check_cli_args(make_args(bizdate=empty))
+            self.assertTrue(msg, "空 bizdate 必须返回错误文案")
+            self.assertIn("日期", msg)
 
     def test_bizdate_with_range_is_rejected(self):
         # 参数互斥在命令行阶段就拦下：退出码 2（参数问题），不进远端流程
@@ -364,10 +414,7 @@ class TestSyncGuards(CliTestCase):
             self.assertEqual(len(world.table.rows_in("20260920")), 1)
             # 源方把文件改坏成"只剩表头"（大小变了 → 台账不命中，会重跑）
             empty = csv_bytes(HEADERS, [])
-            world.fake.contents["/data/report_20260920.csv"] = empty
-            for entry in world.fake.tree["/data"]:
-                if entry.filename == "report_20260920.csv":
-                    entry.st_size = len(empty)
+            world.fake.replace_file("/data/report_20260920.csv", empty)
             self.assertEqual(world.sync(bizdate="20260920"), 1)
             self.assertEqual(len(world.table.rows_in("20260920")), 1, "已有数据被清空了")
             self.assertTrue(any("为避免清空已有数据" in str(line) for line in world.access_logs))
@@ -378,10 +425,7 @@ class TestSyncGuards(CliTestCase):
         with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
             self.assertEqual(world.sync(bizdate="20260920"), 0)
             empty = csv_bytes(HEADERS, [])
-            world.fake.contents["/data/report_20260920.csv"] = empty
-            for entry in world.fake.tree["/data"]:
-                if entry.filename == "report_20260920.csv":
-                    entry.st_size = len(empty)
+            world.fake.replace_file("/data/report_20260920.csv", empty)
             self.assertEqual(world.sync(bizdate="20260920", force=True), 0)
             self.assertEqual(world.table.rows_in("20260920"), [])
 
@@ -399,11 +443,31 @@ class TestSyncGuards(CliTestCase):
             self.assertEqual(world.sync(bizdate="20260920"), 0)
             ledger_path = world.download_dir / state_mod.STATE_FILE_NAME
             ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-            ledger["report_20260920.csv"]["project"] = "other_project"
+            # setdefault + 断言键存在：台账键口径变化时失败信息是"没有该键"，而不是裸 KeyError
+            self.assertIn("report_20260920.csv", ledger)
+            ledger.setdefault("report_20260920.csv", {})["project"] = "other_project"
             ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
             deletes = len(world.table.deleted)
             self.assertEqual(world.sync(bizdate="20260920"), 0)
             self.assertEqual(len(world.table.deleted), deletes + 1)
+
+    def test_corrupted_local_file_is_redownloaded(self):
+        """本地文件被改坏但大小没变（台账 md5 对不上）时必须重新下载：
+
+        原来下载准备阶段按"仅比大小"复用它——损坏数据被重新解析上传、台账 md5 还被覆盖，
+        且永远不会从远端重下。"""
+        data = report([["o1", "1.00"]])
+        with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
+            self.assertEqual(world.sync(bizdate="20260920"), 0)
+            entry = json.loads((world.download_dir / state_mod.STATE_FILE_NAME).read_text(encoding="utf-8"))
+            self.assertIn("report_20260920.csv", entry)
+            local = world.download_dir / "report_20260920.csv"
+            self.assertTrue(local.is_file())
+            local.write_bytes(b"x" * local.stat().st_size)  # 大小不变、内容损坏
+            downloads = len(world.fake.downloaded)
+            self.assertEqual(world.sync(bizdate="20260920"), 0)
+            # 修复后：md5 对不上 → 重新下载
+            self.assertEqual(len(world.fake.downloaded), downloads + 1)
 
     def test_ledger_save_failure_fails_run(self):
         data = report([["o1", "1.00"]])
@@ -605,11 +669,11 @@ class TestSyncInterrupt(CliTestCase):
             calls = {"n": 0}
             real_iter_batches = parse_mod.iter_batches
 
-            def counting(paths, spec):
+            def counting(*args, **kwargs):
                 calls["n"] += 1
-                if calls["n"] >= 2:  # 第 1 次是写前单格大小检查；第 2 次才是真正写库
+                if calls["n"] >= WRITE_PHASE_CALL_INDEX:
                     raise KeyboardInterrupt
-                return real_iter_batches(paths, spec)
+                return real_iter_batches(*args, **kwargs)
 
             with mock.patch.object(parse_mod, "iter_batches", counting):
                 rc = cli_mod.main(["--job", str(world.job_path), "--bizdate", "20260920"])
@@ -657,6 +721,19 @@ class TestMainEntry(CliTestCase):
     def test_negative_sql_timeout_returns_2(self):
         self.assertEqual(cli_mod.main(["--job", "whatever.json", "--sql-timeout", "-1"]), 2)
 
+    def test_empty_systemexit_message_is_not_treated_as_pass(self):
+        """参数校验里捕获到 SystemExit()（空消息）时不能返回空串被当成"校验通过"。"""
+        args = cli_mod.build_parser().parse_args(["--job", "x.json", "--bizdate", "20260101"])
+        with mock.patch.object(cli_mod, "parse_day_arg", side_effect=SystemExit()):
+            problem = cli_mod._check_cli_args(args)
+        self.assertTrue(problem)
+
+    def test_bad_log_file_returns_2(self):
+        """--log-file 指向目录属"参数问题"：按退出码约定报 2（还没做过任何远端操作），
+        不能混进 1（运行失败）让调度按数据故障告警。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(cli_mod.main(["--job", "whatever.json", "--log-file", tmp]), 2)
+
     def test_happy_path(self):
         data = report([["o1", "1.00"]])
         with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
@@ -673,6 +750,22 @@ class TestMainEntry(CliTestCase):
         path = self.tmp / "broken.json"
         path.write_text("{oops", encoding="utf-8")
         self.assertEqual(cli_mod.main(["--job", str(path)]), 1)
+
+    def test_init_errors_map_to_exit_codes(self):
+        """--init 分支与其它分支同口径：配置/文件错 → 1（记日志），Ctrl+C → 130，不留裸 traceback。"""
+        from sftp2ods import init_wizard
+
+        with mock.patch.object(init_wizard, "run_init", side_effect=SystemExit("--init-out 指向的是目录")):
+            self.assertEqual(cli_mod.main(["--init"]), 1)
+        with mock.patch.object(init_wizard, "run_init", side_effect=KeyboardInterrupt):
+            self.assertEqual(cli_mod.main(["--init"]), 130)
+
+    def test_init_unexpected_error_is_logged_not_bare_traceback(self):
+        """向导内部未预期异常：记一笔真实错误（不是"已取消"）并按 1 退出，不抛裸 traceback。"""
+        from sftp2ods import init_wizard
+
+        with mock.patch.object(init_wizard, "run_init", side_effect=ValueError("内部解析出错")):
+            self.assertEqual(cli_mod.main(["--init"]), 1)
 
     def test_check_flag(self):
         data = report([["o1", "1.00"]])
@@ -707,6 +800,58 @@ class TestMainEntry(CliTestCase):
             with mock.patch.dict("os.environ", {"bizdate": "oops"}, clear=False):
                 self.assertEqual(cli_mod.main(["--job", str(world.job_path)]), 1)
 
+    def test_explicit_range_wins_over_env_bizdate(self):
+        """调度环境里 bizdate 总存在；显式补数区间必须优先，不能被"单日 vs 区间"互斥拦下。"""
+        files = {
+            "/data/report_20260920.csv": report([["o1", "1.00"]]),
+            "/data/report_20260921.csv": report([["o2", "2.00"]]),
+        }
+        with World(self.tmp, files=files) as world:
+            with mock.patch.dict("os.environ", {"bizdate": "20260922"}, clear=False):
+                rc = cli_mod.main(
+                    ["--job", str(world.job_path), "--start-date", "2026-09-20", "--end-date", "2026-09-21"]
+                )
+            self.assertEqual(rc, 0)
+            self.assertEqual(sorted(world.table.deleted), ["pt=20260920", "pt=20260921"])
+
+
+class TestSyncLedgerKeyMismatch(CliTestCase):
+    def test_ledger_rows_track_local_file_not_remote_name(self):
+        """台账键的 basename 与远端文件名不同口径时，行数按本地落地文件记录，不能再 KeyError。
+
+        原实现：行数按 path.name 累积、却按 item.name 取值——两把键不一致时数据已入库、
+        台账写不进去，异常还会穿透 run_sync 变成裸 traceback。
+        """
+        data = report([["o1", "1.00"]])
+        with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
+            item = sftp_mod.RemoteFile(
+                date="20260920",
+                name="report_20260920.csv",
+                size=len(data),
+                remote="/data/report_20260920.csv",
+                ledger_key="20260920/renamed.csv",
+            )
+            with mock.patch.object(sftp_mod.SftpSource, "list_files", lambda self: {"20260920": [item]}):
+                self.assertEqual(world.sync(bizdate="20260920"), 0)
+            self.assertEqual(world.ledger()["20260920/renamed.csv"]["rows"], 1)
+
+
+class TestLifecycleDays(CliTestCase):
+    def test_nan_and_infinity_rejected(self):
+        # json.load 默认接受 NaN/Infinity 字面量：原来 float(raw) != int(raw) 会对 NaN 抛
+        # 未捕获的 ValueError（裸 traceback），现在统一给 SystemExit
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.assertRaises(SystemExit):
+                cli_mod._lifecycle_days({"lifecycle_days": bad})
+
+    def test_positive_int_values(self):
+        self.assertEqual(cli_mod._lifecycle_days({"lifecycle_days": 30}), 30)
+        self.assertEqual(cli_mod._lifecycle_days({"lifecycle_days": 30.0}), 30)
+        self.assertIsNone(cli_mod._lifecycle_days({}))
+        for bad in (True, 0, -1, 2.5, "30"):
+            with self.assertRaises(SystemExit):
+                cli_mod._lifecycle_days({"lifecycle_days": bad})
+
 
 class TestRedactionHelpers(CliTestCase):
     def test_redact_job_masks_configured_secrets(self):
@@ -716,6 +861,73 @@ class TestRedactionHelpers(CliTestCase):
         out = redact_secrets(collect_secret_values(job), text)
         self.assertNotIn("secret-pw", out)
         self.assertNotIn("abc12345", out)
+
+    def test_redact_job_includes_config_secrets(self):
+        """异常文本里回显的 --config 明文也要遮：凭证常只写 --config（作业文件里是
+        ${secrets.xxx}），SDK 报错回显的 AK/密码来自 config 那份，只收作业文件的密钥值会漏遮。"""
+        job = minimal_job()
+        config = {"maxcompute": {"access_key_secret": "cfgs-ec-ret-abcdef12"}}
+        out = cli_mod._redact_job(job, "boom: cfgs-ec-ret-abcdef12", config)
+        self.assertNotIn("cfgs-ec-ret-abcdef12", out)
+        self.assertIn("***", out)
+
+    def test_prepare_stage_error_masks_config_secrets(self):
+        """凭证只写在 --config 的 secrets 里时，准备阶段的报错也不能回显明文。
+
+        作业文件里只有 ${secrets.tbl} 时，只按 job_raw 收密钥值会漏遮（把配置里的值
+        原样打进日志/--log-file）；这里断言两份配置一起参与值级脱敏。
+        """
+        job = minimal_job(target={"project": "demo_project", "table": "${secrets.tbl}"})
+        config_path = self.tmp / "config.json"
+        config_path.write_text(json.dumps({"secrets": {"tbl": "my table"}}), encoding="utf-8")
+        with World(self.tmp, job=job) as world:
+            rc = cli_mod.main(["--job", str(world.job_path), "--config", str(config_path), "--check"])
+            joined = "\n".join(str(line) for line in world.access_logs)
+        self.assertEqual(rc, 1)
+        self.assertNotIn("my table", joined)
+        self.assertIn("***", joined)
+
+
+class TestPromptSecret(CliTestCase):
+    def test_getpass_success(self):
+        with mock.patch.object(cli_mod.getpass, "getpass", return_value="hidden"):
+            self.assertEqual(cli_mod.prompt_secret(), "hidden")
+
+    def test_fallback_warns_that_input_echoes(self):
+        logs = []
+        with mock.patch.object(cli_mod.getpass, "getpass", side_effect=EOFError()):
+            with mock.patch.object(cli_mod, "log", logs.append):
+                with mock.patch("builtins.input", return_value="echoed"):
+                    self.assertEqual(cli_mod.prompt_secret(), "echoed")
+        self.assertTrue(any("明文回显" in str(line) for line in logs), logs)
+
+    def test_unexpected_errors_are_not_swallowed(self):
+        with mock.patch.object(cli_mod.getpass, "getpass", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                cli_mod.prompt_secret()
+
+
+class TestLockDirOverride(CliTestCase):
+    """SFTP2ODS_LOCK_DIR：把锁钉在固定目录，避免不同身份/TMPDIR 下互斥静默失效。"""
+
+    def test_env_override_pins_location(self):
+        pinned = self.tmp / "shared-locks"
+        with mock.patch.dict(os.environ, {"SFTP2ODS_LOCK_DIR": str(pinned)}):
+            path = cli_mod._lock_path(self.tmp / "jobs" / "demo.json")
+            again = cli_mod._lock_path(self.tmp / "jobs" / "demo.json")
+        self.assertEqual(path.parent, pinned)
+        self.assertEqual(path, again)
+        self.assertTrue(path.name.endswith(".lock"))
+
+    def test_env_override_unusable_fails_loudly(self):
+        """显式指定的锁目录不可用要立刻报错（静默换目录就等于互斥失效）。"""
+        with (
+            mock.patch.dict(os.environ, {"SFTP2ODS_LOCK_DIR": str(self.tmp / "ro" / "locks")}),
+            mock.patch.object(Path, "mkdir", side_effect=OSError("只读")),
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                cli_mod._lock_path(self.tmp / "jobs" / "demo.json")
+        self.assertIn("SFTP2ODS_LOCK_DIR", str(ctx.exception))
 
 
 if __name__ == "__main__":

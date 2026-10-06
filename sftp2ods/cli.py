@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import hashlib
+import math
 import os
 import sys
 import tempfile
@@ -56,6 +57,7 @@ from .utils import (
     as_bool,
     collect_secret_values,
     log,
+    redact,
     redact_secrets,
     reset_log_once,
     setup_console,
@@ -64,6 +66,27 @@ from .utils import (
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = ROOT / "config.json"
 MISSING_SHOW_LIMIT = 20  # 飞书/日志里最多列多少个缺失日期（防刷屏）
+
+_GETPASS_ERRORS = (EOFError, OSError)
+_GetPassWarning = getattr(getpass, "GetPassWarning", None)
+if isinstance(_GetPassWarning, type) and issubclass(_GetPassWarning, BaseException):
+    _GETPASS_ERRORS = (*_GETPASS_ERRORS, _GetPassWarning)
+
+
+def prompt_secret(prompt: str = "") -> str:
+    """密钥输入：优先 getpass 不回显；没有 tty 时退回 input() 并明确告警会明文回显。"""
+    if prompt:
+        log(prompt)
+    try:
+        return getpass.getpass("")
+    except _GETPASS_ERRORS:
+        log("警告：无法隐藏输入，接下来的内容会明文回显在终端上")
+        try:
+            return input()
+        except (EOFError, ValueError, RuntimeError) as exc:
+            # stdin 关闭/无输入源：统一翻译成 EOFError（= 取消），别让裸 ValueError 冒泡——
+            # 向导顶层若按 ValueError 判"取消"，会把向导内部无关的 ValueError 也一起吞掉
+            raise EOFError("标准输入不可用") from exc
 
 
 # =============================================================================
@@ -100,7 +123,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default="", help=f"可选的共享凭证文件（默认 {DEFAULT_CONFIG_PATH}，没有就不读）")
     parser.add_argument("--check", action="store_true", help="只体检：配置 + SFTP 连通 + 目标表结构（不下载）")
     parser.add_argument(
-        "--bizdate", default="", help="只处理该日期的文件（yyyyMMdd 或 yyyy-MM-dd；默认读环境变量 bizdate）"
+        "--bizdate",
+        default=None,
+        # 默认必须是 None 而不是 ""：空串无法区分"没传 --bizdate"与"显式传了空值"
+        # （调度脚本 `--bizdate "$pt"` 且 $pt 未定义）——后者要报错，不能静默回退处理全部日期
+        help="只处理该日期的文件（yyyyMMdd 或 yyyy-MM-dd；默认读环境变量 bizdate）",
     )
     parser.add_argument("--start-date", default="", help="补数/调试：起始日期（含），可与 --end-date 单独使用")
     parser.add_argument("--end-date", default="", help="补数/调试：结束日期（含）")
@@ -132,11 +159,13 @@ def _check_cli_args(args) -> str:
         # 负数在 run_sql_with_timeout 里会被当成"0=不限制"，与用户直觉相反（想调小却等成无限）
         return "--sql-timeout 不能为负（0 表示不限制）"
     try:
-        bizday = parse_day_arg(args.bizdate) if args.bizdate else None
+        bizday = parse_day_arg(args.bizdate) if args.bizdate is not None else None
         start = norm_date(args.start_date, "--start-date") if args.start_date else ""
         end = norm_date(args.end_date, "--end-date") if args.end_date else ""
     except SystemExit as exc:
-        return str(exc)
+        # SystemExit(0)/空消息时 str(exc) 是空串，会被 main 当成"校验通过"继续跑——
+        # 这里给一句兜底文案，保证"捕获到异常"一定对应"有错误信息"
+        return str(exc) or f"参数校验失败（{type(exc).__name__}，无消息）"
     if bizday and (start or end):
         return "--bizdate 与 --start-date/--end-date 互斥，请二选一"
     if start and end and start > end:
@@ -148,7 +177,9 @@ def _open_log_file(path_text: str):
     """打开 --log-file 指定的日志文件（追加、UTF-8、父目录自动创建）；没指定返回 None。"""
     if not path_text:
         return None
-    path = Path(path_text)
+    # 展开 ~：调度平台把参数写成 "~/logs/x.log"（带引号时 shell 不展开）时，
+    # 字面量 "~" 会在 CWD 下建目录、日志落错位置（排障时以为进程没跑）
+    path = Path(path_text).expanduser()
     if path.is_dir():
         raise SystemExit(f"--log-file 指向的是目录，需要给文件名：{path}（如 {path / 'run.log'}）")
     try:
@@ -170,29 +201,78 @@ def _detach_log_sink(handle) -> None:
 def _lock_path(job_path: Path) -> Path:
     """每个作业一把运行锁（不同作业可并行，同一作业不会重复跑）。
 
-    优先放工具目录下 .run-locks/；工具目录不可写（如 pip 装在只读位置）时退回系统临时目录。
+    锁目录优先级：环境变量 SFTP2ODS_LOCK_DIR > 工具目录下 .run-locks/ > 系统临时目录
+    （工具目录不可写，如 pip 装在只读位置时）。用 SFTP2ODS_LOCK_DIR 可以把锁钉在与运行者
+    身份/环境无关的同一目录上——否则"root 能写工具目录、普通用户退回 TMPDIR"这类差异会让
+    同一作业的两个实例锁在不同文件上，互斥静默失效；指到共享存储（如 NFS）时多机也能互斥
+    （文件系统不支持锁会告警并降级）。
     锁名带路径哈希：jobs/a/api.json 与 jobs/b/api.json 同名不同作业，只按文件名会互相阻塞。
     """
     stem = job_path.stem or "job"
-    digest = hashlib.sha1(str(job_path).encode("utf-8")).hexdigest()[:8]
+    # sha256 截 16 位十六进制：sha1 只取 8 位（32 位）时不同作业有可观的碰撞概率，
+    # 撞了会互相阻塞（解锁时还可能删错对方的锁）。
+    # 摘要先 resolve（绝对化/展开 ~/消解 .. 与软链接）：同一作业用相对/绝对路径两种写法
+    # 原来会落到两把锁上、互斥静默失效（两个进程同删同写一个分区）
+    digest = hashlib.sha256(os.fsencode(str(Path(job_path).expanduser().resolve()).encode("utf-8"))).hexdigest()[:16]
     name = f"{stem}-{digest}"
+    override = os.environ.get("SFTP2ODS_LOCK_DIR", "").strip()
+    if override:
+        base = Path(override).expanduser()
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            # 显式指定的目录不可用要立刻失败：静默换目录等于互斥失效，正是这个开关要防的事
+            raise SystemExit(f"SFTP2ODS_LOCK_DIR 指定的锁目录不可用（{exc}）：{base}") from exc
+        return base / f"{name}.lock"
     candidates = [ROOT / ".run-locks", Path(tempfile.gettempdir()) / "sftp2ods-locks"]
-    for base in candidates:
+    for index, base in enumerate(candidates):
         try:
             base.mkdir(parents=True, exist_ok=True)
             # 探测文件名必须唯一（mkstemp）：并发启动时别的进程先 unlink 会让探测抛 FileNotFoundError
             handle, probe = tempfile.mkstemp(prefix=".probe-", dir=str(base))
             os.close(handle)
-            os.unlink(probe)
-            return base / f"{name}.lock"
         except OSError:
             continue
-    return Path(tempfile.gettempdir()) / f"sftp2ods-{name}.lock"
+        try:
+            os.unlink(probe)
+        except OSError:
+            # 探测文件删不掉（少见）不该把整个目录判成不可用——否则会静默换目录，
+            # 同一作业的两个实例锁在不同路径上，互斥失效
+            pass
+        if index > 0:
+            # 退回目录按用户/环境解析（TMPDIR、macOS /var/folders、systemd PrivateTmp）：
+            # 不同身份/环境跑同一作业可能拿到不同目录、互斥静默失效——至少把事实说出来
+            log(
+                f"  提示：工具目录不可写，运行锁放在 {base}；"
+                f"若存在多用户/多环境混跑，请用 SFTP2ODS_LOCK_DIR 固定同一锁目录"
+            )
+        return base / f"{name}.lock"
+    fallback = Path(tempfile.gettempdir()) / f"sftp2ods-{name}.lock"
+    log(
+        f"  警告：工具目录与系统临时目录都不可写，运行锁临时退回 {fallback}；"
+        f"请用 SFTP2ODS_LOCK_DIR 指定一个可写的固定锁目录，否则并发保护可能失效"
+    )
+    return fallback
 
 
-def _redact_job(job: dict, text) -> str:
-    """作业上下文下的脱敏：先按配置里的密钥值遮，再走形态规则兜底。"""
-    return redact_secrets(collect_secret_values(job), str(text))
+def _redact_job(job: dict, text, config: dict | None = None) -> str:
+    """作业上下文下的脱敏：按作业（连同 --config）里的密钥值遮，再走形态规则兜底。
+
+    凭证常只写在 --config 的 secrets/maxcompute 里、作业文件只写 ${secrets.xxx}：
+    SDK 异常回显出的 AK/密码来自 config 那份明文，只收作业文件的密钥值会漏遮。
+    """
+    nodes = (job,) if config is None else (job, config)
+    return _redact_configs(str(text), *nodes)
+
+
+def _redact_configs(text, *nodes) -> str:
+    """多份配置一起做值级脱敏（作业文件 + --config 文件）。
+
+    凭证常只写在 --config 的 secrets/maxcompute 里、作业文件只写 ${secrets.xxx}，
+    按单份配置收密钥值会漏遮另一份里回显出来的明文。
+    """
+    secrets = [value for node in nodes for value in collect_secret_values(node)]
+    return redact_secrets(secrets, str(text))
 
 
 def _cred_source_label(config_path: Path, job_path: Path) -> str:
@@ -222,7 +302,14 @@ def _lifecycle_days(target_cfg: dict) -> int | None:
     raw = target_cfg.get("lifecycle_days")
     if raw is None or raw == "":
         return None
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or float(raw) != int(raw) or int(raw) <= 0:
+    if (
+        isinstance(raw, bool)
+        or not isinstance(raw, (int, float))
+        # NaN/Infinity 先挡掉：json.load 默认接受这些字面量，而 float(raw) != int(raw)
+        # 会对 NaN 直接抛 ValueError（裸 traceback）；浮点相等比较也不可靠，改判 is_integer()
+        or (isinstance(raw, float) and (not math.isfinite(raw) or not raw.is_integer()))
+        or raw <= 0
+    ):
         raise SystemExit(f"target.lifecycle_days 必须是正整数（天），实际 {raw!r}")
     return int(raw)
 
@@ -270,7 +357,7 @@ def run_check(job: dict, config: dict, args, job_path: Path, config_path: Path |
     """体检：配置概要 + SFTP 真实列目录 + 目标表结构。新接一个源时先跑这个。"""
     log("== 作业概要 ==")
     for line in build_job_summary(job):
-        log(_redact_job(job, line))
+        log(_redact_job(job, line, config))
 
     log("")
     log("== SFTP 连通性（真实列目录） ==")
@@ -283,7 +370,7 @@ def run_check(job: dict, config: dict, args, job_path: Path, config_path: Path |
         )
         if sample:
             date, item = sample
-            log(f"  最新样本：{date}/{item.name}（{item.size:,} 字节）")
+            log(f"  最新样本：{date}/{item.name}（{item.size_text}）")
         else:
             log("  ⚠️ 远端目录下没有匹配文件（检查 source.root / file_regex / 源方是否已产出）")
         missing_cfg = job.get("missing") or {}
@@ -305,7 +392,7 @@ def run_check(job: dict, config: dict, args, job_path: Path, config_path: Path |
     except SystemExit:
         raise
     except Exception as exc:  # noqa: BLE001
-        log(f"  ❌ {_redact_job(job, exc)}")
+        log(f"  ❌ {_redact_job(job, exc, config)}")
         return 1
 
     log("")
@@ -329,10 +416,10 @@ def run_check(job: dict, config: dict, args, job_path: Path, config_path: Path |
             mc_mod.verify_table_schema(table, table_name, parse_spec.columns)
             log(f"  ✅ {table_name} 结构符合（{len(parse_spec.columns)} 列 + pt）")
     except SystemExit as exc:
-        log(f"  ❌ {_redact_job(job, exc)}")
+        log(f"  ❌ {_redact_job(job, exc, config)}")
         return 1
     except Exception as exc:  # noqa: BLE001
-        log(f"  ❌ 连接/校验失败：{_redact_job(job, exc)}")
+        log(f"  ❌ 连接/校验失败：{_redact_job(job, exc, config)}")
         return 1
 
     log("")
@@ -376,7 +463,7 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
     except SystemExit:
         raise
     except Exception as exc:  # noqa: BLE001 - 连接/列目录失败统一按失败退出
-        log(f"❌ 列远端文件失败：{_redact_job(job, exc)}")
+        log(f"❌ 列远端文件失败：{_redact_job(job, exc, config)}")
         return 1
 
     if not files_by_date:
@@ -396,7 +483,7 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
             for item in date_files:
                 sftp_mod.local_path_within(download_dir, item.ledger_key, item.name)
     except FatalSourceError as exc:
-        log(f"❌ {_redact_job(job, exc)}")
+        log(f"❌ {_redact_job(job, exc, config)}")
         return 1
 
     missing_cfg = job.get("missing") or {}
@@ -448,10 +535,17 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
         # 返回 0 会让人以为"补数成功"，比失败更危险（本家族红线：宁可失败不可静默丢数）。
         # 与 1.4.0「显式单日缺文件 → 失败」同口径，--force 是"我知道这段可能没数"的显式放行开关。
         # proc_dates 只看"远端有没有文件"，与台账无关——区间内文件都已上传时它是非空、不会误判。
+        # 远端目录一个文件都没有时，"数据范围"没有意义：直接取 min/max 会 ValueError
+        # （配置写错/源方还没上传时正好走这一支，崩溃会盖掉真正要给的提示）
+        data_range = (
+            f"{min(all_dates)} ~ {max(all_dates)}"
+            if all_dates
+            else "无（远端目录当前没有任何匹配文件，请检查 source 配置）"
+        )
         log(
             f"❌ 【{job_name}】补数区间在远端没有任何匹配文件"
             f"（--start-date {start or '-'}，--end-date {end or '-'}）；"
-            f"远端数据范围 {min(all_dates)} ~ {max(all_dates)}，本区间不会有任何产出。"
+            f"远端数据范围 {data_range}，本区间不会有任何产出。"
             f"若源方确实不产数、确认要空跑，请加 --force 明确继续"
         )
         return 1
@@ -515,7 +609,7 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
         except SystemExit:
             raise
         except Exception as exc:  # noqa: BLE001
-            log(f"❌ 连接/建表失败：{_redact_job(job, exc)}")
+            log(f"❌ 连接/建表失败：{_redact_job(job, exc, config)}")
             return 1
 
     # ---- ③ 逐日期：跳过已上传 → 下载 → 解析 → 写 pt → 校验 ----
@@ -569,37 +663,57 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
         # 下载该日期下所有文件（本地已有且大小一致的不重下）
         local_paths: list[Path] = []
         for item in items:
-            existing = _pick_local(download_dir, item)
+            # 复用本地文件时要带上台账里的 md5（与 done() 同口径）：内容被改坏/损坏但大小
+            # 没变时原来会按"仅比大小"复用它——损坏数据被重新解析上传、台账 md5 还被覆盖，
+            # 而且永远不再从远端重下
+            keys = (item.ledger_key,) if item.ledger_key == item.name else (item.ledger_key, item.name)
+            record = state_mod.record_of(ledger, keys, item.size, table_name, date, project=project)
+            existing = _pick_local(download_dir, item, md5=str((record or {}).get("md5") or ""))
             if existing is not None:
                 local_paths.append(existing)
                 continue
-            log(f"下载 {date}/{item.name}（{item.size:,} 字节）...")
+            log(f"下载 {date}/{item.name}（{item.size_text}）...")
             try:
                 local_paths.append(source.download(item, download_dir / item.ledger_key))
             except FatalSourceError as exc:
-                log(f"❌ {_redact_job(job, exc)}")
+                log(f"❌ {_redact_job(job, exc, config)}")
                 return 1
-            except Exception as exc:  # noqa: BLE001
-                log(f"❌ 下载 {item.name} 失败：{_redact_job(job, exc)}")
+            except (ConfigError, OSError, RuntimeError) as exc:
+                # 只接预期的下载/连接类错误（FatalSourceError 与重试耗尽都是 RuntimeError 子类）；
+                # TypeError/AttributeError 这类代码缺陷继续上抛，不能被"下载失败"掩盖成数据问题
+                log(f"❌ 下载 {item.name} 失败：{_redact_job(job, exc, config)}")
                 return 1
 
-        # 先完整解析一遍数行数（表头校验、合计行校验都在这趟完成；坏文件在写库前就拦住）
-        file_rows: dict[str, int] = {}
+        # 先完整解析一遍数行数（表头校验、合计行校验都在这趟完成；坏文件在写库前就拦住）。
+        # 行数按 local_paths 的顺序存列表：用 path.name 当键有两个坑——台账键与远端文件名
+        # 不同口径时下面按 item.name 取值会 KeyError；同一天两个文件重名时会互相覆盖、行数偏小
+        # 源文件总大小不超过 REUSE_ROWS_MAX_BYTES 时把行缓存下来给写库复用，避免再扫一遍。
+        file_rows: list[int] = []
+        prepared_rows: list[list] | None = None
         try:
+            reuse = parse_mod.source_bytes(local_paths) <= parse_mod.REUSE_ROWS_MAX_BYTES
+            collected: list[list] = []
             for path in local_paths:
                 stats = {"skipped": 0}
-                file_rows[path.name] = sum(1 for _ in parse_spec.iter_rows(path, stats))
+                if reuse:
+                    rows_list = list(parse_spec.iter_rows(path, stats))
+                    file_rows.append(len(rows_list))
+                    collected.extend(rows_list)
+                else:
+                    file_rows.append(sum(1 for _ in parse_spec.iter_rows(path, stats)))
                 if stats["skipped"]:
                     log(f"  {path.name}：跳过 {stats['skipped']} 行（命中 skip_if_empty 的空键行）")
                 extras = stats.get("extra_headers") or []
                 if extras:
                     note_extra_headers(path.name, extras)
+            if reuse:
+                prepared_rows = collected
         except SystemExit:
             raise
         except Exception as exc:  # noqa: BLE001
-            log(f"❌ 解析失败：{_redact_job(job, exc)}")
+            log(f"❌ 解析失败：{_redact_job(job, exc, config)}")
             return 1
-        rows = sum(file_rows.values())
+        rows = sum(file_rows)
         total_rows += rows
         log(f"{date}：{len(local_paths)} 个文件，{rows:,} 行 → pt={date}")
         if args.dry_run:
@@ -616,7 +730,7 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
                 try:
                     existing = mc_mod.count_partition(o, project, table_name, date, timeout=args.sql_timeout)
                 except Exception as exc:  # noqa: BLE001 - 查询失败按写库失败处理（宁可不写）
-                    log(f"❌ pt={date} 写前查询现有分区行数失败：{_redact_job(job, exc)}")
+                    log(f"❌ pt={date} 写前查询现有分区行数失败：{_redact_job(job, exc, config)}")
                     return 1
                 if existing:
                     log(
@@ -628,13 +742,22 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
 
         try:
             mc_mod.write_partition(
-                table, table_name, date, lambda paths=local_paths: parse_mod.iter_batches(paths, parse_spec), rows
+                o,
+                table,
+                project,
+                table_name,
+                date,
+                lambda paths=local_paths, rows=prepared_rows: parse_mod.iter_batches(
+                    paths, parse_spec, prepared_rows=rows
+                ),
+                rows,
+                timeout=args.sql_timeout,
             )
             verified = mc_mod.count_partition(o, project, table_name, date, timeout=args.sql_timeout)
         except SystemExit:
             raise
         except Exception as exc:  # noqa: BLE001 - 写库/Tunnel 失败统一按失败退出（调度可告警）
-            log(f"❌ 写库失败：{_redact_job(job, exc)}")
+            log(f"❌ 写库失败：{_redact_job(job, exc, config)}")
             return 1
         if verified != rows:
             log(f"❌ {date} 写后校验不一致：写入 {rows:,}，查询 {verified:,}")
@@ -642,13 +765,13 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
         # 写入并校验成功后才记台账（失败中断后重跑会重试这个日期）
         # 台账带 md5：下次运行时跳过判断会校验本地文件内容（防误改/静默损坏），
         # 旧台账没有 md5 字段时按只比大小兼容处理（见 state.local_ready）
-        for item, path in zip(items, local_paths):
+        for index, (item, path) in enumerate(zip(items, local_paths)):
             ledger[item.ledger_key] = {
                 "project": project,
                 "table": table_name,
                 "pt": date,
                 "size": item.size,
-                "rows": file_rows[item.name],
+                "rows": file_rows[index],
                 "md5": state_mod.md5_of(path),
             }
         try:
@@ -680,7 +803,13 @@ def main(argv: list[str] | None = None) -> int:
     reset_log_once()
     args = build_parser().parse_args(argv)
 
-    log_handle = _open_log_file(args.log_file)
+    try:
+        log_handle = _open_log_file(args.log_file)
+    except SystemExit as exc:
+        # --log-file 指向目录/打不开属于"参数问题"：按 README 的退出码约定报 2（还没做过
+        # 任何远端操作），不能混进 1（运行失败）让调度侧按"数据问题"处理
+        log(f"❌ {exc}")
+        return 2
     if log_handle is not None:
         from .utils import add_log_sink
 
@@ -692,7 +821,11 @@ def main(argv: list[str] | None = None) -> int:
         def _wizard_ask(prompt: str = "") -> str:
             """向导的提问也走 log：--log-file 里能看到整套问答（只记问题，不记回答——回答里是密钥）。"""
             log(prompt)
-            return input()
+            try:
+                return input()
+            except (EOFError, ValueError, RuntimeError) as exc:
+                # stdin 关闭/无输入源：统一翻译成 EOFError（= 取消），与 prompt_secret 同口径
+                raise EOFError("标准输入不可用") from exc
 
         def _wizard_ask_secret(prompt: str = "") -> str:
             """密钥类提问：问题同样走 log（留痕），回答走 getpass 不回显。
@@ -700,14 +833,21 @@ def main(argv: list[str] | None = None) -> int:
             不回显是为了密钥不进终端 scrollback，也不被 `script` / 录屏抄走——原来走
             input() 时密钥明文回显在终端上。无 tty 等读不到隐藏输入的场景退回 input()。
             """
-            log(prompt)
-            try:
-                return getpass.getpass("")
-            except Exception:  # noqa: BLE001 - 没有 tty 等场景退回普通输入
-                return input()
+            return prompt_secret(prompt)
 
         try:
             return run_init(args.init_out, ask=_wizard_ask, echo=log, ask_secret=_wizard_ask_secret)
+        except KeyboardInterrupt:
+            log("已中断（配置未生成完），退出")
+            return 130
+        except SystemExit as exc:
+            # 与其它分支同口径：向导里的配置错/文件错记一笔再返回，别把裸 traceback 抛给调度
+            log(f"❌ {redact(str(exc))}")
+            return 1
+        except Exception as exc:  # noqa: BLE001 - 向导内部未预期异常
+            # 向导不该把裸 traceback 抛给调度；也避免把它误报成"已取消"（用户取消走 EOFError）
+            log(f"❌ 向导内部错误：{type(exc).__name__}: {redact(str(exc))}")
+            return 1
         finally:
             _detach_log_sink(log_handle)
 
@@ -723,6 +863,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     job_raw: dict = {}
+    config: dict = {}  # 供统一异常出口做值级脱敏（读到 --config 后就有内容）
     try:
         # 凭证来源：作业文件自带；--config/默认 config.json 只在存在时作为补充（可选）
         if args.config:
@@ -740,9 +881,13 @@ def main(argv: list[str] | None = None) -> int:
         # 业务日：--bizdate > 环境变量（DataWorks）> 不设置（处理远端全部未上传日期）
         # 顺序要紧：先看显式 --bizdate，没有才读环境变量；环境变量畸形必须报错（静默回退会处理错日期）
         bizdate = ""
-        if args.bizdate:
+        if args.bizdate is not None:
             base_day = parse_day_arg(args.bizdate)
             bizdate = base_day.strftime("%Y%m%d")
+        elif args.start_date or args.end_date:
+            # 显式补数区间优先于环境变量 bizdate：调度环境里 bizdate 总是存在，不忽略它的话
+            # 合法的补数命令会被 run_sync 的"单日 vs 区间"互斥拦下（退出码还会错成 1）
+            base_day = datetime.now(job_tz_of(job_raw)).date() - timedelta(days=1)
         else:
             from_env = env_bizdate(strict=not args.check)
             if from_env is not None:
@@ -751,11 +896,15 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 base_day = datetime.now(job_tz_of(job_raw)).date() - timedelta(days=1)
 
-        job = render_job(job_raw, config, base_day)  # 替换 ${secrets.x}/${bizdate} 等占位符
+        # 替换 ${secrets.x}/${bizdate} 等占位符；--config 的 maxcompute/profiles 用返回的副本
+        # （render_job 不改写入参，同一进程重复调用时不会串上一个作业已替换的密钥/日期）
+        job, config = render_job(job_raw, config, base_day)
         job = normalize_job(job)  # 补齐默认值，让配置尽量短
         validate_job(job)
         for warning in collect_warnings(job):  # 未知字段告警（拼写错误提示）
-            log(f"⚠️ {warning}")
+            # 此时 job 已经过 render_job，明文密钥就在 job 里：与其它所有来自 job 的输出
+            # 同口径做值级脱敏，防止告警文本里带上字段值（拼错的键名旁边常跟着取值）
+            log(f"⚠️ {_redact_job(job, warning, config)}")
 
         if args.check:
             try:
@@ -768,14 +917,19 @@ def main(argv: list[str] | None = None) -> int:
             with RunLock(_lock_path(job_path)):  # 同机同一作业互斥；不同作业可并行
                 return run_sync(job, config, args, job_path, bizdate=bizdate, config_path=config_path)
         except SystemExit as exc:
-            log(f"❌ {_redact_job(job, exc)}")
+            log(f"❌ {_redact_job(job, exc, config)}")
             return 1
         except KeyboardInterrupt:
             log("已中断（本次未完成；重跑同一命令即可，先删再填、幂等）")
             return 130
     except SystemExit as exc:
-        # 准备阶段的配置错（bizdate 畸形、缺块、占位符写错、运行锁拿不到）统一按运行期错误的格式记一笔
-        log(f"❌ {_redact_job(job_raw, exc)}")
+        # 准备阶段的配置错（bizdate 畸形、缺块、占位符写错、运行锁拿不到）统一按运行期错误的格式记一笔。
+        # 脱敏按**作业文件 + --config** 两份配置一起收密钥值：凭证只写在 --config 的 secrets/
+        # maxcompute 里时，只按 job_raw 收值会把报错里回显的明文漏出去（api2ods 同口径）
+        if job_raw or config:
+            log(f"❌ {_redact_configs(exc, job_raw, config)}")
+        else:
+            log(f"❌ {redact(str(exc))}")
         return 1
     except KeyboardInterrupt:
         log("已中断（尚未开始运行），退出")

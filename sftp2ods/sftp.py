@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import errno
+import ntpath
 import re
 import stat
 from dataclasses import dataclass
@@ -28,6 +29,14 @@ except ImportError:  # pragma: no cover - 未安装时给出明确指引（tests
     paramiko = None
 
 DATE_RE = re.compile(r"\A\d{8}\Z")
+
+
+def _cfg_or_default(cfg: dict, key: str, default, conv):
+    """读配置数值：None/空串用默认值；显式 0 保留（不能 `x or default`）。"""
+    value = cfg.get(key)
+    if value is None or value == "":
+        return conv(default)
+    return conv(value)
 
 
 def _safe_remote_name(name: str, kind: str) -> str:
@@ -47,13 +56,21 @@ def _safe_remote_name(name: str, kind: str) -> str:
 def local_path_within(base: Path, key: str, remote_name: str) -> Path:
     """把台账键拼成本地落地路径，并确保结果落在下载目录内。
 
-    远端是 POSIX 系统，文件名里出现 ":" 是合法的（如 report:20260920.csv），不能一律禁掉；
-    但 Windows 上 "Z:xxx" 这类盘符相对名会让 `base / key` 直接跳出下载目录（写到别的盘），
-    所以拼出路径后用 resolve() 做一次包含性判断：越界就拒绝。POSIX 上 ":" 只是普通字符，
-    同一判断不会误伤正常文件名。
+    两层判断：
+    1) 拼出路径后 resolve() 做包含性判断（挡 ".." 与平台相关的越界形态）；
+    2) 显式拦截 Windows 盘符相对名（"Z:xxx" / "a:b.csv"）：NT 上它解析到「该盘的当前目录」
+       而不是下载目录。POSIX 上这类名字只是普通文件名，但同一个作业跨平台跑时行为必须一致，
+       所以统一拒绝；"report:20260920.csv" 这种冒号前多于一个字符的名字不受影响
+       （ntpath.splitdrive 只把「单字符 + 冒号」当盘符），合法的冒号文件名不会误伤。
     """
     base = Path(base)
-    candidate = base / str(key)
+    key_text = str(key)
+    if ntpath.splitdrive(key_text)[0]:
+        raise FatalSourceError(
+            f"远端文件名 {remote_name!r} 落地后的本地路径落在下载目录之外"
+            f"（Windows 盘符相对名 {key_text!r}）；可能是服务端异常或伪造数据，拒绝处理"
+        )
+    candidate = base / key_text
     try:
         base_real = base.resolve()
         target_real = candidate.resolve()
@@ -104,12 +121,17 @@ class RemoteFile:
 
     date: str  # 业务日期 YYYYMMDD（= 目标 pt）
     name: str  # 文件名
-    size: int  # 字节数（远端列表值，下载后核对）
+    size: int | None  # 字节数；None = 远端未给出（下载后跳过大小核对）
     remote: str  # 远端完整路径
     ledger_key: str  # 台账键（flat = 文件名；date_dir = 日期/文件名）
 
     def __repr__(self) -> str:  # 日志里简洁可读
         return f"<RemoteFile {self.date}/{self.name} {self.size}B>"
+
+    @property
+    def size_text(self) -> str:
+        """日志里的大小文案：未知大小不能按 0 展示（会误导成"空文件"）。"""
+        return "大小未知" if self.size is None else f"{self.size:,} 字节"
 
 
 class SftpSource:
@@ -119,19 +141,30 @@ class SftpSource:
         self.cfg = dict(cfg or {})
         auth = self.cfg.get("auth") or {}
         self.host = str(self.cfg.get("host") or "")
-        self.port = int(self.cfg.get("port") or 22)
+        # 端口校验给配置错：'abc' 这类非法值原来抛裸 ValueError；显式 0 也按未填处理
+        # （0 不是合法端口，但 `or 22` 会把 0 当成"没填"——两种口径统一成"缺省 22/非法报错"）
+        raw_port = self.cfg.get("port")
+        try:
+            self.port = int(raw_port) if raw_port else 22
+        except (TypeError, ValueError):
+            raise ConfigError(f"sftp.port 必须是整数，实际 {raw_port!r}") from None
+        if not 1 <= self.port <= 65535:
+            raise ConfigError(f"sftp.port 应在 1~65535 之间，实际 {self.port}")
         self.username = str(self.cfg.get("username") or "")
         self.auth_type = str(auth.get("type") or "password").lower()
         self.password = str(auth.get("password") or "")
         self.key_file = str(auth.get("key_file") or "")
         self.passphrase = str(auth.get("passphrase") or "")
-        self.connect_timeout = float(self.cfg.get("connect_timeout") or 30)
-        self.io_timeout = float(self.cfg.get("io_timeout") or 600)
-        self.retry_times = int(self.cfg.get("retry_times") or 3)
-        self.retry_delay = float(self.cfg.get("retry_delay") or 10)
+        self.connect_timeout = _cfg_or_default(self.cfg, "connect_timeout", 30, float)
+        self.io_timeout = _cfg_or_default(self.cfg, "io_timeout", 600, float)
+        self.retry_times = _cfg_or_default(self.cfg, "retry_times", 3, int)
+        self.retry_delay = _cfg_or_default(self.cfg, "retry_delay", 10, float)
         source = source_cfg or self.cfg.get("_source") or {}
-        self.layout = str(source.get("layout") or "flat")
-        self.root = str(source.get("root") or "").strip().rstrip("/")
+        # 取值统一小写：validate_job / normalize_job 都按小写口径校验，"DATE_DIR" 这类
+        # 写法若按字面量比较会被当成 flat（列目录结果为空），与校验口径不一致
+        self.layout = str(source.get("layout") or "flat").strip().lower()
+        root_raw = str(source.get("root") or "").strip()
+        self.root = "/" if root_raw == "/" else root_raw.rstrip("/")
         self.download_dir = Path(source.get("download_dir") or ".")
         try:
             self.file_re = re.compile(str(source.get("file_regex") or ""))
@@ -144,6 +177,24 @@ class SftpSource:
                 self.dir_re = re.compile(str(dir_re or ""))
             except re.error as exc:
                 raise ConfigError(f"source.date_dir_regex 不是合法正则：{exc}")
+            if "date" not in self.dir_re.groupindex:
+                # 缺 (?P<date>) 时 match.group("date") 会在扫描时抛 IndexError：
+                # 报错不可读，还会被重试循环当成瞬时错误白重试若干轮
+                raise ConfigError(f"source.date_dir_regex 必须带日期命名捕获组 (?P<date>...)：{dir_re!r}")
+        elif "date" not in self.file_re.groupindex:
+            raise ConfigError(
+                f"source.file_regex 必须带日期命名捕获组 (?P<date>...)：{source.get('file_regex')!r}"
+                f"（业务日期从文件名里提取，pt 靠它确定）"
+            )
+
+    def _join_root(self, *parts: str) -> str:
+        """拼远端路径：root="/" 时结果仍以单斜杠开头，不能变成 //name 或空串。"""
+        rest = "/".join(str(p) for p in parts if p)
+        if not self.root:
+            return rest
+        if self.root == "/":
+            return f"/{rest}" if rest else "/"
+        return f"{self.root}/{rest}" if rest else self.root
 
     # ------------------------------------------------------------ 连接
     def _connect(self):
@@ -161,6 +212,11 @@ class SftpSource:
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         else:
             ssh.load_system_host_keys()
+            # load_system_host_keys() 不传参只读系统 known_hosts（如 /etc/ssh/ssh_known_hosts），
+            # 用户自己 ssh-keyscan 进 ~/.ssh/known_hosts 的指纹要另 load_host_keys
+            user_known = Path.home() / ".ssh" / "known_hosts"
+            if user_known.is_file():
+                ssh.load_host_keys(str(user_known))
             # 显式拒绝未知主机指纹：不能让"默认严格"依赖 paramiko 的隐式默认策略——
             # 将来 paramiko 改默认值或重构时会静默降级为不校验主机指纹（中间人风险），
             # 把"严格"写死在代码里，行为可预期。
@@ -197,16 +253,25 @@ class SftpSource:
         except paramiko.PasswordRequiredException as exc:
             ssh.close()
             raise FatalSourceError(f"私钥需要口令，但 sftp.auth.passphrase 没配或不对（{exc}）")
+        except paramiko.BadHostKeyException as exc:
+            ssh.close()
+            raise FatalSourceError(
+                f"SFTP 主机指纹不匹配：{self.username}@{self.host}:{self.port}（{exc}）；"
+                f"可能是主机换过密钥，也可能是中间人攻击。请核对本机 known_hosts"
+            ) from exc
         except paramiko.SSHException as exc:
             ssh.close()
             message = str(exc)
-            if "not found in known_hosts" in message and host_key != "auto_accept":
+            unknown_host = "not found in known_hosts" in message.lower()
+            if unknown_host and host_key != "auto_accept":
                 # 严格模式下最常见的第一类错误：提示怎么把主机指纹加进 known_hosts
                 message += (
                     f"；本工具默认校验主机指纹（防中间人），请先运行："
                     f"ssh-keyscan -p {self.port} {self.host} >> ~/.ssh/known_hosts"
                     f'（确实要跳过校验可在 sftp 块加 "host_key": "auto_accept"）'
                 )
+            if unknown_host:
+                raise FatalSourceError(f"SFTP 连接失败：{type(exc).__name__}: {message}") from exc
             raise RuntimeError(f"SFTP 连接失败：{type(exc).__name__}: {message}")
         except OSError as exc:
             ssh.close()
@@ -230,12 +295,12 @@ class SftpSource:
             finally:
                 try:
                     sftp.close()
-                except Exception:  # noqa: BLE001 - 清理失败不掩盖业务结果
-                    pass
+                except Exception as exc:  # noqa: BLE001 - 清理失败不掩盖业务结果，但留一条线索
+                    log(f"  警告：关闭 SFTP 会话失败（{type(exc).__name__}: {exc}）")
                 try:
                     ssh.close()
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001 - 同上：会话泄漏/协议错误要能被察觉
+                    log(f"  警告：关闭 SSH 连接失败（{type(exc).__name__}: {exc}）")
 
         return retry_call(
             _do,
@@ -243,6 +308,9 @@ class SftpSource:
             base_delay=self.retry_delay,
             desc=desc,
             fatal=(FatalSourceError,),
+            # paramiko 的报错常把凭证写进自由文本（认证失败会回显密码/口令），
+            # 形态规则盖不住，带上本连接的凭证值做值级脱敏
+            secrets=[value for value in (self.password, self.passphrase) if value],
         )
 
     # ------------------------------------------------------------ 列文件
@@ -253,18 +321,28 @@ class SftpSource:
         与两个结算脚本口径一致：空目录是异常，但不是连接错误。
         """
         raw = self._run("列远端文件", self._scan)
-        return {date: sorted(files, key=lambda item: item.name) for date, files in raw.items()}
+        # 按日期升序返回（docstring 承诺的顺序）：_scan 的插入顺序是 READDIR 顺序，
+        # 不能直接透传（下游 max()/遍历的可读性与稳定性）
+        return {date: sorted(files, key=lambda item: item.name) for date, files in sorted(raw.items())}
 
-    def _entry_size(self, sftp, entry, remote_path: str) -> int:
+    def _entry_size(self, sftp, entry, remote_path: str) -> int | None:
         """条目大小：软链在 READDIR 里的 st_size 是链接自身（= 目标路径字符串长度），
         直接当"远端大小"用会让下载后的大小核对必然失败、台账也永远对不上；对软链用
-        stat()（跟随链接）取目标文件的真实大小。"""
-        size = int(getattr(entry, "st_size", 0) or 0)
+        stat()（跟随链接）取目标文件的真实大小。
+
+        远端没给大小（READDIR 未返回 st_size，或软链 stat 失败）时返回 None：
+        下面各处会跳过大小核对，而不是把未知当成 0 字节去比较（那必然误报不一致）。
+        """
+        raw_size = getattr(entry, "st_size", None)
+        size = int(raw_size) if raw_size is not None else None
         if stat.S_ISLNK(getattr(entry, "st_mode", 0) or 0):
             try:
-                size = int(sftp.stat(remote_path).st_size or 0)
-            except Exception:  # noqa: BLE001 - 取不到就退回列表值（下载后仍会核对大小）
-                pass
+                target_size = sftp.stat(remote_path).st_size
+                if target_size is not None:
+                    size = int(target_size)
+            except Exception as exc:  # noqa: BLE001 - 取不到就按"大小未知"处理
+                log(f"  警告：软链 {remote_path} 的 stat 失败（{exc}），大小未知，下载后跳过大小核对")
+                size = None
         return size
 
     def _scan(self, sftp) -> dict[str, list[RemoteFile]]:
@@ -280,14 +358,24 @@ class SftpSource:
         if self.layout == "date_dir":
             for entry in entries:
                 if not stat.S_ISDIR(entry.st_mode or 0):
-                    continue
+                    # 指向目录的软链（st_mode 是 S_IFLNK）要跟随判断：flat 布局显式支持
+                    # 软链，date_dir 下若直接跳过，整个业务日期会从结果里静默消失
+                    if not stat.S_ISLNK(entry.st_mode or 0):
+                        continue
+                    try:
+                        followed = sftp.stat(self._join_root(entry.filename))
+                    except Exception as exc:  # noqa: BLE001 - 跟随失败按非目录处理，但要留痕
+                        log(f"  警告：软链日期目录 {entry.filename} 跟随失败（{exc}），已跳过")
+                        continue
+                    if not stat.S_ISDIR(followed.st_mode or 0):
+                        continue
                 match = self.dir_re.fullmatch(entry.filename) if self.dir_re else None
                 if not match:
                     continue
                 dir_name = _safe_remote_name(entry.filename, "日期目录")
                 date = normalize_date(match.group("date"), dir_name, "日期目录名")
                 try:
-                    children = sftp.listdir_attr(f"{root}/{dir_name}" if root else dir_name)
+                    children = sftp.listdir_attr(self._join_root(dir_name))
                 except OSError as exc:
                     if not _is_missing_path_error(exc):
                         raise  # 同上：瞬时失败不能变成"这天不存在"
@@ -297,7 +385,7 @@ class SftpSource:
                     if stat.S_ISDIR(item.st_mode or 0) or not self.file_re.fullmatch(item.filename):
                         continue
                     file_name = _safe_remote_name(item.filename, "文件名")
-                    path = f"{root}/{dir_name}/{file_name}" if root else f"{dir_name}/{file_name}"
+                    path = self._join_root(dir_name, file_name)
                     result.setdefault(date, []).append(
                         RemoteFile(date, file_name, self._entry_size(sftp, item, path), path, f"{date}/{file_name}")
                     )
@@ -311,7 +399,7 @@ class SftpSource:
                     continue
                 file_name = _safe_remote_name(entry.filename, "文件名")
                 date = normalize_date(match.group("date"), file_name, "文件名")
-                path = f"{root}/{file_name}" if root else file_name
+                path = self._join_root(file_name)
                 result.setdefault(date, []).append(
                     RemoteFile(date, file_name, self._entry_size(sftp, entry, path), path, file_name)
                 )
@@ -330,8 +418,11 @@ class SftpSource:
             return tmp
 
         tmp = self._run(f"下载 {item.name}", _do)
-        actual = tmp.stat().st_size if tmp.is_file() else None
-        if actual != item.size:
+        if not tmp.is_file():
+            raise RuntimeError(f"下载 {item.name} 后本地文件不存在（{tmp}）；.part 已保留供排查，重跑会重新下载")
+        actual = tmp.stat().st_size
+        # item.size 为 None = 远端没给大小（未知），跳过核对而不是把未知当 0 字节误报
+        if item.size is not None and actual != item.size:
             raise RuntimeError(
                 f"下载 {item.name} 大小不一致（远端 {item.size} 字节，本地 {actual}）；.part 已保留供排查，重跑会重新下载"
             )

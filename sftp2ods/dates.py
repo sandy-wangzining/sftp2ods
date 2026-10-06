@@ -14,14 +14,14 @@ from __future__ import annotations
 import os
 import re
 from datetime import date, datetime, timedelta
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .utils import ConfigError
 
 DEFAULT_TZ = "Asia/Shanghai"
 DATE_FMT = "%Y%m%d"
 # \A...\Z 而不是 ^...$：$ 会放过结尾的换行（"20260920\n" 静默通过校验）
-_DAY_COMPACT_RE = re.compile(r"\A\d{8}\Z")
+_DAY_COMPACT_RE = re.compile(r"\A\d{8}\Z", re.ASCII)  # 只认 ASCII 数字：全角数字不该被当成业务日
 _DAY_ISO_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
 _GRACE_RE = re.compile(r"\A(\d{1,2}):(\d{2})\Z")
 
@@ -30,10 +30,11 @@ def load_zone(name: str) -> ZoneInfo:
     """按名称加载时区（如 Asia/Shanghai、UTC、America/New_York）。"""
     try:
         return ZoneInfo(str(name))
-    except Exception:
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        # 只认"时区名不认识/不合法"两类：别的异常（如 TypeError）是编程错误，不该伪装成时区问题
         raise ConfigError(
             f"无法识别时区：{name}（如 Asia/Shanghai / UTC / America/New_York；Windows 本机需 pip install tzdata）"
-        )
+        ) from exc
 
 
 def parse_day_arg(text: str) -> date:
@@ -58,15 +59,26 @@ def parse_day_arg(text: str) -> date:
 
 
 def norm_date(text: str, flag: str) -> str:
-    """日期参数归一化成 YYYYMMDD（容忍 2026-09-21 / 2026/09/21 写法）；写错直接报错。"""
-    value = re.sub(r"[-/]", "", str(text or "").strip())
-    if not re.fullmatch(r"\d{8}", value):
+    """日期参数归一化成 YYYYMMDD（容忍 2026-09-21 / 2026/09/21 写法）；写错直接报错。
+
+    用结构化白名单而不是"删掉所有 - 和 /"：后者会把 `20-2609-21` 这类明显写错的日期
+    也归一化成合法值，静默落到错误的 pt 上（同一个参数的 --bizdate 路径是严格正则，
+    两套标准）。分隔符只允许"两处都有且一致"或"都没有"。
+    """
+    value = str(text or "").strip()
+    # re.ASCII：\d 默认匹配全角数字、int() 也认——放行的话返回值会是全角字符串
+    # （字符串比较里 '２'(U+FF12) > '2'），plan_dates 的过滤会把真实日期整段滤掉、
+    # 作业"成功"却一个文件没同步，调度侧看不到报错
+    match = re.fullmatch(r"\A(\d{4})([-/]?)(\d{2})\2(\d{2})\Z", value, re.ASCII)
+    if not match:
         raise ConfigError(f"{flag} 应为 YYYYMMDD 或 YYYY-MM-DD，实际 {text!r}")
+    year, _, month, day = match.groups()
     try:
-        datetime.strptime(value, DATE_FMT)
+        moment = datetime(int(year), int(month), int(day))
     except ValueError:
         raise ConfigError(f"{flag} 不是有效日期：{text!r}")
-    return value
+    # 强制按 ASCII 拼回：不给"匹配用的字符集"与"返回值的字符集"留缝
+    return f"{moment.year:04d}{moment.month:02d}{moment.day:02d}"
 
 
 def env_bizdate(strict: bool = True) -> date | None:
@@ -78,13 +90,37 @@ def env_bizdate(strict: bool = True) -> date | None:
 
     strict=False 只给"只读体检"（--check）用：它不写库，落哪些 pt 只是看一眼。
     """
-    raw = os.environ.get("bizdate") or os.environ.get("SKYNET_BIZDATE") or ""
+    # 按"第一个非空白值"取：bizdate=" " 这类空白值不能把后面有效的 SKYNET_BIZDATE 一起
+    # 吞掉（原来是 `a or b`，空白串是真值、直接短路）
+    raw = ""
+    seen = False
+    for name in ("bizdate", "SKYNET_BIZDATE"):
+        if name in os.environ:
+            seen = True
+            if os.environ[name].strip():
+                raw = os.environ[name]
+                break
     text = raw.strip()
     if not text:
+        # "变量不存在"与"变量存在但值为空白"是两回事：后者是调度侧传参失误
+        # （`export bizdate=$1` 且 $1 为空、`export bizdate=`），当成"未设置"会静默回退
+        # 处理全部日期（每个 pt 先删再填），而调度侧完全看不出来——与 --bizdate 同标准报错
+        if seen:
+            message = (
+                "环境变量 bizdate/SKYNET_BIZDATE 已设置但值为空白："
+                "按未设置回退会处理全部日期（每个 pt 先删再填），拒绝执行；"
+                "请修正调度侧传参，或 unset 该变量"
+            )
+            if not strict:
+                from .utils import log
+
+                log(f"  警告：{message}；只读体检（--check）不写库，按未设置继续")
+                return None
+            raise ConfigError(message)
         return None
     try:
         return parse_day_arg(text)
-    except SystemExit as exc:
+    except ConfigError as exc:
         if not strict:
             from .utils import log
 
@@ -119,7 +155,14 @@ def expected_latest(tz: ZoneInfo, grace: str = "", now: datetime | None = None) 
     调度比生成时刻跑得早时，把预期上界后退一天防误报；调度正常传 --bizdate 时
     这个兜底根本不参与（核对的只是那一天的 --bizdate）。
     """
-    moment = now.astimezone(tz) if now is not None else datetime.now(tz)
+    if now is None:
+        moment = datetime.now(tz)
+    elif now.tzinfo is None:
+        # 朴素 datetime 不能交给 astimezone()——那会按**本机时区**解释（同一份传入值
+        # 在不同机器上算出不同日期）；按调用方给的 tz 解释
+        moment = now.replace(tzinfo=tz)
+    else:
+        moment = now.astimezone(tz)
     latest = moment.date() - timedelta(days=1)
     hour, minute = parse_grace(grace)
     if (moment.hour, moment.minute) < (hour, minute):
@@ -130,7 +173,11 @@ def expected_latest(tz: ZoneInfo, grace: str = "", now: datetime | None = None) 
 def find_missing(all_dates, start: str, end: str) -> list[str]:
     """[start, end]（含）逐日核对，返回缺失日期列表（内部断档 + 最新缺失都会命中）。"""
     have, missing = set(all_dates), []
-    day, end_day = datetime.strptime(start, DATE_FMT).date(), datetime.strptime(end, DATE_FMT).date()
+    try:
+        day, end_day = datetime.strptime(start, DATE_FMT).date(), datetime.strptime(end, DATE_FMT).date()
+    except ValueError as exc:
+        # 走库调用方可能绕过 CLI 的 --start-date 校验：给配置错而不是裸 ValueError
+        raise ConfigError(f"核对区间必须是 yyyyMMdd：start={start!r}, end={end!r}") from exc
     while day <= end_day:
         key = day.strftime(DATE_FMT)
         if key not in have:
