@@ -460,6 +460,14 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
             raise SystemExit(
                 f"--init-out 指向的是目录，需要给文件名：{target_path}（例如 {target_path / (job_name + '.json')}）"
             )
+        if target_path.exists():
+            # 防手滑覆盖生产作业（文件里有 SFTP 密码/AK-SK/webhook 明文）：默认不覆盖，
+            # 想覆盖要显式答 y——与 feishu2ods 向导同口径。作业名消毒可能把不同名字
+            # 塌缩成同一个文件名（reports.2024 → reports_2024），这里也拦住这种静默覆盖
+            answer = _ask(ask, f"⚠️ {target_path} 已存在，覆盖吗？（y/n）", "n").lower()
+            if answer not in ("y", "yes", "1"):
+                echo("已取消（原文件未动）。")
+                return 1
         try:
             target_path.parent.mkdir(parents=True, exist_ok=True)
             # 文件含 SFTP 密码/AK-SK/webhook 明文：写同目录临时文件（mkstemp，默认 0600）

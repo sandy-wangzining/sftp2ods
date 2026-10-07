@@ -603,7 +603,8 @@ class TestWizardSampleErrors(WizardTestCase):
         打开瞬间旧文件就没了，失败后磁盘上只剩 0 字节或半截 JSON。"""
         self.out_path.parent.mkdir(parents=True, exist_ok=True)
         self.out_path.write_text('{"job": "old"}', encoding="utf-8")
-        script = self.base_script() + self.common_tail()
+        # 目标已存在要先显式答 y 才进入写入流程（见下面的覆盖确认用例）
+        script = self.base_script() + self.common_tail() + [("已存在", "y")]
         asks = ScriptedAsk(script)
         with mock.patch.object(init_wizard.os, "fsync", side_effect=OSError("disk full")):
             rc = init_wizard.run_init(
@@ -611,6 +612,27 @@ class TestWizardSampleErrors(WizardTestCase):
             )
         self.assertEqual(rc, 1)
         self.assertEqual(self.out_path.read_text(encoding="utf-8"), '{"job": "old"}')
+
+    def test_existing_job_requires_explicit_overwrite_consent(self):
+        """目标文件已存在时默认不覆盖（回车=取消）：作业名消毒会把不同名字塌缩成
+        同一个文件名（reports.2024 → reports_2024），静默覆盖会让另一个作业的配置
+        连带密钥一起被删掉。"""
+        self.out_path.parent.mkdir(parents=True, exist_ok=True)
+        self.out_path.write_text('{"job": "old"}', encoding="utf-8")
+        script = self.base_script() + self.common_tail() + [("已存在", "")]
+        rc, ask = self.run_wizard(script)
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.out_path.read_text(encoding="utf-8"), '{"job": "old"}')
+        self.assertTrue(any("已存在" in p for p in ask.prompts))
+
+    def test_existing_job_overwritten_when_confirmed(self):
+        """显式答 y 后按新配置覆盖（向导的重跑更新流程不受影响）。"""
+        self.out_path.parent.mkdir(parents=True, exist_ok=True)
+        self.out_path.write_text('{"job": "old"}', encoding="utf-8")
+        script = self.base_script() + self.common_tail() + [("已存在", "y")]
+        rc, _ = self.run_wizard(script)
+        self.assertEqual(rc, 0)
+        self.assertNotEqual(self.out_path.read_text(encoding="utf-8"), '{"job": "old"}')
 
 
 class TestWizardRemoteSampleGuard(WizardTestCase):
