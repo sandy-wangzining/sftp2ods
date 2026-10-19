@@ -253,6 +253,16 @@ class TestSecretValues(OfflineTestCase):
         for expected in ("topsecret-pw", "AKID12345", "SKVALUE999", "hookvalue"):
             self.assertIn(expected, values)
 
+    def test_collects_every_webhook_in_array(self):
+        job = self._job()
+        job["notify"]["webhook"] = [
+            "https://open.feishu.cn/open-apis/bot/v2/hook/hook-one-1111",
+            "https://open.feishu.cn/open-apis/bot/v2/hook/hook-two-2222",
+        ]
+        values = utils.collect_secret_values(job)
+        self.assertIn("hook-one-1111", values)
+        self.assertIn("hook-two-2222", values)
+
     def test_redact_secrets_by_value(self):
         job = self._job()
         text = f"Authentication failed for user with password {job['sftp']['auth']['password']}"

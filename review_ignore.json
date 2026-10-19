@@ -80,6 +80,11 @@
       "file": "sftp2ods/init_wizard.py",
       "title": "未捕获的 re.error",
       "reason": "误报（2026-10-06 实证）：SftpSource.__init__ 已把 re.error 转成 ConfigError（sftp.py:170-172 与 177-179），_read_remote_sample 的 except (ConfigError, OSError, RuntimeError)（init_wizard.py:219）会接住、提示「连接/列目录失败」并返回 None 走三次重选；list_files 只用已编译的 self.file_re.fullmatch，不会再抛。实测 SftpSource(cfg, file_regex='broken_(') 抛 ConfigError 而非 re.error。"
+    },
+    {
+      "file": "sftp2ods/config.py",
+      "title": "check_block_types 用 _show 回显整块取值",
+      "reason": "误报（2026-10-19 实测）：_show() 走 redact()，/hook/<id> 形状会被遮成 /hook/***；notify 写成裸字符串时 hook id 不会进日志，与 notify.py「webhook 是凭证」的承诺一致。"
     }
   ]
 }

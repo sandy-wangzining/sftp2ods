@@ -375,6 +375,31 @@ class TestValidate(OfflineTestCase):
         job = minimal_job()
         job["notify"] = {"webhook": 123}
         self.assert_invalid(job, "notify.webhook")
+        job = minimal_job()
+        job["notify"] = {"webhook": ["https://hook/a", 123]}
+        self.assert_invalid(job, "notify.webhook")
+
+    def test_notify_webhook_array_accepted(self):
+        job = minimal_job()
+        job["notify"] = {"webhook": [" https://hook/a ", "https://hook/b", "https://hook/a"]}
+        normalized = config.normalize_job(job)
+        config.validate_job(normalized)
+        self.assertEqual(normalized["notify"]["webhook"], ["https://hook/a", "https://hook/b"])
+
+    def test_notify_webhook_array_placeholders_render(self):
+        """数组里的 ${secrets.x} 占位符逐项渲染（多群地址可放 secrets）。"""
+        job = minimal_job()
+        job["secrets"] = {
+            "hook_a": "https://open.feishu.cn/x/hook/aaa",
+            "hook_b": "https://open.feishu.cn/x/hook/bbb",
+        }
+        job["notify"] = {"webhook": ["${secrets.hook_a}", "${secrets.hook_b}"]}
+        rendered, _ = config.render_job(job, {}, date(2026, 9, 18))
+        config.validate_job(rendered)
+        self.assertEqual(
+            rendered["notify"]["webhook"],
+            ["https://open.feishu.cn/x/hook/aaa", "https://open.feishu.cn/x/hook/bbb"],
+        )
 
     def test_warning_for_unknown_keys(self):
         job = minimal_job()

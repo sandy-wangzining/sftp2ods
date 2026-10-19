@@ -85,7 +85,7 @@
   },
 
   "notify": {
-    "//webhook": "缺文件/远端目录为空时发飞书群卡片；留空则不发",
+    "//webhook": "缺文件/远端目录为空时发飞书群卡片；字符串或字符串数组（多个群同时发）；留空则不发",
     "webhook": "${secrets.feishu_webhook}",
     "enabled": true
   }

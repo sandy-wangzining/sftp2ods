@@ -536,8 +536,21 @@ def validate_job(job: dict) -> None:
     notify = job.get("notify") or {}
     if notify:
         as_bool(notify.get("enabled"), default=True, field="notify.enabled")
-        if notify.get("webhook") is not None and not isinstance(notify.get("webhook"), str):
-            raise ConfigError("notify.webhook 必须是字符串（飞书群机器人地址）")
+        webhook = notify.get("webhook")
+        if webhook is not None:
+            if isinstance(webhook, str):
+                pass  # 允许空串（= 未配置，运行时静默跳过）
+            elif isinstance(webhook, list):
+                cleaned: list[str] = []
+                for index, item in enumerate(webhook, 1):
+                    if not isinstance(item, str) or not item.strip():
+                        raise ConfigError(f"notify.webhook 数组第 {index} 项必须是非空字符串（飞书群机器人地址）")
+                    item = item.strip()
+                    if item not in cleaned:
+                        cleaned.append(item)
+                notify["webhook"] = cleaned
+            else:
+                raise ConfigError("notify.webhook 必须是字符串或字符串数组（飞书群机器人地址）")
 
     # ---- secrets / maxcompute ----
     # 显式 JSON null 按"未配置"处理（与 check_block_types / _as_secrets / _profile_source
