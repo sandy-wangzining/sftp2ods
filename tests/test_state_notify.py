@@ -247,6 +247,43 @@ class TestNotify(OfflineTestCase):
         self.assertEqual(card["card"]["header"]["title"]["content"], "标题")
         self.assertEqual(card["card"]["elements"][0]["text"]["content"], "一行")
 
+    def test_multiple_webhooks(self):
+        """webhook 写成数组时逐个群发送（多个群同时告警）。"""
+        fake = FakeRequests()
+        hooks = ["https://open.feishu.cn/hook/a", "https://open.feishu.cn/hook/b"]
+        with mock.patch.object(notify_mod, "requests", fake):
+            self.assertTrue(notify_mod.notify(hooks, "标题", ["一行"]))
+        self.assertEqual([c["url"] for c in fake.calls], hooks)
+
+    def test_multiple_webhooks_partial_failure(self):
+        """单个群失败不影响其它群，整体返回 False（告警失败不改主流程退出码）。"""
+
+        class FlakyRequests(FakeRequests):
+            def post(self, url, **kwargs):
+                if url.endswith("/bad"):
+                    self.calls.append({"url": url, "json": kwargs.get("json"), "timeout": kwargs.get("timeout")})
+                    raise OSError("network down")
+                return super().post(url, **kwargs)
+
+        fake = FlakyRequests()
+        with mock.patch.object(notify_mod, "requests", fake):
+            self.assertFalse(
+                notify_mod.notify(["https://open.feishu.cn/hook/bad", "https://open.feishu.cn/hook/ok"], "t", ["x"])
+            )
+        self.assertEqual(
+            [c["url"] for c in fake.calls],
+            ["https://open.feishu.cn/hook/bad", "https://open.feishu.cn/hook/ok"],
+        )
+
+    def test_invalid_webhook_type_warns_and_skips(self):
+        """webhook 写成对象等非法类型时不能静默跳过告警（配置错要能看见）。"""
+        fake = FakeRequests()
+        logged = []
+        with mock.patch.object(notify_mod, "requests", fake), mock.patch.object(notify_mod, "log", logged.append):
+            self.assertFalse(notify_mod.notify({"url": "https://hook"}, "t", ["x"]))
+        self.assertEqual(fake.calls, [])
+        self.assertTrue(any("没有可用地址" in str(line) for line in logged))
+
     def test_api_error_returns_false(self):
         fake = FakeRequests(response=FakeResponse(status_code=400, payload={"code": 19001}))
         with mock.patch.object(notify_mod, "requests", fake):

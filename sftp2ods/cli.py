@@ -283,9 +283,12 @@ def _cred_source_label(config_path: Path, job_path: Path) -> str:
 
 
 def _notifier(job: dict, args):
-    """构造飞书通知函数（webhook/enabled 都从作业配置取；--no-notify 优先）。"""
+    """构造飞书通知函数（webhook/enabled 都从作业配置取；--no-notify 优先）。
+
+    webhook 支持字符串或字符串数组（多个群同时告警），归一化在 notify 模块内部完成。
+    """
     notify_cfg = job.get("notify") or {}
-    webhook = str(notify_cfg.get("webhook") or "")
+    webhook = notify_cfg.get("webhook") or ""
     enabled = as_bool(notify_cfg.get("enabled"), default=True, field="notify.enabled") and not args.no_notify
     return lambda title, lines, footer: notify(webhook, title, lines, footer, enabled=enabled)
 

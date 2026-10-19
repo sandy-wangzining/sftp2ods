@@ -766,6 +766,28 @@ def _webhook_values(value) -> list[str]:
     return result
 
 
+def webhook_targets(value) -> list[str]:
+    """把 notify.webhook 归一化成地址列表（字符串或字符串数组）。
+
+    运行时口径：去首尾空白、去空、去重保序；非字符串元素忽略——配置校验阶段会先拦，
+    这里再兜一层，保证告警链路不会因为一个写错的目标把主流程带崩。
+    """
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        item = item.strip()
+        if item and item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
 def collect_secret_values(job: dict) -> list[str]:
     """收集作业配置里"可能被回显"的密钥字面量，供值级脱敏使用。
 
