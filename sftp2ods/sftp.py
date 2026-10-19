@@ -5,7 +5,7 @@
 - 每次操作独立建连、用完即断（与两个结算脚本一致）：调度任务里一次运行的文件数有限，
   换来"任何一次操作失败重试都从干净连接开始"，不留半死会话；
 - 列目录与下载都走 utils.retry_call（指数退避）；认证失败（FatalSourceError）不重试；
-- 下载先落 <名字>.part、核对大小后才改名生效：半截文件永远不会以正式名进解析；
+- 下载先落 <名字>.part、已知远端大小时核对后才改名生效；源方仍须在写完后原子投递；
 - 远端布局两种：flat（root 下直接是文件）/ date_dir（root/{日期}/文件）；
 - 日期一律从文件名或日期目录的命名捕获组 (?P<date>...) 提取，规范化成 YYYYMMDD。
 
@@ -321,6 +321,16 @@ class SftpSource:
         与两个结算脚本口径一致：空目录是异常，但不是连接错误。
         """
         raw = self._run("列远端文件", self._scan)
+        # 日期格式归一化后，不同目录可能映射到同一本地文件，复用缓存会把其中一份写两遍。
+        for files in raw.values():
+            paths = {}
+            for item in files:
+                if item.ledger_key in paths:
+                    raise ConfigError(
+                        f"远端文件落地路径冲突：{paths[item.ledger_key]!r} 与 {item.remote!r}"
+                        f" 都映射到 {item.ledger_key!r}，请调整日期目录或文件命名"
+                    )
+                paths[item.ledger_key] = item.remote
         # 按日期升序返回（docstring 承诺的顺序）：_scan 的插入顺序是 READDIR 顺序，
         # 不能直接透传（下游 max()/遍历的可读性与稳定性）
         return {date: sorted(files, key=lambda item: item.name) for date, files in sorted(raw.items())}
@@ -364,8 +374,10 @@ class SftpSource:
                         continue
                     try:
                         followed = sftp.stat(self._join_root(entry.filename))
-                    except Exception as exc:  # noqa: BLE001 - 跟随失败按非目录处理，但要留痕
-                        log(f"  警告：软链日期目录 {entry.filename} 跟随失败（{exc}），已跳过")
+                    except OSError as exc:
+                        if not _is_missing_path_error(exc):
+                            raise  # 未知目录状态不能按缺失跳过，交给整轮扫描重试
+                        log(f"  警告：软链日期目录 {entry.filename} 已不存在（{exc}），已跳过")
                         continue
                     if not stat.S_ISDIR(followed.st_mode or 0):
                         continue

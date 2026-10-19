@@ -496,6 +496,16 @@ class TestSyncGuards(CliTestCase):
 class TestSyncNewColumns(CliTestCase):
     """源文件表头新增列：不报错、照常入库，发飞书提醒（人工决定是否加列）。"""
 
+    def test_untrusted_header_cannot_close_alert_code_span(self):
+        name = "note`<at id=all></at>[link](https://example.invalid)"
+        data = csv_bytes(HEADERS + [name], [["o1", "1.50", "hello"]])
+        with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
+            self.assertEqual(world.sync(bizdate="20260920"), 0)
+            alert = next(c for c in world.notify_calls if "新增列" in c["title"])
+            line = next(line for line in alert["lines"] if "**新增列**" in line)
+            self.assertEqual(line.count("`"), 2)
+            self.assertNotIn(name, line)
+
     def test_extra_columns_ingest_and_notify(self):
         data = csv_bytes(HEADERS + ["Note"], [["o1", "1.50", "hello"]])
         with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
@@ -918,6 +928,14 @@ class TestLockDirOverride(CliTestCase):
         self.assertEqual(path.parent, pinned)
         self.assertEqual(path, again)
         self.assertTrue(path.name.endswith(".lock"))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX surrogateescape 路径")
+    def test_lock_path_accepts_non_utf8_filename(self):
+        with mock.patch.dict(os.environ, {"SFTP2ODS_LOCK_DIR": str(self.tmp / "locks")}):
+            job = self.tmp / os.fsdecode(b"job-\xff.json")
+            path = cli_mod._lock_path(job)
+            self.assertEqual(path, cli_mod._lock_path(job))
+            self.assertTrue(path.name.endswith(".lock"))
 
     def test_env_override_unusable_fails_loudly(self):
         """显式指定的锁目录不可用要立刻报错（静默换目录就等于互斥失效）。"""

@@ -31,6 +31,18 @@ def validated(job: dict) -> dict:
     return job
 
 
+class TestTimezoneSecretRendering(unittest.TestCase):
+    def test_secret_timezone_is_resolved_before_today(self):
+        job = {"missing": {"timezone": "${secrets.tz}"}, "secrets": {"tz": "UTC"}, "job": "${today}"}
+        shared = {"secrets": {"tz": "Asia/Shanghai"}}
+        with mock.patch.object(config, "build_context", wraps=config.build_context) as build:
+            rendered, _ = config.render_job(job, shared, date(2026, 9, 18))
+        self.assertEqual(rendered["missing"]["timezone"], "UTC")
+        self.assertEqual(job["missing"]["timezone"], "${secrets.tz}")
+        self.assertEqual(shared["secrets"]["tz"], "Asia/Shanghai")
+        self.assertEqual(build.call_args.kwargs["tz"].key, "UTC")
+
+
 class TestLoadJson(OfflineTestCase):
     def test_missing_file(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -592,6 +604,15 @@ class TestResolveTargetAndDirs(OfflineTestCase):
             home = Path(tmp)
             with mock.patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}):
                 self.assertEqual(config.resolve_download_dir(job, home / "jobs" / "demo.json"), home / "sftp2ods-data")
+
+    def test_regex_requires_string(self):
+        for value in ({"pattern": "(?P<date>.*)"}, [".*"], 123):
+            with self.subTest(value=value), self.assertRaisesRegex(config.ConfigError, "字符串"):
+                config._compile_regex(value, "source.file_regex", need_date=True)
+
+    def test_oversized_numeric_configuration_is_readable_error(self):
+        with self.assertRaisesRegex(config.ConfigError, "sftp.port"):
+            config._require_number(10**400, "sftp.port", integer=True)
 
     def test_summary_lines(self):
         job = validated(minimal_job())

@@ -14,8 +14,9 @@ import re
 import time
 from pathlib import Path
 
+from . import _common
 from .parse import normalize_type
-from .utils import ConfigError, log, progress_log, require_identifier, retry_call
+from .utils import ConfigError, log, progress_log, redact, require_identifier, retry_call
 
 try:
     from odps import ODPS
@@ -142,44 +143,10 @@ def connect_odps(
 
 
 def run_sql_with_timeout(o, sql: str, timeout: int = SQL_TIMEOUT_SECONDS, desc: str = "SQL"):
-    """提交 SQL 并等待完成：成功返回 / 失败抛错 / 超时主动 stop() 取消并抛 TimeoutError。
-
-    超时预算从**提交前**开始计：提交本身若在网关侧卡了 5 分钟，轮询不会再拿到一整份
-    新预算（否则总数可以是 提交用时 + timeout）。提交与 Tunnel 的单次 HTTP 另由 pyodps
-    的 connect/read 超时（默认 120s）兜底。
-    """
-    # 单调时钟：墙钟被 NTP 校时/夏令时回拨会让 now - started 变负或突跳，
-    # 600 秒超时可能提前触发或永不触发
-    started = time.monotonic()
-    instance = o.run_sql(sql)
-    last_log = started
-    try:
-        while True:
-            if instance.is_successful():
-                return instance
-            if instance.is_terminated():
-                instance.wait_for_success(timeout=1)  # 触发一次，抛出带错误信息的异常
-                if not instance.is_successful():
-                    # 不能无条件 return：wait_for_success 万一没抛（超时语义/实现差异），
-                    # 终止但失败的实例会被当成成功
-                    raise RuntimeError(f"{desc} 已终止但未成功（实例 {getattr(instance, 'id', '?')}）")
-                return instance
-            now = time.monotonic()
-            if timeout and timeout > 0 and now - started > timeout:
-                raise TimeoutError(f"{desc} 执行超过 {timeout} 秒，已主动停止")
-            if timeout and timeout > 0 and now - last_log >= SQL_HEARTBEAT_SECONDS:
-                log(f"    {desc} 还在执行（已等待 {int(now - started)} 秒，超时阈值 {timeout} 秒）...")
-                last_log = now
-            time.sleep(1)
-    except BaseException:
-        # 任何提前退出（超时、轮询遇到网络抖动/5xx、KeyboardInterrupt）都不能把云端实例
-        # 留在运行中：只有超时分支 stop 的话，报错退出后云端那条昂贵 SQL 还在跑，
-        # 重跑还会与它并发操作同一个分区。先尽力 stop 再原样抛出
-        try:
-            instance.stop()
-        except Exception as exc:  # noqa: BLE001 - 取消失败不影响报错，但要留痕
-            log(f"    {desc} 取消失败（{type(exc).__name__}: {exc}），云端实例可能仍在运行")
-        raise
+    """通过公共实现等待 SQL，保留项目自身的时钟、脱敏日志与超时配置。"""
+    return _common.run_sql_with_timeout(
+        o, sql, timeout, desc, clock=time, log=lambda message: log(redact(message)), heartbeat=SQL_HEARTBEAT_SECONDS
+    )
 
 
 # =============================================================================

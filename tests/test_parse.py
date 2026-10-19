@@ -507,7 +507,7 @@ class TestFooter(SpecTestCase):
     def test_footer_dirty_number_is_rejected_like_data_rows(self):
         """合计行的数字口径与数据行一致：下划线/非 ASCII 脏值同样拒绝（Decimal 也接受它们）。"""
         for raw, must in (("1_0", "下划线"), ("１２３", "非 ASCII")):
-            path = self.make([["a", raw], ["b", raw]], footer=["", raw])
+            path = self.make([["a", "1.5"], ["b", "2.5"]], footer=["", raw])
             s = spec(self.COLS, footer={"sum": ["amount"]})
             with self.assertRaises(RuntimeError) as ctx:
                 self.rows_of(path, s)
@@ -584,9 +584,9 @@ class TestFooter(SpecTestCase):
 
     def test_footer_requires_first_column(self):
         s = spec(self.COLS, footer={"sum": ["amount"]})
-        # 表头缺第一列：footer 开启时直接报错
-        self.make_file("b.csv", csv_bytes(["Amount"], [["1"]]))
-        with self.assertRaises(RuntimeError):
+        # 必需列都在，但顺序与配置不同，必须由 footer 首列约束拒绝。
+        self.make_file("b.csv", csv_bytes(["Amount", "Name"], [["1", "a"]]))
+        with self.assertRaisesRegex(RuntimeError, "首列"):
             self.rows_of(self.tmp / "b.csv", s)
 
     def test_footer_amounts_use_same_number_rules_as_data_rows(self):

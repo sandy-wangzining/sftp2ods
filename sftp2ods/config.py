@@ -239,7 +239,19 @@ def render_job(job_raw: dict, config: dict, bizdate) -> tuple[dict, dict]:
     替换结果以**新副本**返回，不就地改写入参——同一进程里用同一个 config 跑多个作业时，
     就地改写会把上一个作业已替换的密钥/日期串到下一个作业。
     """
-    context = build_context(config, bizdate, job_raw.get("secrets"), tz=job_tz_of(job_raw))
+    # 时区先解析 secrets，再生成日期上下文，避免把占位符当成时区名。
+    clock_job = job_raw
+    clock_block = job_raw.get("missing")
+    if (
+        isinstance(clock_block, dict)
+        and isinstance(clock_block.get("timezone"), str)
+        and "${" in clock_block["timezone"]
+    ):
+        secrets = _as_secrets(config.get("secrets"), "--config 文件里的 secrets")
+        secrets.update(_as_secrets(job_raw.get("secrets"), "作业配置的 secrets"))
+        resolved_zone = deep_substitute(clock_block["timezone"], {"secrets": secrets})
+        clock_job = {**job_raw, "missing": {**clock_block, "timezone": resolved_zone}}
+    context = build_context(config, bizdate, job_raw.get("secrets"), tz=job_tz_of(clock_job))
     job = {key: value for key, value in job_raw.items() if key != "secrets"}
     rendered = deep_substitute(job, context)
     rendered["secrets"] = _as_secrets(job_raw.get("secrets"), "作业配置的 secrets")
@@ -384,7 +396,7 @@ def _require_number(
         raise ConfigError(f"{where} 必须是{'整数' if integer else '数字'}，实际 {value!r}")
     try:
         number = float(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ConfigError(f"{where} 必须是{'整数' if integer else '数字'}，实际 {value!r}") from exc
     if not math.isfinite(number):
         raise ConfigError(f"{where} 必须是有限数字（不能是 NaN/Infinity），实际 {value!r}")
@@ -400,7 +412,9 @@ def _require_number(
 
 def _compile_regex(value, where: str, need_date: bool, hint: str = "从文件名提取业务日期") -> None:
     """校验正则：能编译；需要日期捕获组时必须带命名组 date。"""
-    text = str(value or "")
+    if not isinstance(value, str):
+        raise ConfigError(f"{where} 必须是正则字符串，实际 {type(value).__name__}")
+    text = value
     if not text:
         raise ConfigError(f"作业配置缺少 {where}")
     try:

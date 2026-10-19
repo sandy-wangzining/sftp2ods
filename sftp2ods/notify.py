@@ -7,6 +7,7 @@ webhook 是凭证：日志里不出现它，抛出/回显的文本由调用方�
 
 from __future__ import annotations
 
+from ._common import feishu_card
 from .utils import log, redact, webhook_targets
 
 try:
@@ -40,17 +41,7 @@ def notify(
     if requests is None:
         log("  警告：缺少 requests，飞书通知跳过（pip install requests）")
         return False
-    card = {
-        "msg_type": "interactive",
-        "card": {
-            "config": {"wide_screen_mode": True},
-            "header": {"template": "red", "title": {"tag": "plain_text", "content": title}},
-            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(str(x) for x in lines)}}],
-        },
-    }
-    if footer:
-        card["card"]["elements"].append({"tag": "hr"})
-        card["card"]["elements"].append({"tag": "note", "elements": [{"tag": "plain_text", "content": footer}]})
+    card = feishu_card(title, lines, footer)
     sent = 0
     for hook in targets:
         try:
