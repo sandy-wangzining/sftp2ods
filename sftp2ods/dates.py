@@ -20,7 +20,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .utils import ConfigError
 
 DEFAULT_TZ = "Asia/Shanghai"
-DEFAULT_BIZDATE_TZ = "America/New_York"  # 没传业务日时的默认口径：美东昨天
 DATE_FMT = "%Y%m%d"
 # \A...\Z 而不是 ^...$：$ 会放过结尾的换行（"20260920\n" 静默通过校验）
 _DAY_COMPACT_RE = re.compile(r"\A\d{8}\Z", re.ASCII)  # 只认 ASCII 数字：全角数字不该被当成业务日
@@ -134,23 +133,6 @@ def env_bizdate(strict: bool = True) -> date | None:
             f"环境变量 bizdate/SKYNET_BIZDATE 的值不是合法日期：{raw!r}"
             f"（应为 YYYYMMDD 或 YYYY-MM-DD）；不打算用它请先 unset，或用 --bizdate 显式指定"
         ) from exc
-
-
-def default_bizdate(now: datetime | None = None) -> date:
-    """没传业务日时的默认值：美东时区（America/New_York）的昨天。
-
-    只在 --bizdate、--start-date/--end-date、环境变量 bizdate/SKYNET_BIZDATE 都没有时使用，
-    行为等价于显式传这一天；不再回退"处理远端全部日期"（全量重扫请显式给区间）。
-    """
-    tz = load_zone(DEFAULT_BIZDATE_TZ)
-    if now is None:
-        moment = datetime.now(tz)
-    elif now.tzinfo is None:
-        # 与 expected_latest 同口径：朴素时间按给定时区解释，不按本机时区
-        moment = now.replace(tzinfo=tz)
-    else:
-        moment = now.astimezone(tz)
-    return moment.date() - timedelta(days=1)
 
 
 def parse_grace(text: str) -> tuple[int, int]:

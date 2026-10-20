@@ -97,20 +97,6 @@ class TestEnvBizdate(OfflineTestCase):
             dates.parse_day_arg("２０２６０９２０")
 
 
-class TestDefaultBizdate(OfflineTestCase):
-    def test_us_eastern_yesterday(self):
-        now = datetime(2026, 9, 24, 10, 0, tzinfo=timezone.utc)  # 06:00 EDT
-        self.assertEqual(dates.default_bizdate(now=now).isoformat(), "2026-09-23")
-
-    def test_boundary_uses_eastern_date(self):
-        # 2026-09-24 03:00 UTC = 2026-09-23 23:00 EDT → 美东昨天是 22 日（不是 UTC 的 23 日）
-        now = datetime(2026, 9, 24, 3, 0, tzinfo=timezone.utc)
-        self.assertEqual(dates.default_bizdate(now=now).isoformat(), "2026-09-22")
-
-    def test_naive_now_is_interpreted_in_eastern(self):
-        self.assertEqual(dates.default_bizdate(now=datetime(2026, 9, 24, 10, 0)).isoformat(), "2026-09-23")
-
-
 class TestGrace(OfflineTestCase):
     def test_parse(self):
         self.assertEqual(dates.parse_grace("02:30"), (2, 30))
