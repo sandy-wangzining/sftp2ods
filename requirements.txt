@@ -1,4 +1,4 @@
-# 运行时依赖（优先级见 pyproject.toml 的 dependencies）
+# 运行时依赖（与 pyproject.toml 的 dependencies 保持一致）
 paramiko>=3.0
 requests>=2.25
 pyodps>=0.11

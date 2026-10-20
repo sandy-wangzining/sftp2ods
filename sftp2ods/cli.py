@@ -3,7 +3,7 @@
 
 一次运行的完整流程（run_sync）：
     1) 解析参数 → 列远端文件 → 缺文件核对（缺了飞书告警 + 跳过缺失日期，照常同步已有文件；
-       但显式点名单日（--bizdate/环境变量 bizdate）整天无文件时直接失败，防静默缺数）
+       但显式点名或默认的单日（--bizdate/环境变量 bizdate/默认业务日）整天无文件时直接失败，防静默缺数）
     2) 逐日期：跳过已上传 → 下载（.part 校验大小）→ 解析数行数（先全量校验一遍）
     3) 写库：自动建表/校验结构 → 删分区 → Tunnel 分批写入 → count(*) 行数核对
     4) 台账记录每个文件（表/pt/大小/行数），校验通过才落账；失败中断后重跑幂等自愈
@@ -18,7 +18,6 @@ import math
 import os
 import sys
 import tempfile
-from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import VERSION
@@ -33,7 +32,6 @@ from .config import (
     check_block_types,
     collect_warnings,
     get_mc_profile_meta,
-    job_tz_of,
     load_json_file,
     normalize_job,
     render_job,
@@ -112,7 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  # 正式同步：调度传业务日（只处理该日期的文件）；pt = 文件日期\n"
             "  sftp2ods --job jobs/demo.json --bizdate ${bizdate}\n"
             "\n"
-            "  # 补数（闭区间）；不传 --bizdate 且不给区间时默认美东昨天（只处理那一天）\n"
+            "  # 补数（闭区间）；不传 --bizdate 且不给区间时默认 ODS_BIZDATE_TZ 时区的昨天（默认美东，只处理那一天）\n"
             "  sftp2ods --job jobs/demo.json --start-date 2026-09-01 --end-date 2026-09-10\n"
             "\n"
             f"占位符：{build_context_doc()}\n"
@@ -128,11 +126,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         # 默认必须是 None 而不是 ""：空串无法区分"没传 --bizdate"与"显式传了空值"
         # （调度脚本 `--bizdate "$pt"` 且 $pt 未定义）——后者要报错，不能静默回退处理全部日期
-        help="只处理该日期的文件（yyyyMMdd 或 yyyy-MM-dd；默认读环境变量 bizdate，都没有则取美东昨天）",
+        help="只处理该日期的文件（yyyyMMdd 或 yyyy-MM-dd；默认读环境变量 bizdate，都没有则取 ODS_BIZDATE_TZ 时区的昨天，默认美东）",
     )
     parser.add_argument("--start-date", default="", help="补数/调试：起始日期（含），可与 --end-date 单独使用")
     parser.add_argument("--end-date", default="", help="补数/调试：结束日期（含）")
-    parser.add_argument("--force", action="store_true", help="忽略已上传台账，全部重写（缺文件核对仍然生效）")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="忽略已上传台账，全部重写（复用本地已下载文件、不重新下载；缺文件核对仍然生效）",
+    )
     parser.add_argument("--dry-run", action="store_true", help="只下载并数行数，不写 MaxCompute")
     parser.add_argument("--no-notify", action="store_true", help="缺文件/空目录时只报错，不发飞书")
     parser.add_argument("--endpoint", default="", help="MaxCompute endpoint（覆盖作业里的配置）")
@@ -662,22 +664,66 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
         items = files_by_date[date]
 
         def done(item, date=date):
-            """台账 + 本地文件都齐（大小一致）→ 该文件已上传；远端文件更新过会自动重下重写。
+            """台账 + 本地文件都齐（大小与修改时间一致）→ 该文件已上传；远端文件更新过会自动重下重写。
 
             allow_legacy=True：允许回退到旧脚本的平铺文件——台账已经证明那个键属于这一天，
             跳过是安全的；下载阶段绝不会这么认（见 _pick_local）。
             台账里有 md5 时同时校验内容：本地文件被误改/损坏但大小没变也能发现。
+            mtime 用来发现"同尺寸重写"（结算文件更正金额很常见）：远端 mtime 变了就重下。
             """
             keys = (item.ledger_key,) if item.ledger_key == item.name else (item.ledger_key, item.name)
-            record = state_mod.record_of(ledger, keys, item.size, table_name, date, project=project)
+            record = state_mod.record_of(ledger, keys, item.size, table_name, date, project=project, mtime=item.mtime)
             return bool(record) and _pick_local(
                 download_dir, item, allow_legacy=True, md5=str((record or {}).get("md5") or "")
             )
 
-        if not args.force and all(done(item) for item in items):
-            skipped += 1
-            state_mod.log_skip(date, items)
-            continue
+        def date_done():
+            """该日期下所有当前文件都已完成，且台账里没有已从远端消失的旧文件记录。"""
+            if not all(done(item) for item in items):
+                return False
+            known = {item.ledger_key for item in items} | {item.name for item in items}
+            for key, record in ledger.items():
+                if not isinstance(record, dict):
+                    continue
+                if record.get("table") != table_name or record.get("pt") != date:
+                    continue
+                if record.get("project") and record.get("project") != project:
+                    continue
+                if key not in known:
+                    # 远端删掉了这个文件：必须重建该 pt，不能靠台账跳过、把已删文件的行留在分区里
+                    return False
+            return True
+
+        if not args.force and date_done():
+            partition_ok = True
+            if table is not None:
+                try:
+                    partition_ok = mc_mod.partition_exists(table, date)
+                except Exception as exc:  # noqa: BLE001 - 元数据查询失败要给脱敏结论，不能裸 traceback
+                    log(f"❌ pt={date} 查询目标分区是否存在失败：{_redact_job(job, exc, config)}")
+                    return 1
+            if not partition_ok:
+                # 台账只是"曾经写成功"的凭证：目标表被重建/分区被手工删掉后继续跳过，
+                # 会 rc=0 但分区缺失。确认不存在就重新下载/写入。
+                log(f"  台账显示 {date} 已上传，但目标分区 pt={date} 不存在，重新写入")
+            else:
+                skipped += 1
+                state_mod.log_skip(date, items)
+                continue
+
+        # 远端已不存在的文件的台账记录：本次重建后一并删除，否则下次运行又会因为它们重建
+        known = {item.ledger_key for item in items} | {item.name for item in items}
+        orphans = {
+            key: record
+            for key, record in ledger.items()
+            if isinstance(record, dict)
+            and record.get("table") == table_name
+            and record.get("pt") == date
+            and (not record.get("project") or record.get("project") == project)
+            and key not in known
+        }
+        for key in orphans:
+            ledger.pop(key, None)
 
         # 下载该日期下所有文件（本地已有且大小一致的不重下）
         local_paths: list[Path] = []
@@ -686,8 +732,10 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
             # 没变时原来会按"仅比大小"复用它——损坏数据被重新解析上传、台账 md5 还被覆盖，
             # 而且永远不再从远端重下
             keys = (item.ledger_key,) if item.ledger_key == item.name else (item.ledger_key, item.name)
-            record = state_mod.record_of(ledger, keys, item.size, table_name, date, project=project)
-            existing = _pick_local(download_dir, item, md5=str((record or {}).get("md5") or ""))
+            record = state_mod.record_of(ledger, keys, item.size, table_name, date, project=project, mtime=item.mtime)
+            # 没有当前台账记录（新文件、远端更新、删了又出现）一律重下：本地同尺寸文件
+            # 可能是旧内容，靠 size 复用会把旧数据重新写进分区。
+            existing = _pick_local(download_dir, item, md5=str(record.get("md5") or "")) if record is not None else None
             if existing is not None:
                 local_paths.append(existing)
                 continue
@@ -759,6 +807,25 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
                     return 1
             log(f"  警告：pt={date} 解析出 0 行，将写入空分区（源文件不该为空时请检查解析配置）")
 
+        # 即将先删再填：先把该日期已有的台账记录从磁盘作废。否则写库中途失败时，
+        # 旧台账仍写着“已完成”，下一次运行会直接跳过这个可能已经空/缺行的分区。
+        stale = {
+            key: record
+            for key, record in ledger.items()
+            if isinstance(record, dict)
+            and record.get("table") == table_name
+            and record.get("pt") == date
+            and (not record.get("project") or record.get("project") == project)
+        }
+        if stale:
+            for key in stale:
+                ledger.pop(key, None)
+            try:
+                state_mod.save_state(ledger_path, {}, drop_keys=stale)
+            except OSError as exc:
+                log(f"❌ 写库前作废旧台账失败：{ledger_path}（{exc}）；未动目标分区，重跑即可")
+                return 1
+
         try:
             mc_mod.write_partition(
                 o,
@@ -784,17 +851,22 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
         # 写入并校验成功后才记台账（失败中断后重跑会重试这个日期）
         # 台账带 md5：下次运行时跳过判断会校验本地文件内容（防误改/静默损坏），
         # 旧台账没有 md5 字段时按只比大小兼容处理（见 state.local_ready）
+        new_records = {}
         for index, (item, path) in enumerate(zip(items, local_paths)):
-            ledger[item.ledger_key] = {
+            record = {
                 "project": project,
                 "table": table_name,
                 "pt": date,
                 "size": item.size,
+                "mtime": item.mtime,
                 "rows": file_rows[index],
                 "md5": state_mod.md5_of(path),
             }
+            ledger[item.ledger_key] = record
+            new_records[item.ledger_key] = record
         try:
-            state_mod.save_state(ledger_path, ledger)
+            # 只提交本次写成功的记录；整份内存态会把其它进程期间更新的键覆盖回旧值
+            state_mod.save_state(ledger_path, new_records, drop_keys=orphans)
         except OSError as exc:
             # 数据本身已经写好并校验过；台账写不进去只是"下次会重传"，
             # 但既然本地状态已经异常，按失败退出让调度可见（重跑幂等）
@@ -894,10 +966,10 @@ def main(argv: list[str] | None = None) -> int:
 
         job_path = Path(args.job).resolve()
         job_raw = load_json_file(job_path, "作业配置文件")
-        # 类型检查提到最前面：下面 job_tz_of 就要取 missing.timezone，而 missing 写成字符串时是裸 traceback
+        # 类型检查提到最前面：下面 render_job 就会取 missing.timezone，而 missing 写成字符串时是裸 traceback
         check_block_types(job_raw)
 
-        # 业务日：--bizdate > 环境变量（DataWorks）> 美东昨天（正式同步）
+        # 业务日：--bizdate > 环境变量（DataWorks）> 默认业务日（ODS_BIZDATE_TZ 时区的昨天）
         # --check 不传日期仍核对整个区间（只读体检，不写库）
         # 顺序要紧：先看显式 --bizdate，没有才读环境变量；环境变量畸形必须报错（静默回退会处理错日期）
         bizdate = ""
@@ -907,15 +979,17 @@ def main(argv: list[str] | None = None) -> int:
         elif args.start_date or args.end_date:
             # 显式补数区间优先于环境变量 bizdate：调度环境里 bizdate 总是存在，不忽略它的话
             # 合法的补数命令会被 run_sync 的"单日 vs 区间"互斥拦下（退出码还会错成 1）
-            base_day = datetime.now(job_tz_of(job_raw)).date() - timedelta(days=1)
+            # ${bizdate} 占位符仍按统一缺省值（默认业务日）渲染
+            base_day = default_bizdate()
         else:
             from_env = env_bizdate(strict=not args.check)
             if from_env is not None:
                 bizdate = from_env.strftime("%Y%m%d")
                 base_day = from_env
             elif args.check:
-                # 体检不传日期：仍按整个远端区间核对（bizdate 留空）
-                base_day = datetime.now(job_tz_of(job_raw)).date() - timedelta(days=1)
+                # 体检不传日期：仍按整个远端区间核对（bizdate 留空），
+                # ${bizdate} 占位符与正式同步一样按默认业务日渲染
+                base_day = default_bizdate()
             else:
                 base_day = default_bizdate()
                 bizdate = base_day.strftime("%Y%m%d")
