@@ -156,8 +156,8 @@ class TestScanFlat(OfflineTestCase):
 
     def test_multi_files_per_date_sorted(self):
         fake = FakeSftp()
-        add_file(fake, "/data/report_20260920.csv", b"1")
-        add_file(fake, "/data/report_20260920_2.csv", b"22")
+        add_file(fake, "/data/report_20260920_2.csv", b"1")
+        add_file(fake, "/data/report_20260920.csv", b"22")
         source = flat_source(source={"file_regex": "report_(?P<date>\\d{8})(?:_2)?\\.csv"})
         with mock.patch.object(sftp_mod.SftpSource, "_connect", connect_to(fake)):
             files = source.list_files()
@@ -187,6 +187,24 @@ class TestScanFlat(OfflineTestCase):
 
 
 class TestScanDateDir(OfflineTestCase):
+    def test_normalized_date_dirs_cannot_share_local_file(self):
+        fake = FakeSftp()
+        for dirname in ("20260920", "2026-09-20"):
+            add_dir(fake, f"settlements/{dirname}")
+            add_file(fake, f"settlements/{dirname}/detail_20260920.csv", b"a\n1\n")
+        source = flat_source(
+            source={
+                "root": "settlements",
+                "layout": "date_dir",
+                "date_dir_regex": r"(?P<date>\d{4}-?\d{2}-?\d{2})",
+                "file_regex": r"detail_(?P<date>\d{8})\.csv",
+            }
+        )
+        with mock.patch.object(sftp_mod.SftpSource, "_connect", connect_to(fake)):
+            with self.assertRaisesRegex(sftp_mod.ConfigError, "落地路径冲突"):
+                source.list_files()
+        self.assertEqual(fake.get_calls, 0)
+
     def test_date_from_dir(self):
         fake = FakeSftp()
         add_dir(fake, "settlements/20260920")
@@ -216,7 +234,7 @@ class TestScanDateDir(OfflineTestCase):
         """指向日期目录的软链（st_mode 是 S_IFLNK）要跟随判断：flat 布局显式支持软链，
         date_dir 下若直接跳过，整个业务日期会从结果里静默消失。"""
         fake = FakeSftp()
-        fake.tree["settlements"] = [FakeEntry("20260920", 0, is_dir=True, is_link=True)]
+        fake.tree["settlements"] = [FakeEntry("20260920", 0, is_link=True)]
         fake.tree["settlements/20260920"] = [FakeEntry("detail_x_20260920_USD.csv", 8)]
         fake.contents["settlements/20260920/detail_x_20260920_USD.csv"] = b"a,b\n1,2\n"
         source = date_dir_source()
@@ -233,6 +251,18 @@ class TestScanDateDir(OfflineTestCase):
         with mock.patch.object(sftp_mod.SftpSource, "_connect", connect_to(fake)):
             files = source.list_files()
         self.assertEqual(files, {})
+
+    def test_symlink_directory_stat_failure_retries_scan(self):
+        fake = FakeSftp()
+        fake.tree["settlements"] = [FakeEntry("20260920", 0, is_link=True)]
+        source = date_dir_source(sftp={"retry_times": 1})
+        with (
+            mock.patch.object(sftp_mod.SftpSource, "_connect", connect_to(fake)),
+            mock.patch.object(fake, "stat", side_effect=OSError("connection reset")) as probe,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "connection reset"):
+                source.list_files()
+        self.assertEqual(probe.call_count, 2)
 
     def test_subdir_transient_failure_propagates(self):
         """子目录列失败若是瞬时错误（非"路径不存在"），必须抛出去让重试生效。

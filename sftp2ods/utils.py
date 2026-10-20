@@ -14,6 +14,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import quote, quote_plus, unquote
 
+from ._common import leaf_strings as _leaf_strings
+from ._common import webhook_targets as webhook_targets
+from ._common import with_scheme_bare as _with_scheme_bare
+
 try:
     import fcntl  # Linux / macOS：进程级运行锁
 except ImportError:  # pragma: no cover - Windows 没有 fcntl
@@ -725,30 +729,8 @@ _MAX_REDACT_DEPTH = 10
 
 # sftp.auth 里承载凭证的字段名（结构性字段 type 不在此列）
 _SFTP_SECRET_KEYS = frozenset({"password", "passphrase", "key_file", "token", "secret_key"})
-_AUTH_SCHEMES = frozenset({"basic", "bearer", "token", "digest"})
 # 结构性字段后缀：值为配置项名/位置，不是凭证
 _AUTH_STRUCT_SUFFIXES = ("_field", "_in", "_name", "_param")
-
-
-def _leaf_strings(value) -> list[str]:
-    """递归收集 dict/list/tuple/set 里的字符串叶子（数字也按 str 收）。"""
-    if isinstance(value, dict):
-        return [item for sub in value.values() for item in _leaf_strings(sub)]
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return [item for sub in value for item in _leaf_strings(sub)]
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return [str(value)]
-    return []
-
-
-def _with_scheme_bare(value: str) -> list[str]:
-    """`Bearer sk-xxx` 除整串外再收集裸 token：接口常常只回显后半截。"""
-    head, sep, tail = value.partition(" ")
-    if sep and head.lower() in _AUTH_SCHEMES and tail.strip():
-        return [value, tail.strip()]
-    return [value]
 
 
 # 飞书 webhook 里的 hook id（/hook/<id>）：报错/日志里常只出现后半截
@@ -763,28 +745,6 @@ def _webhook_values(value) -> list[str]:
         match = _WEBHOOK_ID_RE.search(part)
         if match:
             result.append(match.group(1))
-    return result
-
-
-def webhook_targets(value) -> list[str]:
-    """把 notify.webhook 归一化成地址列表（字符串或字符串数组）。
-
-    运行时口径：去首尾空白、去空、去重保序；非字符串元素忽略——配置校验阶段会先拦，
-    这里再兜一层，保证告警链路不会因为一个写错的目标把主流程带崩。
-    """
-    if isinstance(value, str):
-        value = [value]
-    if not isinstance(value, (list, tuple)):
-        return []
-    result: list[str] = []
-    seen: set[str] = set()
-    for item in value:
-        if not isinstance(item, str):
-            continue
-        item = item.strip()
-        if item and item not in seen:
-            seen.add(item)
-            result.append(item)
     return result
 
 
