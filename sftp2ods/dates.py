@@ -5,8 +5,9 @@
 - 远端每个文件都能提取出一个"文件日期"（文件名或日期子目录），它就是该文件数据所属的业务日；
 - 写入时 pt = 文件日期，一个日期一个分区（一天多个文件合并进同一个 pt）；
 - --bizdate 只处理那一天；--start-date/--end-date 处理区间；
+- CLI 没传业务日、也没给区间/环境变量时，默认取美东时区（America/New_York）的昨天；
 - 缺文件核对：对 [核对区间] 内每一天，远端至少要有匹配文件；缺了只告警 + 跳过缺失日期
-  （照常同步已有文件），只有"显式点名单日（--bizdate/环境变量 bizdate）整天无文件"才失败。
+  （照常同步已有文件），只有"显式点名单日（--bizdate/环境变量 bizdate/默认业务日）整天无文件"才失败。
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .utils import ConfigError
 
 DEFAULT_TZ = "Asia/Shanghai"
+DEFAULT_BIZDATE_TZ = "America/New_York"  # 没传业务日时的默认口径：美东昨天
 DATE_FMT = "%Y%m%d"
 # \A...\Z 而不是 ^...$：$ 会放过结尾的换行（"20260920\n" 静默通过校验）
 _DAY_COMPACT_RE = re.compile(r"\A\d{8}\Z", re.ASCII)  # 只认 ASCII 数字：全角数字不该被当成业务日
@@ -134,6 +136,23 @@ def env_bizdate(strict: bool = True) -> date | None:
         ) from exc
 
 
+def default_bizdate(now: datetime | None = None) -> date:
+    """没传业务日时的默认值：美东时区（America/New_York）的昨天。
+
+    只在 --bizdate、--start-date/--end-date、环境变量 bizdate/SKYNET_BIZDATE 都没有时使用，
+    行为等价于显式传这一天；不再回退"处理远端全部日期"（全量重扫请显式给区间）。
+    """
+    tz = load_zone(DEFAULT_BIZDATE_TZ)
+    if now is None:
+        moment = datetime.now(tz)
+    elif now.tzinfo is None:
+        # 与 expected_latest 同口径：朴素时间按给定时区解释，不按本机时区
+        moment = now.replace(tzinfo=tz)
+    else:
+        moment = now.astimezone(tz)
+    return moment.date() - timedelta(days=1)
+
+
 def parse_grace(text: str) -> tuple[int, int]:
     """解析消息里的 grace（"HH:MM"），返回 (小时, 分钟)；空串返回 (0, 0)。"""
     value = str(text or "").strip()
@@ -200,6 +219,7 @@ def plan_dates(
     - 核对区间：--bizdate 时只核对那一天；否则 [max(远端最早, --start-date), --end-date 或预期最新]。
       显式 start 早于远端最早时按远端最早算，避免把"源方本来就没有的更早历史"误报成缺失。
     - 处理日期：--bizdate 单日；否则按 --start-date/--end-date 过滤全部远端日期（都没给 = 全部）。
+      CLI 正式同步在没传业务日时会先补一个默认业务日（美东昨天），所以不会走到"全部"这一支。
     - check_missing=False 时不做缺文件核对（missing 恒为空）。
     """
     if not all_dates:

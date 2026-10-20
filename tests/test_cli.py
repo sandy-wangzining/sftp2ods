@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest import mock
 
@@ -292,7 +293,8 @@ class TestSyncRangeNoOverlap(CliTestCase):
             "/data/report_20260922.csv": report([["o2", "2.00"]]),
         }
         with World(self.tmp, files=files) as world:
-            self.assertEqual(world.sync(), 0)  # 不传区间：缺 20260921 仍只告警、照常同步
+            # 直接调 run_sync（bizdate 为空）= 全部远端日期；CLI 不传日期已默认美东昨天
+            self.assertEqual(world.sync(), 0)  # 缺 20260921 仍只告警、照常同步
             self.assertTrue(any("缺少文件" in str(line) for line in world.access_logs))
 
 
@@ -316,10 +318,11 @@ class TestSyncGuards(CliTestCase):
         with World(self.tmp, files=files) as world:
             self.assertEqual(world.sync(bizdate="20260921", force=True), 0)
             self.assertEqual(world.table.deleted, [])
-            self.assertTrue(any("缺少文件" in str(line) for line in world.access_logs))
+            self.assertTrue(any("没有任何匹配文件" in str(line) for line in world.access_logs))
 
     def test_missing_without_bizdate_still_warns(self):
-        # ②不传业务日（处理远端全部日期）时缺某天：仍只告警不失败（回归，防改坏 1.2.0 原设计）。
+        # ②直接调 run_sync 且 bizdate 为空（处理远端全部日期）时缺某天：仍只告警不失败
+        #   （CLI 现在不传日期会默认美东昨天，不再走这条全量分支）。
         files = {
             "/data/report_20260920.csv": report([["o1", "1.00"]]),
             "/data/report_20260922.csv": report([["o2", "2.00"]]),
@@ -351,7 +354,8 @@ class TestSyncGuards(CliTestCase):
             self.assertTrue(any("没有要处理的日期" in str(line) for line in world.access_logs))
 
     def test_missing_file_writes_existing_dates_anyway(self):
-        # 缺 20260921，但 20 与 22 的文件要照常写入（下游任务不受影响）
+        # 直接调 run_sync 的全量分支：缺 20260921，但 20 与 22 的文件要照常写入
+        # （CLI 不传日期已改为美东昨天单日，不再走这条分支）
         files = {
             "/data/report_20260920.csv": report([["o1", "1.00"]]),
             "/data/report_20260922.csv": report([["o2", "2.00"]]),
@@ -724,6 +728,39 @@ class TestCheck(CliTestCase):
             self.assertEqual(world.check(), 1)
 
 
+class TestDefaultBizdateCli(CliTestCase):
+    def test_no_date_defaults_to_us_eastern_yesterday(self):
+        files = {
+            "/data/report_20260920.csv": report([["o1", "1.00"]]),
+            "/data/report_20260921.csv": report([["o2", "2.00"]]),
+        }
+        with World(self.tmp, files=files) as world:
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.object(cli_mod, "default_bizdate", return_value=date(2026, 9, 21)),
+            ):
+                rc = cli_mod.main(["--job", str(world.job_path)])
+            self.assertEqual(rc, 0)
+            self.assertEqual(sorted(world.table.deleted), ["pt=20260921"])
+            self.assertEqual([r[0] for r in world.table.rows_in("20260921")], ["o2"])
+
+    def test_check_without_date_does_not_use_default_bizdate(self):
+        files = {
+            "/data/report_20260920.csv": report([["o1", "1.00"]]),
+            "/data/report_20260922.csv": report([["o2", "2.00"]]),
+        }
+        with World(self.tmp, files=files) as world:
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.object(cli_mod, "default_bizdate", side_effect=AssertionError("--check 不应使用默认业务日")),
+                mock.patch.object(cli_mod, "expected_latest", return_value="20260922"),
+            ):
+                rc = cli_mod.main(["--job", str(world.job_path), "--check"])
+            self.assertEqual(rc, 0)
+            joined = "\n".join(str(line) for line in world.access_logs)
+            self.assertIn("20260921", joined)
+
+
 class TestMainEntry(CliTestCase):
     def test_no_job_returns_2(self):
         self.assertEqual(cli_mod.main([]), 2)
@@ -797,8 +834,8 @@ class TestMainEntry(CliTestCase):
             self.assertEqual(rc, 0)
 
     def test_env_bizdate_missing_day_returns_1(self):
-        # 调度（DataWorks）用环境变量 bizdate 点名某天、而该天无文件：与 --bizdate 同样失败（rc=1）。
-        # 这正是 F6 要防的"静默缺数"场景——调度看到 rc=0 会以为 pt=<bizdate> 已产出，其实没有。
+        # 调度：DataWorks环境变量 bizdate 点名某天、而远端没有文件：与默认单日路径一致。
+        # 但按 F6 要求"不静默缺数"：不能返回 rc=0 假装 pt=<bizdate> 已产生（其实没有）。
         files = {"/data/report_20260920.csv": report([["o1", "1.00"]])}
         with World(self.tmp, files=files) as world:
             with mock.patch.dict("os.environ", {"bizdate": "20260921"}, clear=False):
