@@ -26,7 +26,7 @@ from . import mc as mc_mod
 from . import parse as parse_mod
 from . import sftp as sftp_mod
 from . import state as state_mod
-from ._common import private_lock_dir, safe_label
+from ._common import default_bizdate, private_lock_dir, safe_label
 from .config import (
     build_context_doc,
     build_job_summary,
@@ -112,7 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  # 正式同步：调度传业务日（只处理该日期的文件）；pt = 文件日期\n"
             "  sftp2ods --job jobs/demo.json --bizdate ${bizdate}\n"
             "\n"
-            "  # 补数（闭区间）；不传 --bizdate 时默认处理远端全部未上传日期\n"
+            "  # 补数（闭区间）；不传 --bizdate 且不给区间时默认美东昨天（只处理那一天）\n"
             "  sftp2ods --job jobs/demo.json --start-date 2026-09-01 --end-date 2026-09-10\n"
             "\n"
             f"占位符：{build_context_doc()}\n"
@@ -128,7 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         # 默认必须是 None 而不是 ""：空串无法区分"没传 --bizdate"与"显式传了空值"
         # （调度脚本 `--bizdate "$pt"` 且 $pt 未定义）——后者要报错，不能静默回退处理全部日期
-        help="只处理该日期的文件（yyyyMMdd 或 yyyy-MM-dd；默认读环境变量 bizdate）",
+        help="只处理该日期的文件（yyyyMMdd 或 yyyy-MM-dd；默认读环境变量 bizdate，都没有则取美东昨天）",
     )
     parser.add_argument("--start-date", default="", help="补数/调试：起始日期（含），可与 --end-date 单独使用")
     parser.add_argument("--end-date", default="", help="补数/调试：结束日期（含）")
@@ -555,25 +555,41 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
 
     if missing:
         # 缺文件只告警、不失败：源方产数是人/上游系统排期（节假日、结算方停产出是常态），
-        # 缺几天不等于任务失败——跳过缺失日期、照常同步已有的文件（缺失日期后面补产
-        # 出后，下次运行会自动下载写分区）。真正的异常（远端目录一个文件都没有、
-        # 日期范围与远端无交集）仍按失败处理。
+        # 缺几天不等于任务失败——跳过缺失日期、照常同步已有的文件。真正的异常（远端目录
+        # 一个文件都没有、日期范围与远端无交集）仍按失败处理。
+        # 单日调度（点名的那天正好缺失）不会在后续运行自动补：告警里明确提示用 --bizdate 回刷。
         shown = "、".join(missing[:MISSING_SHOW_LIMIT]) + (" 等" if len(missing) > MISSING_SHOW_LIMIT else "")
-        log(
-            f"⚠️ 【{job_name}】缺少文件：{shown}（共 {len(missing)} 个）；"
-            f"已有最新：{max(all_dates)}，预期到：{range_end}；本次跳过缺失日期、继续处理已有文件"
-        )
-        notifier(
-            f"{job_name}：文件缺失（已跳过继续）",
-            [
-                f"**缺少日期**：{shown}（共 {len(missing)} 个）",
-                f"**当前最大**：{max(all_dates)}",
-                f"**预期到**：{range_end}",
-                "本次已跳过缺失日期、照常同步已有文件，下游任务不受影响；",
-                "缺失日期补产出后下次运行会自动同步，无需人工干预。",
-            ],
-            footer,
-        )
+        if bizdate and bizdate in missing:
+            log(
+                f"⚠️ 【{job_name}】业务日 {bizdate} 在远端没有任何匹配文件；"
+                f"本次按告警继续（pt={bizdate} 不会产生，其他日期未受影响）"
+            )
+            notifier(
+                f"{job_name}：业务日 {bizdate} 远端无文件（已跳过继续）",
+                [
+                    f"**业务日**：{bizdate}",
+                    f"**远端数据范围**：{min(all_dates)} ~ {max(all_dates)}",
+                    f"该业务日没有匹配文件，`pt={bizdate}` 分区不会产生。",
+                    f"如源方稍后补产出，请用 `--bizdate {bizdate}` 回刷（下次调度不会自动补该日）。",
+                ],
+                footer,
+            )
+        else:
+            log(
+                f"⚠️ 【{job_name}】缺少文件：{shown}（共 {len(missing)} 个）；"
+                f"已有最新：{max(all_dates)}，预期到：{range_end}；本次跳过缺失日期、继续处理已有文件"
+            )
+            notifier(
+                f"{job_name}：文件缺失（已跳过继续）",
+                [
+                    f"**缺少日期**：{shown}（共 {len(missing)} 个）",
+                    f"**当前最大**：{max(all_dates)}",
+                    f"**预期到**：{range_end}",
+                    "本次已跳过缺失日期、照常同步已有文件，下游任务不受影响；",
+                    "缺失日期补产出后下次运行会自动同步，无需人工干预。",
+                ],
+                footer,
+            )
     if check_missing and range_start and range_start <= range_end:
         state = "完整" if not missing else "有缺失（上面已告警并跳过）"
         log(
@@ -881,7 +897,8 @@ def main(argv: list[str] | None = None) -> int:
         # 类型检查提到最前面：下面 job_tz_of 就要取 missing.timezone，而 missing 写成字符串时是裸 traceback
         check_block_types(job_raw)
 
-        # 业务日：--bizdate > 环境变量（DataWorks）> 不设置（处理远端全部未上传日期）
+        # 业务日：--bizdate > 环境变量（DataWorks）> 美东昨天（正式同步）
+        # --check 不传日期仍核对整个区间（只读体检，不写库）
         # 顺序要紧：先看显式 --bizdate，没有才读环境变量；环境变量畸形必须报错（静默回退会处理错日期）
         bizdate = ""
         if args.bizdate is not None:
@@ -896,8 +913,12 @@ def main(argv: list[str] | None = None) -> int:
             if from_env is not None:
                 bizdate = from_env.strftime("%Y%m%d")
                 base_day = from_env
-            else:
+            elif args.check:
+                # 体检不传日期：仍按整个远端区间核对（bizdate 留空）
                 base_day = datetime.now(job_tz_of(job_raw)).date() - timedelta(days=1)
+            else:
+                base_day = default_bizdate()
+                bizdate = base_day.strftime("%Y%m%d")
 
         # 替换 ${secrets.x}/${bizdate} 等占位符；--config 的 maxcompute/profiles 用返回的副本
         # （render_job 不改写入参，同一进程重复调用时不会串上一个作业已替换的密钥/日期）
