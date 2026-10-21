@@ -48,17 +48,24 @@ def load_state(path: Path) -> dict:
     return data
 
 
-def save_state(path: Path, state: dict) -> None:
+def save_state(path: Path, state: dict, drop_keys=()) -> None:
     """写台账（进程间锁 + 与磁盘合并 + 临时文件原子替换）。
 
     两个工具可能共用一份台账：只做原子替换挡不住丢更新（A 读完后 B 写入的记录会被 A 整文件覆盖）。
     因此在 load-modify-save 外包一层跨平台文件锁（POSIX flock / Windows msvcrt），
     持锁期间重新读盘再合并本次记录。
+
+    state 只应传**本次真正写成功的记录**，不要传运行开始时加载的整份台账：整份旧快照
+    会把其它进程在本次运行期间更新的同名键覆盖回旧值。drop_keys 用于删除本次日期里
+    已不存在于远端的旧文件记录：只删除磁盘上仍与快照一致的记录，避免误删并发进程刚写入的新记录。
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with interprocess_lock(path.with_name(path.name + ".lock")):
         merged = load_state(path)
+        for key, expected in dict(drop_keys).items():
+            if merged.get(key) == expected:
+                merged.pop(key, None)
         merged.update(state)
         _write_state_unlocked(path, merged)
 
@@ -82,13 +89,18 @@ def _write_state_unlocked(path: Path, state: dict) -> None:
             pass
 
 
-def record_of(state: dict, keys, size: int, table: str, pt: str, project: str | None = None) -> dict | None:
+def record_of(state: dict, keys, size: int, table: str, pt: str, project: str | None = None, mtime=None) -> dict | None:
     """台账里是否存在"与本次一致"的完成记录（keys 任一命中即可，兼容旧台账的键）。
 
     keys 里放当前键与历史键（如 date_dir 布局的 "20260920/xxx.csv" 与旧的 "xxx.csv"）。
     记录里带了 project 时也要一致：换过目标项目（如 dev → prod，表名相同）时不能拿
     另一个项目里的上传记录跳过——否则会把整段日期静默跳成"没数据"。
     旧脚本的台账没有 project 字段，按兼容处理（不因缺字段拒绝）。
+
+    mtime 给定时再比远端修改时间：远端文件被同尺寸重写（结算文件更正金额很常见）时
+    size 不变，只比大小会永远跳过、留下旧数据。带 mtime 查询时，旧台账（没有 mtime）
+    视为未命中，强制该日期重下一次并补上 mtime；某个候选键的 mtime 对不上时也不再
+    回退到其它旧键——否则旧平铺键会盖掉新键的"已更新"结论。
     返回命中的记录 dict（调用方可能需要里面的 md5），没有返回 None。
     """
     for key in keys:
@@ -107,8 +119,25 @@ def record_of(state: dict, keys, size: int, table: str, pt: str, project: str | 
             # "不传"不等于"任意项目都算已上传"，否则换过目标项目（dev→prod、迁移后
             # 某条调用路径没带 project）会拿旧项目的记录跳过，整段日期静默变"没数据"
             continue
+        if mtime is None:
+            return record
+        recorded_mtime = _as_float(record.get("mtime"))
+        if recorded_mtime is None:
+            # 旧台账没有 mtime：按未命中处理，让该日期重下一次并补上 mtime；
+            # 继续看后面的候选键，万一它已经带 mtime。
+            continue
+        if recorded_mtime != float(mtime):
+            # 当前键明确显示远端已更新：不要回退到没有 mtime 的旧平铺键。
+            return None
         return record
     return None
+
+
+def _as_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _as_int(value):
@@ -137,7 +166,7 @@ def local_ready(target: Path, size: int | None, md5: str = "") -> bool:
     """本地文件已存在且大小与远端一致（不用重新下载）；md5 给定时（台账里有）再校验内容。
 
     旧台账没有 md5 字段：md5 传空串，退回只比大小（兼容迁移前的记录）。
-    size=None（远端没给大小）时只要求文件存在：拿不到基准就没法比，重下也解决不了。
+    远端没给大小（size=None）且没有 md5 时判定未就绪，重下一次；有 md5 时按 md5 校验。
     """
     target = Path(target)
     # 一次 stat 完成"存在 + 类型 + 大小"：is_file() 与 stat() 之间存在 TOCTOU
@@ -149,6 +178,9 @@ def local_ready(target: Path, size: int | None, md5: str = "") -> bool:
     if not stat.S_ISREG(info.st_mode):
         return False
     if size is not None and info.st_size != size:
+        return False
+    if size is None and not md5:
+        # 远端大小未知、台账也没有 md5：无法证明本地文件完整，宁可重下一次
         return False
     if md5:
         return md5_of(target) == md5

@@ -8,6 +8,8 @@ import copy
 import csv
 import errno
 import io
+import itertools
+import os
 import re
 import shutil
 import stat
@@ -18,6 +20,9 @@ from pathlib import Path
 from unittest import mock
 
 from sftp2ods.utils import setup_console
+
+# 每个远端文件一个递增的 mtime：同尺寸重写的用例靠它和旧台账区分开
+_MTIME_COUNTER = itertools.count(1_700_000_000)
 
 
 class OfflineTestCase(unittest.TestCase):
@@ -37,6 +42,12 @@ class OfflineTestCase(unittest.TestCase):
         lock_patcher = mock.patch.object(cli_mod, "ROOT", Path(lock_root))
         lock_patcher.start()
         self.addCleanup(lock_patcher.stop)
+        # 调度环境可能带着业务日/时区变量：不隔离会让默认业务日用例吃到脏值。
+        env_patcher = mock.patch.dict(os.environ, clear=False)
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+        for name in ("bizdate", "SKYNET_BIZDATE", "ODS_BIZDATE_TZ"):
+            os.environ.pop(name, None)
 
 
 def make_args(**overrides):
@@ -98,9 +109,12 @@ def minimal_job(**overrides) -> dict:
 class FakeEntry:
     """listdir_attr 的元素（paramiko SFTPAttributes 的最小替身）。"""
 
-    def __init__(self, filename: str, size: int = 0, is_dir: bool = False, is_link: bool = False):
+    def __init__(
+        self, filename: str, size: int = 0, is_dir: bool = False, is_link: bool = False, mtime: float | None = None
+    ):
         self.filename = filename
         self.st_size = size
+        self.st_mtime = next(_MTIME_COUNTER) if mtime is None else mtime
         if is_dir:
             self.st_mode = stat.S_IFDIR | 0o755
         elif is_link:
@@ -118,6 +132,7 @@ class FakeSftp:
         self.tree = {key: [copy.copy(entry) for entry in value] for key, value in (tree or {}).items()}
         self.contents = dict(contents or {})
         self.link_targets = {}  # 远端路径 -> 目标文件大小（stat 跟随软链后的真实大小）
+        self.mtimes: dict[str, float] = {}  # 远端路径 -> 修改时间
         self.fail_downloads = 0  # 前 N 次下载失败（模拟网络抖动）
         self.fail_lists = 0  # 前 N 次列目录失败
         self.downloaded = []
@@ -138,9 +153,13 @@ class FakeSftp:
     def stat(self, path):
         """跟随软链的 stat（paramiko SFTPClient.stat 的语义，对应 lstat 版是 listdir_attr）。"""
         if path in self.link_targets:
-            return FakeEntry(path.rpartition("/")[2], self.link_targets[path])
+            return FakeEntry(
+                path.rpartition("/")[2], self.link_targets[path], mtime=self.mtimes.get(path, 1_700_000_000)
+            )
         if path in self.contents:
-            return FakeEntry(path.rpartition("/")[2], len(self.contents[path]))
+            return FakeEntry(
+                path.rpartition("/")[2], len(self.contents[path]), mtime=self.mtimes.get(path, 1_700_000_000)
+            )
         if path in self.tree:
             # 已登记的目录也存在：对目录一律抛 ENOENT 与 paramiko 语义不符，
             # 会让"对目录做 stat 存在性判断"的代码在测试里走"文件不存在"分支
@@ -163,7 +182,7 @@ class FakeSftp:
         pass
 
     def replace_file(self, path: str, data: bytes) -> None:
-        """替换已登记远端文件的内容并同步目录条目大小（模拟源方重写了文件）。
+        """替换已登记远端文件的内容并同步目录条目大小/修改时间（模拟源方重写了文件）。
 
         用例不要自己去翻 tree/contents 内部结构：路径或目录名变了会静默匹配不到、
         依赖"大小变化"的断言以无关原因失败/空转。未登记的文件直接报错。
@@ -171,12 +190,25 @@ class FakeSftp:
         if path not in self.contents:
             raise AssertionError(f"replace_file: 未登记的远端文件 {path}")
         self.contents[path] = data
+        self.mtimes[path] = next(_MTIME_COUNTER)
         name = path.rpartition("/")[2]
         for entry in self.tree.get(_parent_dir(path), []):
             if entry.filename == name:
                 entry.st_size = len(data)
+                entry.st_mtime = self.mtimes[path]
                 return
         raise AssertionError(f"replace_file: 目录里找不到 {path} 的条目")
+
+    def remove_file(self, path: str) -> None:
+        """模拟源方删除一个已登记的远端文件（目录条目、内容与软链目标一起移除）。"""
+        if path not in self.contents and path not in self.link_targets:
+            raise AssertionError(f"remove_file: 未登记的远端文件 {path}")
+        self.contents.pop(path, None)
+        self.mtimes.pop(path, None)
+        self.link_targets.pop(path, None)
+        name = path.rpartition("/")[2]
+        entries = self.tree.get(_parent_dir(path), [])
+        self.tree[_parent_dir(path)] = [entry for entry in entries if entry.filename != name]
 
     def get_channel(self):
         return None
@@ -206,10 +238,12 @@ def _parent_dir(path: str) -> str:
 
 
 def add_file(fake: FakeSftp, path: str, data: bytes) -> FakeSftp:
-    """加一个远端文件：父目录条目 + 文件条目 + 内容。"""
+    """加一个远端文件：父目录条目 + 文件条目 + 内容（含递增的 mtime）。"""
     parent, _, name = path.rpartition("/")
-    fake.tree.setdefault(_parent_dir(path), []).append(FakeEntry(name, len(data)))
+    mtime = next(_MTIME_COUNTER)
+    fake.tree.setdefault(_parent_dir(path), []).append(FakeEntry(name, len(data), mtime=mtime))
     fake.contents[path] = data
+    fake.mtimes[path] = mtime
     return fake
 
 
@@ -312,6 +346,10 @@ class FakeTable:
         writer = FakeWriter(self, partition, reopen, blocks)
         self.writers.append(writer)
         return writer
+
+    def exist_partition(self, spec):
+        # 与真实表一致：分区存在 = 该 pt 已有提交过的数据
+        return spec in self.written
 
     def rows_in(self, pt: str) -> list:
         return self.written.get(f"pt={pt}", [])

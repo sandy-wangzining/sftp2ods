@@ -389,15 +389,20 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
                 if matched:
                     skip_field = columns[sorted(matched)[0]]["name"]
         parse_cfg: dict = {"encoding": "utf-8-sig", "delimiter": "auto", "columns": columns}
+        if footer_value and skip_field and columns and skip_field == columns[0]["name"]:
+            # footer 用「首列为空」识别合计行，skip_if_empty 又指向首列时两者冲突
+            # （解析器会直接拒绝）；合计行优先，丢掉这条跳过规则
+            echo("   提示：合计行按首列为空识别，关键字段又是首列，已忽略该跳过规则。")
+            skip_field = ""
         if footer_value:
             sum_names = [col["name"] for col in columns if str(col.get("type", "")).startswith("decimal")]
+            # 即使没有 decimal 列也要落 footer：解析器靠"footer 非空"开启合计行识别，
+            # 不写的话合计行会被当成一条普通数据写进 ODS（金额翻倍/首列空成脏行）
+            parse_cfg["footer"] = {"sum": sum_names} if sum_names else {}
             if sum_names:
-                parse_cfg["footer"] = {"sum": sum_names}
                 echo(f"   合计行会按 {len(sum_names)} 个金额列核对“合计 = 数据行之和”（对不上直接报错）。")
             else:
-                # 写 {"sum": []} 与"没配 footer"等价（运行时按空列表跳过核对）：留着会让用户
-                # 以为配了合计核对，不如明说没启用
-                echo("   提示：当前没有金额（decimal）列，合计行核对未启用。")
+                echo("   提示：当前没有金额（decimal）列，合计行会按「首列为空」跳过，但不核对金额。")
         if skip_field:
             parse_cfg["skip_if_empty"] = [skip_field]
 

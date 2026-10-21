@@ -45,7 +45,7 @@ def notify(
     sent = 0
     for hook in targets:
         try:
-            resp = requests.post(hook, json=card, timeout=timeout)
+            resp = requests.post(hook, json=card, timeout=timeout, allow_redirects=False)
             data = resp.json()
         except Exception as exc:  # noqa: BLE001 - 告警失败不影响主流程
             # requests 的异常消息里带完整 URL，末段 hook id 就是凭证：必须脱敏后再进日志
@@ -66,5 +66,5 @@ def notify(
             continue
         # 有 JSON 但没有 code/StatusCode（如误填成其它接口的地址）：不能当成功——
         # 告警通道静默失效比报错更危险
-        log(f"  警告：飞书通知发送失败：HTTP {resp.status_code} {redact(str(data)[:200])}")
+        log(f"  警告：飞书通知发送失败：HTTP {resp.status_code} {redact(str(data))[:200]}")
     return sent == len(targets)

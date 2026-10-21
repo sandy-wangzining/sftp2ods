@@ -256,13 +256,24 @@ class TestValidate(OfflineTestCase):
         job["sftp"]["retry_times"] = -1
         self.assert_invalid(job, "sftp.retry_times")
 
-    def test_sftp_zero_timeout_and_retry_are_valid(self):
-        """0 是有意义的取值（不重试 / 不等待 / 不限制超时），配置校验必须放行。"""
+    def test_sftp_zero_retry_is_valid_zero_timeout_is_rejected(self):
+        """retry_times/retry_delay 的 0 有意义；超时 0 会让 socket 进入非阻塞模式、立即失败。"""
         job = minimal_job()
         job["sftp"]["retry_times"] = 0
         job["sftp"]["retry_delay"] = 0
-        job["sftp"]["connect_timeout"] = 0
-        job["sftp"]["io_timeout"] = 0
+        validated(job)
+        for field in ("connect_timeout", "io_timeout"):
+            job = minimal_job()
+            job["sftp"][field] = 0
+            self.assert_invalid(job, f"sftp.{field}")
+
+    def test_sftp_integer_string_forms(self):
+        """整数配置写成 "3.0" 会在运行期 int() 崩，配置阶段必须拒绝；"3" 放行。"""
+        job = minimal_job()
+        job["sftp"]["retry_times"] = "3.0"
+        self.assert_invalid(job, "sftp.retry_times")
+        job = minimal_job()
+        job["sftp"]["retry_times"] = "3"
         validated(job)
 
     def test_sftp_auth_errors(self):
@@ -544,6 +555,17 @@ class TestResolveTargetAndDirs(OfflineTestCase):
         conf = {"maxcompute": {"project": "pp", "access_key_id": "a", "access_key_secret": "b"}}
         self.assertEqual(config.resolve_target(job, conf, make_args()), ("pp", "ods_x_di"))
 
+    def test_profile_project_must_be_identifier(self):
+        """profile/maxcompute 提供的 project 同样过标识符白名单（validate_job 只查 target.project）。"""
+        job = minimal_job()
+        del job["maxcompute"]
+        job["target"] = {"table": "ods_x_di"}
+        for bad in ("my project", "proj; drop table x"):
+            conf = {"maxcompute": {"project": bad}}
+            with self.subTest(project=bad), self.assertRaises(SystemExit) as ctx:
+                config.resolve_target(job, conf, make_args())
+            self.assertIn("maxcompute.project", str(ctx.exception))
+
     def test_target_project_missing(self):
         job = minimal_job()
         job["maxcompute"] = {}
@@ -554,6 +576,14 @@ class TestResolveTargetAndDirs(OfflineTestCase):
     def test_safe_job_name_keeps_legal_lowercase_name(self):
         """只含合法字符且全小写的名字（含首尾下划线）原样保留：否则下载目录被改名、旧文件不复用。"""
         self.assertEqual(config.safe_job_name({"job": "recon_"}, Path("x.json")), "recon_")
+
+    def test_safe_job_name_hashes_windows_reserved_names(self):
+        """CON/AUX/NUL/COM1 这类 Windows 保留设备名不能原名返回，否则目录创建失败。"""
+        for name in ("con", "aux", "nul", "com1", "LPT9", "aux.txt"):
+            with self.subTest(name=name):
+                got = config.safe_job_name({"job": name}, Path("x.json"))
+                self.assertNotEqual(got, name)
+                self.assertIn("-", got)  # 走了 cleaned+哈希分支
 
     def test_safe_job_name_keeps_caseless_name(self):
         """不含大小写字符的名字（纯数字/纯下划线）也原样保留：islower() 对它们返回 False。"""

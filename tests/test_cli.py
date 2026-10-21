@@ -170,6 +170,28 @@ class TestSyncHappyPath(CliTestCase):
             self.assertEqual(len(world.table.deleted), deletes + 1)
             self.assertEqual(len(world.fake.downloaded), downloads)  # 本地文件在，不重下
 
+    def test_skip_rechecks_target_partition(self):
+        """台账命中但目标分区被删/表被重建：不能 rc=0 跳过，必须重新写入。"""
+        data = report([["o1", "1.50"]])
+        with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
+            self.assertEqual(world.sync(bizdate="20260920"), 0)
+            deletes = len(world.table.deleted)
+            world.table.written.pop("pt=20260920", None)  # 模拟分区被手工删除/表重建
+            self.assertEqual(world.sync(bizdate="20260920"), 0)
+            self.assertEqual(len(world.table.deleted), deletes + 1)
+            self.assertEqual([r[0] for r in world.table.rows_in("20260920")], ["o1"])
+
+    def test_partition_probe_failure_is_clean_error(self):
+        """跳过前查分区元数据失败：脱敏后 rc=1，不能裸 traceback，也不能偷偷跳过。"""
+        data = report([["o1", "1.50"]])
+        with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
+            self.assertEqual(world.sync(bizdate="20260920"), 0)
+            deletes = len(world.table.deleted)
+            with mock.patch.object(mc_mod, "partition_exists", side_effect=RuntimeError("metadata 500")):
+                self.assertEqual(world.sync(bizdate="20260920"), 1)
+            self.assertEqual(len(world.table.deleted), deletes)
+            self.assertTrue(any("查询目标分区是否存在失败" in line for line in world.access_logs))
+
     def test_multi_file_same_date_merged(self):
         job = minimal_job(
             source={"root": "/data", "layout": "flat", "file_regex": "report_(?P<date>\\d{8})(?:_\\d)?\\.csv"}
@@ -547,7 +569,8 @@ class TestSyncNewColumns(CliTestCase):
 
 
 class TestSyncLedgerCompat(CliTestCase):
-    def test_date_dir_legacy_flat_file_and_ledger_skips(self):
+    def test_date_dir_legacy_flat_ledger_is_rewritten_once(self):
+        """旧台账没有 mtime：升级后首次命中该日期必须重下一次并补上 mtime，而不是继续跳过。"""
         job = minimal_job()
         job["source"] = {
             "root": "settlements",
@@ -561,12 +584,49 @@ class TestSyncLedgerCompat(CliTestCase):
         add_file(fake, "settlements/20260920/detail_20260920_USD.csv", data)
         with World(self.tmp, job=job, fake=fake) as world:
             world.download_dir.mkdir(parents=True, exist_ok=True)
-            # 旧脚本口径：文件平铺 + 台账键是文件名
+            # 旧脚本口径：文件平铺 + 台账键是文件名，且没有 mtime
             (world.download_dir / "detail_20260920_USD.csv").write_bytes(data)
             state_mod.save_state(
                 world.download_dir / state_mod.STATE_FILE_NAME,
                 {"detail_20260920_USD.csv": {"table": "ods_demo_di", "pt": "20260920", "size": len(data), "rows": 1}},
             )
+            self.assertEqual(world.sync(bizdate="20260920"), 0)
+            self.assertEqual(world.fake.downloaded, ["settlements/20260920/detail_20260920_USD.csv"])
+            self.assertEqual(world.table.deleted, ["pt=20260920"])
+            record = world.ledger()["20260920/detail_20260920_USD.csv"]
+            self.assertIsNotNone(record.get("mtime"))
+
+    def test_date_dir_legacy_flat_file_and_ledger_skips(self):
+        """旧台账已经带 mtime（新版本写过）时，平铺键仍然可以用来跳过。"""
+        job = minimal_job()
+        job["source"] = {
+            "root": "settlements",
+            "layout": "date_dir",
+            "date_dir_regex": "(?P<date>\\d{8})",
+            "file_regex": "detail_(?P<date>\\d{8})_USD\\.csv",
+        }
+        data = report([["o1", "1.00"]])
+        fake = FakeSftp()
+        add_dir(fake, "settlements/20260920")
+        add_file(fake, "settlements/20260920/detail_20260920_USD.csv", data)
+        with World(self.tmp, job=job, fake=fake) as world:
+            world.download_dir.mkdir(parents=True, exist_ok=True)
+            path = "settlements/20260920/detail_20260920_USD.csv"
+            (world.download_dir / "detail_20260920_USD.csv").write_bytes(data)
+            state_mod.save_state(
+                world.download_dir / state_mod.STATE_FILE_NAME,
+                {
+                    "detail_20260920_USD.csv": {
+                        "table": "ods_demo_di",
+                        "pt": "20260920",
+                        "size": len(data),
+                        "mtime": world.fake.mtimes[path],
+                        "rows": 1,
+                    }
+                },
+            )
+            # 台账命中 + 目标分区已存在：本次应跳过（分区存在性由新增的跳过前检查确认）
+            world.table.written["pt=20260920"] = [["o1", "1.00"]]
             self.assertEqual(world.sync(bizdate="20260920"), 0)
             self.assertEqual(world.table.deleted, [])
             self.assertEqual(world.fake.downloaded, [])
@@ -617,6 +677,95 @@ class TestSyncLedgerCompat(CliTestCase):
             rows = world.table.rows_in("20260920")
             self.assertEqual([r[0] for r in rows], ["new-20"], "别的日期的本地文件被当成当天数据写进了库")
             self.assertEqual(world.fake.downloaded, ["settlements/20260920/a.csv"], "本日文件应重新下载")
+
+
+class TestLedgerRemoteChanges(CliTestCase):
+    def test_same_size_remote_update_is_redownloaded(self):
+        """远端同尺寸重写（结算文件更正金额）必须靠 mtime 发现并重建，不能按台账跳过。"""
+        data = report([["o1", "1.00"]])
+        with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
+            self.assertEqual(world.sync(bizdate="20260920"), 0)
+            self.assertEqual(str(world.table.rows_in("20260920")[0][1]), "1.00")
+            new_data = report([["o1", "9.00"]])
+            self.assertEqual(len(new_data), len(data), "同尺寸更新才构成这条回归")
+            world.fake.replace_file("/data/report_20260920.csv", new_data)
+            downloads = len(world.fake.downloaded)
+            self.assertEqual(world.sync(bizdate="20260920"), 0)
+            self.assertEqual(len(world.fake.downloaded), downloads + 1, "mtime 变化必须触发重下")
+            self.assertEqual(str(world.table.rows_in("20260920")[0][1]), "9.00")
+
+    def test_force_write_failure_invalidates_ledger(self):
+        """--force 重写失败后必须作废旧台账，下次运行不能跳过空/半截分区。"""
+        data = report([["o1", "1.00"]])
+        with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
+            self.assertEqual(world.sync(bizdate="20260920"), 0)
+            ledger_path = world.download_dir / state_mod.STATE_FILE_NAME
+            self.assertIn("report_20260920.csv", json.loads(ledger_path.read_text(encoding="utf-8")))
+            with mock.patch.object(mc_mod, "write_partition", side_effect=RuntimeError("tunnel boom")):
+                self.assertEqual(world.sync(bizdate="20260920", force=True), 1)
+            self.assertNotIn(
+                "report_20260920.csv",
+                json.loads(ledger_path.read_text(encoding="utf-8")),
+                "写库失败后旧台账必须作废，否则下次会跳过",
+            )
+            deletes = len(world.table.deleted)
+            self.assertEqual(world.sync(bizdate="20260920"), 0)
+            self.assertGreater(len(world.table.deleted), deletes, "下次运行应重新写这个分区")
+
+    def test_reappeared_file_is_downloaded_not_reused(self):
+        """远端删掉再放回同名同尺寸文件时，不能复用本地旧副本把旧数据写回去。"""
+        job = minimal_job()
+        job["source"] = {
+            "root": "/data",
+            "layout": "flat",
+            "file_regex": "report_(?P<date>\\d{8})_(?P<seq>\\d+)\\.csv",
+        }
+        files = {
+            "/data/report_20260920_1.csv": report([["o1", "1.00"]]),
+            "/data/report_20260920_2.csv": report([["o2", "2.00"]]),
+        }
+        with World(self.tmp, job=job, files=files) as world:
+            self.assertEqual(world.sync(bizdate="20260920"), 0)
+            path = "/data/report_20260920_2.csv"
+            old_mtime = world.fake.mtimes[path]
+            world.fake.remove_file(path)
+            self.assertEqual(world.sync(bizdate="20260920"), 0)  # 重建后 _2 的台账记录被清掉
+            self.assertTrue((world.download_dir / "report_20260920_2.csv").is_file(), "本地旧副本应仍在")
+            add_file(world.fake, path, report([["o2", "9.00"]]))
+            # 模拟源方用 cp -p/rsync -t 从备份恢复：同尺寸且 mtime 也变回原值。
+            # 这时只有“孤儿台账记录已被清掉”能保证重下；若 drop_keys 失效，用例必须失败。
+            world.fake.mtimes[path] = old_mtime
+            for entry in world.fake.tree["/data"]:
+                if entry.filename == "report_20260920_2.csv":
+                    entry.st_mtime = old_mtime
+            downloads = len(world.fake.downloaded)
+            self.assertEqual(world.sync(bizdate="20260920"), 0)
+            self.assertEqual(len(world.fake.downloaded), downloads + 1, "远端回来的文件必须重新下载")
+            rows = world.table.rows_in("20260920")
+            self.assertEqual([r[0] for r in rows], ["o1", "o2"])
+            self.assertEqual(str(rows[1][1]), "9.00")
+
+    def test_remote_file_removed_rebuilds_date(self):
+        """远端删掉同一天的一个文件时，整个 pt 必须重建，不能靠台账跳过留下已删文件的行。"""
+        job = minimal_job()
+        job["source"] = {
+            "root": "/data",
+            "layout": "flat",
+            "file_regex": "report_(?P<date>\\d{8})_(?P<seq>\\d+)\\.csv",
+        }
+        files = {
+            "/data/report_20260920_1.csv": report([["o1", "1.00"]]),
+            "/data/report_20260920_2.csv": report([["o2", "2.00"]]),
+        }
+        with World(self.tmp, job=job, files=files) as world:
+            self.assertEqual(world.sync(bizdate="20260920"), 0)
+            self.assertEqual([r[0] for r in world.table.rows_in("20260920")], ["o1", "o2"])
+            world.fake.remove_file("/data/report_20260920_2.csv")
+            downloads = len(world.fake.downloaded)
+            self.assertEqual(world.sync(bizdate="20260920"), 0)
+            self.assertEqual(len(world.fake.downloaded), downloads, "剩下的文件有台账记录，不应重下")
+            self.assertEqual([r[0] for r in world.table.rows_in("20260920")], ["o1"])
+            self.assertNotIn("report_20260920_2.csv", world.ledger())
 
 
 class TestSyncConnectionErrors(CliTestCase):
@@ -744,7 +893,7 @@ class TestDefaultBizdateCli(CliTestCase):
             self.assertEqual(sorted(world.table.deleted), ["pt=20260921"])
             self.assertEqual([r[0] for r in world.table.rows_in("20260921")], ["o2"])
 
-    def test_check_without_date_does_not_use_default_bizdate(self):
+    def test_check_without_date_keeps_whole_range_but_renders_default_bizdate(self):
         files = {
             "/data/report_20260920.csv": report([["o1", "1.00"]]),
             "/data/report_20260922.csv": report([["o2", "2.00"]]),
@@ -752,11 +901,16 @@ class TestDefaultBizdateCli(CliTestCase):
         with World(self.tmp, files=files) as world:
             with (
                 mock.patch.dict(os.environ, {}, clear=True),
-                mock.patch.object(cli_mod, "default_bizdate", side_effect=AssertionError("--check 不应使用默认业务日")),
+                mock.patch.object(cli_mod, "default_bizdate", return_value=date(2026, 9, 21)),
                 mock.patch.object(cli_mod, "expected_latest", return_value="20260922"),
+                mock.patch.object(cli_mod, "run_check", wraps=cli_mod.run_check) as run_check,
+                mock.patch.object(cli_mod, "render_job", wraps=cli_mod.render_job) as render_job,
             ):
                 rc = cli_mod.main(["--job", str(world.job_path), "--check"])
             self.assertEqual(rc, 0)
+            # 体检不传日期仍核对整个远端区间（bizdate 为空），只有 ${bizdate} 占位符用默认值渲染
+            self.assertEqual(run_check.call_args.kwargs["bizdate"], "")
+            self.assertEqual(render_job.call_args.args[2], date(2026, 9, 21))
             joined = "\n".join(str(line) for line in world.access_logs)
             self.assertIn("20260921", joined)
 
@@ -854,11 +1008,17 @@ class TestMainEntry(CliTestCase):
             "/data/report_20260921.csv": report([["o2", "2.00"]]),
         }
         with World(self.tmp, files=files) as world:
-            with mock.patch.dict("os.environ", {"bizdate": "20260922"}, clear=False):
+            with (
+                mock.patch.dict("os.environ", {"bizdate": "20260922"}, clear=False),
+                mock.patch.object(cli_mod, "default_bizdate", return_value=date(2026, 9, 21)),
+                mock.patch.object(cli_mod, "render_job", wraps=cli_mod.render_job) as render_job,
+            ):
                 rc = cli_mod.main(
                     ["--job", str(world.job_path), "--start-date", "2026-09-20", "--end-date", "2026-09-21"]
                 )
             self.assertEqual(rc, 0)
+            # 区间补数时 ${bizdate} 仍按默认业务日渲染，不能被调度环境里的 bizdate 顶替
+            self.assertEqual(render_job.call_args.args[2], date(2026, 9, 21))
             self.assertEqual(sorted(world.table.deleted), ["pt=20260920", "pt=20260921"])
 
 

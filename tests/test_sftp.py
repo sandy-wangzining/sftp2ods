@@ -120,9 +120,11 @@ class TestNormalize(OfflineTestCase):
         self.assertEqual(sftp_mod.normalize_date("20260920", "f"), "20260920")
         self.assertEqual(sftp_mod.normalize_date("2026-09-20", "f"), "20260920")
         self.assertEqual(sftp_mod.normalize_date("2026/09/20", "f"), "20260920")
+        self.assertEqual(sftp_mod.normalize_date("2026.09.20", "f"), "20260920")
 
     def test_invalid_forms(self):
-        for bad in ("2026920", "abcdefgh", "", "2026-09"):
+        # 分隔符位置/一致性写错不能静默删掉分隔符归一化（202-609-20 → 20260920 会写错 pt）
+        for bad in ("2026920", "abcdefgh", "", "2026-09", "202-609-20", "2026-0920", "2026/09-20"):
             with self.assertRaises(SystemExit):
                 sftp_mod.normalize_date(bad, "f")
 
@@ -230,6 +232,12 @@ class TestScanDateDir(OfflineTestCase):
             with self.assertRaises(sftp_mod.ConfigError):
                 sftp_mod.SftpSource({"host": "h", "username": "u", "port": bad})
 
+    def test_bad_numeric_config_is_clean_error(self):
+        """直接构造 SftpSource（不走 validate_job）时，数值写错也要给配置错而不是裸 ValueError。"""
+        for key in ("retry_times", "connect_timeout", "io_timeout", "retry_delay"):
+            with self.subTest(key=key), self.assertRaises(sftp_mod.ConfigError):
+                flat_source(sftp={key: "3.0" if key == "retry_times" else "abc"})
+
     def test_symlinked_date_dir_is_scanned(self):
         """指向日期目录的软链（st_mode 是 S_IFLNK）要跟随判断：flat 布局显式支持软链，
         date_dir 下若直接跳过，整个业务日期会从结果里静默消失。"""
@@ -242,6 +250,18 @@ class TestScanDateDir(OfflineTestCase):
             files = source.list_files()
         self.assertEqual(sorted(files), ["20260920"])
         self.assertEqual(files["20260920"][0].remote, "settlements/20260920/detail_x_20260920_USD.csv")
+
+    def test_date_dir_without_st_mode_is_scanned(self):
+        """服务端 READDIR 不带权限位（st_mode=None）：不能把日期目录当非目录静默跳过。"""
+        fake = FakeSftp()
+        add_dir(fake, "settlements/20260920")
+        add_file(fake, "settlements/20260920/detail_x_20260920_USD.csv", b"a,b\n1,2\n")
+        for entry in fake.tree["settlements"]:
+            entry.st_mode = None
+        source = date_dir_source()
+        with mock.patch.object(sftp_mod.SftpSource, "_connect", connect_to(fake)):
+            files = source.list_files()
+        self.assertEqual(sorted(files), ["20260920"])
 
     def test_empty_subdir_yields_nothing(self):
         """日期目录存在但没有匹配文件：返回空（列目录失败的两条语义由下面两个用例分别覆盖）。"""
@@ -565,6 +585,36 @@ class TestScanSafety(OfflineTestCase):
             item = source.list_files()["20260920"][0]
         self.assertIsNone(item.size)
         self.assertEqual(item.size_text, "大小未知")
+
+    def test_symlink_uses_target_mtime(self):
+        """软链要取目标文件的 mtime；链接自身的时间不随目标内容变化。"""
+        fake = FakeSftp()
+        link = "/data/report_20260920.csv"
+        entry = FakeEntry("report_20260920.csv", size=len(link), is_link=True)
+        entry.st_mtime = 111.0
+        fake.tree["/data"] = [entry]
+        fake.contents[link] = b"a,b\n1,2\n"
+        fake.link_targets[link] = len(fake.contents[link])
+        fake.mtimes[link] = 222.0
+        source = flat_source(sftp={"retry_times": 0})
+        with mock.patch.object(sftp_mod.SftpSource, "_connect", connect_to(fake)):
+            first = source.list_files()["20260920"][0]
+            fake.mtimes[link] = 333.0
+            second = source.list_files()["20260920"][0]
+        self.assertEqual(first.mtime, 222.0)
+        self.assertEqual(second.mtime, 333.0)
+
+    def test_symlink_stat_failure_uses_link_mtime(self):
+        """目标 stat 失败时大小按未知处理，mtime 退回链接自身时间。"""
+        fake = FakeSftp()
+        entry = FakeEntry("report_20260920.csv", size=4, is_link=True)
+        entry.st_mtime = 444.0
+        fake.tree["/data"] = [entry]
+        source = flat_source(sftp={"retry_times": 0})
+        with mock.patch.object(sftp_mod.SftpSource, "_connect", connect_to(fake)):
+            item = source.list_files()["20260920"][0]
+        self.assertIsNone(item.size)
+        self.assertEqual(item.mtime, 444.0)
 
     def test_entry_without_size_is_unknown(self):
         """READDIR 未返回 st_size（paramiko 给 None）时不能当成 0 字节：下载后核对必然误报。"""

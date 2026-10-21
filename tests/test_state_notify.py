@@ -100,6 +100,24 @@ class TestState(OfflineTestCase):
         legacy = {"a.csv": {"table": "t", "pt": "20260920", "size": "3", "rows": 1}}
         self.assertTrue(state_mod.record_of(legacy, ("a.csv",), 3, "t", "20260920"))
 
+    def test_record_of_mtime_guard(self):
+        """远端同尺寸重写只有 mtime 会变：mtime 不一致不能当成已上传。"""
+        state = {"a.csv": {"table": "t", "pt": "20260920", "size": 3, "mtime": 100, "rows": 1}}
+        self.assertTrue(state_mod.record_of(state, ("a.csv",), 3, "t", "20260920", mtime=100))
+        self.assertFalse(state_mod.record_of(state, ("a.csv",), 3, "t", "20260920", mtime=101))
+        # 旧台账没有 mtime：带 mtime 查询时视为未命中，强制重下一次补上 mtime
+        legacy = {"a.csv": {"table": "t", "pt": "20260920", "size": 3, "rows": 1}}
+        self.assertIsNone(state_mod.record_of(legacy, ("a.csv",), 3, "t", "20260920", mtime=999))
+
+    def test_record_of_mtime_mismatch_does_not_fall_back_to_legacy_key(self):
+        """当前键 mtime 已变时，不能回退到没有 mtime 的旧平铺键而跳过。"""
+        state = {
+            "20260920/a.csv": {"table": "t", "pt": "20260920", "size": 3, "mtime": 100},
+            "a.csv": {"table": "t", "pt": "20260920", "size": 3},
+        }
+        self.assertIsNone(state_mod.record_of(state, ("20260920/a.csv", "a.csv"), 3, "t", "20260920", mtime=101))
+        self.assertIsNotNone(state_mod.record_of(state, ("20260920/a.csv", "a.csv"), 3, "t", "20260920", mtime=100))
+
     def test_record_of_project_guard(self):
         """换过目标项目（表名相同）时不能拿另一个项目的上传记录跳过。"""
         state = {"a.csv": {"project": "prod", "table": "t", "pt": "20260920", "size": 3, "rows": 1}}
@@ -144,6 +162,13 @@ class TestState(OfflineTestCase):
         # 旧台账无 md5（空串）：退回只比大小，兼容迁移前记录
         self.assertTrue(state_mod.local_ready(path, 3, md5=""))
 
+    def test_local_ready_unknown_size_requires_md5(self):
+        """远端大小未知又没有 md5：无法证明本地文件完整，必须重新下载。"""
+        path = self.tmp / "f.csv"
+        path.write_bytes(b"123")
+        self.assertFalse(state_mod.local_ready(path, None))
+        self.assertTrue(state_mod.local_ready(path, None, md5=state_mod.md5_of(path)))
+
     def test_md5_of(self):
         path = self.tmp / "f.csv"
         path.write_bytes(b"123")
@@ -158,6 +183,19 @@ class TestState(OfflineTestCase):
         data = state_mod.load_state(path)
         self.assertIn("a.csv", data)
         self.assertIn("b.csv", data)
+
+    def test_drop_keys_keeps_concurrently_updated_record(self):
+        """drop_keys 只在磁盘记录仍与快照一致时删除，不能误删另一进程刚写的记录。"""
+        path = self.tmp / "state.json"
+        old = {"table": "t", "pt": "1", "size": 1}
+        new = {"table": "t", "pt": "1", "size": 2}
+        state_mod.save_state(path, {"k.csv": old})
+        state_mod.save_state(path, {}, drop_keys={"k.csv": old})
+        self.assertNotIn("k.csv", state_mod.load_state(path))
+        state_mod.save_state(path, {"k.csv": old})
+        state_mod.save_state(path, {"k.csv": new})  # 模拟另一进程随后写入
+        state_mod.save_state(path, {}, drop_keys={"k.csv": old})
+        self.assertEqual(state_mod.load_state(path)["k.csv"], new)
 
     def test_save_state_merges_disk_state_read_after_lock(self):
         """合并必须在**拿到锁之后**重读磁盘：锁外已被别的进程改过的台账不能被整文件覆盖。

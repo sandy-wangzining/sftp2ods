@@ -102,7 +102,11 @@ def _as_secrets(value, where: str) -> dict:
 
 
 def job_tz_of(job: dict) -> ZoneInfo:
-    """作业时区：missing.timezone（默认 Asia/Shanghai），只影响 ${today} 等占位符与缺文件核对。"""
+    """作业时区：missing.timezone（默认 Asia/Shanghai），影响 ${today} 等占位符与缺文件核对。
+
+    缺省业务日（不传 --bizdate/环境变量时的 ${bizdate}）默认取业务日时区
+    （ODS_BIZDATE_TZ，默认美东）的昨天，不受此字段影响。
+    """
     missing = job.get("missing")
     if missing is not None and not isinstance(missing, dict):
         # render_job 会在 check_block_types 之前调到这里：missing 写成字符串时
@@ -112,7 +116,12 @@ def job_tz_of(job: dict) -> ZoneInfo:
 
 
 def build_context(config: dict, bizdate, job_secrets: dict | None = None, tz: ZoneInfo | None = None) -> dict:
-    """运行时上下文：secrets（作业内优先）+ 日期。"""
+    """运行时上下文：secrets（作业内优先）+ 日期。
+
+    ${today} 按作业时区（tz，缺省 Asia/Shanghai）计算；${bizdate} 由调用方传入，
+    缺省为业务日时区（ODS_BIZDATE_TZ，默认美东）的昨天。两者口径不同，
+    作业配置的 missing.timezone 不代表业务日时区。
+    """
     secrets = _as_secrets(config.get("secrets"), "--config 文件里的 secrets")
     secrets.update(_as_secrets(job_secrets, "作业配置的 secrets"))
     today = datetime.now(tz or ZoneInfo(DEFAULT_TZ)).date()
@@ -394,6 +403,10 @@ def _require_number(
         return
     if isinstance(value, bool):
         raise ConfigError(f"{where} 必须是{'整数' if integer else '数字'}，实际 {value!r}")
+    if integer and isinstance(value, str) and not re.fullmatch(r"[+-]?\d+", value.strip()):
+        # "3.0" 经 float() 能通过整值判断，但运行期 int("3.0") 会抛 ValueError；
+        # 配置阶段必须直接给出人话报错
+        raise ConfigError(f"{where} 必须是整数，实际 {value!r}")
     try:
         number = float(value)
     except (TypeError, ValueError, OverflowError) as exc:
@@ -446,8 +459,8 @@ def validate_job(job: dict) -> None:
     if not username.strip():
         raise ConfigError("作业配置缺少 sftp.username（SFTP 登录名）")
     _require_number(sftp.get("port"), "sftp.port", minimum=1, maximum=65535, integer=True)
-    _require_number(sftp.get("connect_timeout"), "sftp.connect_timeout", minimum=0)
-    _require_number(sftp.get("io_timeout"), "sftp.io_timeout", minimum=0)
+    _require_number(sftp.get("connect_timeout"), "sftp.connect_timeout", exclusive_min=0)
+    _require_number(sftp.get("io_timeout"), "sftp.io_timeout", exclusive_min=0)
     _require_number(sftp.get("retry_times"), "sftp.retry_times", minimum=0, integer=True)
     _require_number(sftp.get("retry_delay"), "sftp.retry_delay", minimum=0)
     auth = sftp.get("auth")
@@ -639,13 +652,26 @@ def resolve_target(job: dict, config: dict, args) -> tuple[str, str]:
     """解析目标表信息 → (project, table)。"""
     target = _as_mapping(job.get("target"))
     profile = get_mc_profile_meta(config, job, args)
-    project = str(target.get("project") or profile.get("project") or "")
-    if not project:
+    # project 可能来自 --config 的 maxcompute/profiles，validate_job 只校验了 target.project：
+    # 这里统一过标识符白名单，别让带空格/分号的值一直拖到拼 DDL 时才报错。
+    raw_project = target.get("project") or profile.get("project")
+    if not raw_project:
         raise ConfigError(
             "没有目标项目：请在作业文件的 maxcompute.project（或 profiles.<名>.project）或 target.project 里指定"
         )
+    project = require_identifier(raw_project, "target.project / maxcompute.project")
     table = str(target.get("table") or "")
     return project, table
+
+
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"} | {f"com{i}" for i in range(1, 10)} | {f"lpt{i}" for i in range(1, 10)}
+)
+
+
+def _is_windows_reserved(name: str) -> bool:
+    """Windows 保留设备名（CON/AUX/NUL/COM1…，含带扩展名形式）不能直接当目录名。"""
+    return name.rstrip(". ").split(".", 1)[0].lower() in _WINDOWS_RESERVED_NAMES
 
 
 def safe_job_name(job: dict, job_path: Path) -> str:
@@ -654,11 +680,12 @@ def safe_job_name(job: dict, job_path: Path) -> str:
     过滤后为空（全中文/全符号的作业名，本项目里很常见）时用名字哈希做后缀，
     不能一律退化成 "job"：多个这样的作业会共用同一个下载目录，互相扫到对方的
     文件（旧文件被当成本次数据、重名文件被去重跳过），错误数据写进目标表
-    还看不出来。
+    还看不出来。Windows 的保留设备名（CON/AUX/NUL/COM1…）也不能原名返回，
+    否则下载目录根本创建不了。
     """
     raw = str(job.get("job") or job_path.stem or "job")
     cleaned = re.sub(r"[^0-9A-Za-z_\-]", "_", raw)
-    if cleaned and cleaned == raw and raw == raw.lower():
+    if cleaned and cleaned == raw and raw == raw.lower() and not _is_windows_reserved(raw):
         # 只含合法字符且不含大写字母：原样保留（再 strip 会把 "recon_" 改成 "recon-<hash>"，
         # 注释承诺的"已有下载目录不受影响"就不成立）。判定不能用 raw.islower()：它对
         # 没有大小写字符的名字（"20240101"、"___"）返回 False，会把这类名字也错误地

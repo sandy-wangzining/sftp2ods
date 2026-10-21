@@ -103,10 +103,22 @@ def load_mc_credentials(profile: dict, source_label: str = "作业文件", cli_p
             if not (item.get("access_key_id") and item.get("access_key_secret")):
                 raise SystemExit(
                     f"指定的 aliyun CLI profile「{cli_profile}」不存在或没有 AK/SK；"
-                    f"不会自动回退到其它 profile（避免用另一个身份写库），请检查 --mc-profile"
+                    f"不会自动回退到其它 profile（避免用另一个身份写库），请检查 --cli-profile"
                 )
             return item["access_key_id"], item["access_key_secret"], f"aliyun CLI profile [{cli_profile}]"
-        names = [cli_config.get("current")]
+        current = cli_config.get("current")
+        if current and current in profiles:
+            item = profiles[current]
+            if not (item.get("access_key_id") and item.get("access_key_secret")):
+                # 与 --mc-profile 分支同口径：current 是用户显式选择的身份，它没有 AK/SK
+                # （常见于 STS/RAM 角色模式）时静默换一个 profile 等于用另一个身份写库
+                raise SystemExit(
+                    f"aliyun CLI 当前 profile「{current}」没有 AK/SK（可能是 STS/RAM 角色模式）；"
+                    f"不会自动改用其它 profile（避免用另一个身份写库）。请用 --cli-profile 指定"
+                    f"带 AK/SK 的 profile，或在作业文件里填 maxcompute.access_key_id/access_key_secret"
+                )
+            return item["access_key_id"], item["access_key_secret"], f"aliyun CLI profile [{current}]"
+        names = [current]
         names += [
             name
             for name, item in profiles.items()
@@ -256,6 +268,11 @@ def ensure_target_table(
     table = o.get_table(f"{project}.{table_name}")
     verify_table_schema(table, table_name, columns)
     return table
+
+
+def partition_exists(table, partition_value: str) -> bool:
+    """目标分区是否存在：台账命中后用它确认数据真的还在（表被重建/分区被删时重写）。"""
+    return bool(table.exist_partition(f"{PARTITION_COLUMN}={partition_value}"))
 
 
 # =============================================================================

@@ -101,6 +101,25 @@ class TestCredentials(OfflineTestCase):
                     with self.assertRaises(SystemExit) as ctx:
                         mc_mod.load_mc_credentials({}, "作业", cli_profile="typo_profile")
                 self.assertIn("不会自动回退", str(ctx.exception))
+                self.assertIn("--cli-profile", str(ctx.exception))
+
+    def test_current_cli_profile_without_ak_does_not_fall_back(self):
+        """current profile 没有 AK/SK（STS 模式）时不能静默改用其它 profile。"""
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp)
+                (home / ".aliyun").mkdir(parents=True)
+                (home / ".aliyun" / "config.json").write_text(
+                    '{"current": "sts", "profiles": ['
+                    '{"name": "sts", "mode": "StsToken", "sts_token": "T"},'
+                    '{"name": "other", "mode": "AK", "access_key_id": "OA", "access_key_secret": "OS"}]}',
+                    encoding="utf-8",
+                )
+                with mock.patch.object(mc_mod.Path, "home", return_value=home):
+                    with self.assertRaises(SystemExit) as ctx:
+                        mc_mod.load_mc_credentials({}, "作业")
+        self.assertIn("不会自动改用", str(ctx.exception))
+        self.assertIn("--cli-profile", str(ctx.exception))
 
     def test_cli_config_fallback(self):
         with mock.patch.dict(os.environ, {}, clear=True):

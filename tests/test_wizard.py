@@ -112,6 +112,17 @@ class WizardTestCase(OfflineTestCase):
 
 
 class TestWizardHappyPath(WizardTestCase):
+    def test_footer_without_decimal_columns_still_skips_total_row(self):
+        """用户说有合计行、但没标 decimal 列：仍要写 footer（空 sum）让解析器跳过合计行。"""
+        tail = [
+            (prompt, "" if prompt == "金额" else ("y" if prompt == "合计行" else answer))
+            for prompt, answer in self.common_tail()
+        ]
+        rc, _ = self.run_wizard(self.base_script() + tail)
+        self.assertEqual(rc, 0)
+        job = self.load_job()
+        self.assertEqual(job["parse"]["footer"], {})
+
     def test_generates_valid_job(self):
         rc, _ = self.run_wizard(self.base_script() + self.common_tail())
         self.assertEqual(rc, 0)
@@ -136,9 +147,8 @@ class TestWizardHappyPath(WizardTestCase):
         self.assertEqual(job["target"]["table"], "ods_demo_di")
         self.assertEqual(job["maxcompute"]["project"], "my_project")
 
-    def test_footer_without_amount_column_is_not_written(self):
-        """选了合计行核对但没有金额（decimal）列：不写空 footer、只提示未启用
-        （空列表与"没配"等价，留着会让用户以为配了核对）。"""
+    def test_footer_without_amount_column_still_skips_row(self):
+        """选了合计行但没有金额（decimal）列：仍写空 footer 让解析器跳过合计行。"""
         tail = []
         for question, answer in self.common_tail():
             if question == "金额":
@@ -151,7 +161,10 @@ class TestWizardHappyPath(WizardTestCase):
         rc, _ = self.run_wizard(self.base_script() + tail)
         self.assertEqual(rc, 0)
         raw = json.loads(self.out_path.read_text(encoding="utf-8"))
-        self.assertNotIn("footer", raw["parse"])
+        # 没有 decimal 列也要写空 footer：解析器靠它开启"首列为空 = 合计行"的跳过逻辑
+        self.assertEqual(raw["parse"]["footer"], {})
+        # 首列同时被选成 skip_if_empty 会与 footer 冲突，向导应丢弃该规则
+        self.assertNotIn("skip_if_empty", raw["parse"])
 
     def test_no_sample_placeholder(self):
         script = self.base_script(sample_choice="3")

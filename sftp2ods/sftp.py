@@ -28,15 +28,18 @@ try:
 except ImportError:  # pragma: no cover - 未安装时给出明确指引（tests 环境也走这里）
     paramiko = None
 
-DATE_RE = re.compile(r"\A\d{8}\Z")
-
 
 def _cfg_or_default(cfg: dict, key: str, default, conv):
     """读配置数值：None/空串用默认值；显式 0 保留（不能 `x or default`）。"""
     value = cfg.get(key)
     if value is None or value == "":
         return conv(default)
-    return conv(value)
+    try:
+        return conv(value)
+    except (TypeError, ValueError) as exc:
+        # 直接构造 SftpSource（库调用方/测试）不走 validate_job：数值写错要给带字段名的
+        # 配置错，不能把裸 ValueError/TypeError 抛到连接阶段
+        raise ConfigError(f"sftp.{key} 不是合法的数值：{value!r}") from exc
 
 
 def _safe_remote_name(name: str, kind: str) -> str:
@@ -97,22 +100,26 @@ def _is_missing_path_error(exc: OSError) -> bool:
 
 
 def normalize_date(value: str, source_name: str, kind: str = "文件名") -> str:
-    """把命名捕获组里的日期规范化成 YYYYMMDD（容忍 2026-09-21 / 2026/09/21）。
+    """把命名捕获组里的日期规范化成 YYYYMMDD（容忍 2026-09-21 / 2026/09/21 / 2026.09.21）。
 
+    用结构化白名单而不是"删掉所有分隔符"：后者会把 202-609-20 这类明显写错的日期
+    也归一化成合法值，静默落到错误的 pt 上。分隔符只允许"两处都有且一致"或"都没有"。
     形态或真实性不对直接报错：远端出现不能识别的日期时，宁可中止也不猜。
     """
-    text = re.sub(r"[-/.]", "", str(value or "").strip())
-    if not DATE_RE.match(text):
+    text = str(value or "").strip()
+    match = re.fullmatch(r"(\d{4})([-/.]?)(\d{2})\2(\d{2})", text, re.ASCII)
+    if not match:
         raise ConfigError(
-            f"{kind} {source_name!r} 里提取到的日期不是 8 位数字：{value!r}（检查 file_regex 的 date 捕获组）"
+            f"{kind} {source_name!r} 里提取到的日期不是 YYYYMMDD 或 YYYY-MM-DD：{value!r}（检查 file_regex 的 date 捕获组）"
         )
+    year, _, month, day = match.groups()
     try:
         import datetime as _dt
 
-        _dt.datetime.strptime(text, "%Y%m%d")
+        _dt.datetime(int(year), int(month), int(day))
     except ValueError:
         raise ConfigError(f"{kind} {source_name!r} 里提取到的日期不存在：{value!r}")
-    return text
+    return f"{year}{month}{day}"
 
 
 @dataclass
@@ -124,6 +131,7 @@ class RemoteFile:
     size: int | None  # 字节数；None = 远端未给出（下载后跳过大小核对）
     remote: str  # 远端完整路径
     ledger_key: str  # 台账键（flat = 文件名；date_dir = 日期/文件名）
+    mtime: float | None = None  # 远端修改时间（秒）；None = 远端未给出，台账只比大小
 
     def __repr__(self) -> str:  # 日志里简洁可读
         return f"<RemoteFile {self.date}/{self.name} {self.size}B>"
@@ -335,25 +343,33 @@ class SftpSource:
         # 不能直接透传（下游 max()/遍历的可读性与稳定性）
         return {date: sorted(files, key=lambda item: item.name) for date, files in sorted(raw.items())}
 
-    def _entry_size(self, sftp, entry, remote_path: str) -> int | None:
-        """条目大小：软链在 READDIR 里的 st_size 是链接自身（= 目标路径字符串长度），
-        直接当"远端大小"用会让下载后的大小核对必然失败、台账也永远对不上；对软链用
-        stat()（跟随链接）取目标文件的真实大小。
+    def _entry_meta(self, sftp, entry, remote_path: str) -> tuple[int | None, float | None]:
+        """条目 (大小, 修改时间)：软链用一次 stat() 跟随链接取目标值。
 
-        远端没给大小（READDIR 未返回 st_size，或软链 stat 失败）时返回 None：
-        下面各处会跳过大小核对，而不是把未知当成 0 字节去比较（那必然误报不一致）。
+        READDIR 里软链的 st_size 是链接自身长度、mtime 是链接自身时间，都不能直接当
+        目标文件的值。stat 失败时大小按未知（None）处理，mtime 退回链接自身时间。
         """
         raw_size = getattr(entry, "st_size", None)
-        size = int(raw_size) if raw_size is not None else None
+        raw_mtime = getattr(entry, "st_mtime", None)
+        try:
+            size = int(raw_size) if raw_size is not None else None
+        except (TypeError, ValueError):
+            size = None
+        try:
+            mtime = float(raw_mtime) if raw_mtime is not None else None
+        except (TypeError, ValueError):
+            mtime = None
         if stat.S_ISLNK(getattr(entry, "st_mode", 0) or 0):
             try:
-                target_size = sftp.stat(remote_path).st_size
-                if target_size is not None:
-                    size = int(target_size)
-            except Exception as exc:  # noqa: BLE001 - 取不到就按"大小未知"处理
-                log(f"  警告：软链 {remote_path} 的 stat 失败（{exc}），大小未知，下载后跳过大小核对")
+                target = sftp.stat(remote_path)
+                if target.st_size is not None:
+                    size = int(target.st_size)
+                if target.st_mtime is not None:
+                    mtime = float(target.st_mtime)
+            except Exception as exc:  # noqa: BLE001 - 取不到就按未知/链接自身时间处理
+                log(f"  警告：软链 {remote_path} 的 stat 失败（{exc}），大小未知，按链接自身修改时间判断")
                 size = None
-        return size
+        return size, mtime
 
     def _scan(self, sftp) -> dict[str, list[RemoteFile]]:
         root = self.root
@@ -367,13 +383,26 @@ class SftpSource:
         result: dict[str, list[RemoteFile]] = {}
         if self.layout == "date_dir":
             for entry in entries:
-                if not stat.S_ISDIR(entry.st_mode or 0):
+                path = self._join_root(entry.filename)
+                mode = entry.st_mode
+                if not mode:
+                    # 服务端 READDIR 不带权限位时 st_mode 是 None：原来按"非目录"静默跳过，
+                    # 整天的数据会从结果里消失。用 stat 跟随判断；仍拿不到类型就交给
+                    # dir_re 匹配与后续 listdir 决定，不能静默丢日期。
+                    try:
+                        mode = sftp.stat(path).st_mode
+                    except OSError as exc:
+                        if not _is_missing_path_error(exc):
+                            raise  # 未知目录状态不能按缺失跳过，交给整轮扫描重试
+                        log(f"  警告：无法确认日期目录 {entry.filename}（{exc}），已跳过")
+                        continue
+                if mode and not stat.S_ISDIR(mode):
                     # 指向目录的软链（st_mode 是 S_IFLNK）要跟随判断：flat 布局显式支持
                     # 软链，date_dir 下若直接跳过，整个业务日期会从结果里静默消失
-                    if not stat.S_ISLNK(entry.st_mode or 0):
+                    if not stat.S_ISLNK(mode):
                         continue
                     try:
-                        followed = sftp.stat(self._join_root(entry.filename))
+                        followed = sftp.stat(path)
                     except OSError as exc:
                         if not _is_missing_path_error(exc):
                             raise  # 未知目录状态不能按缺失跳过，交给整轮扫描重试
@@ -398,8 +427,9 @@ class SftpSource:
                         continue
                     file_name = _safe_remote_name(item.filename, "文件名")
                     path = self._join_root(dir_name, file_name)
+                    size, mtime = self._entry_meta(sftp, item, path)
                     result.setdefault(date, []).append(
-                        RemoteFile(date, file_name, self._entry_size(sftp, item, path), path, f"{date}/{file_name}")
+                        RemoteFile(date, file_name, size, path, f"{date}/{file_name}", mtime)
                     )
         else:
             for entry in entries:
@@ -412,9 +442,8 @@ class SftpSource:
                 file_name = _safe_remote_name(entry.filename, "文件名")
                 date = normalize_date(match.group("date"), file_name, "文件名")
                 path = self._join_root(file_name)
-                result.setdefault(date, []).append(
-                    RemoteFile(date, file_name, self._entry_size(sftp, entry, path), path, file_name)
-                )
+                size, mtime = self._entry_meta(sftp, entry, path)
+                result.setdefault(date, []).append(RemoteFile(date, file_name, size, path, file_name, mtime))
         return result
 
     # ------------------------------------------------------------ 下载
