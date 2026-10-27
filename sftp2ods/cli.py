@@ -25,7 +25,7 @@ from . import mc as mc_mod
 from . import parse as parse_mod
 from . import sftp as sftp_mod
 from . import state as state_mod
-from ._common import default_bizdate, private_lock_dir, safe_label
+from ._common import default_bizdate, private_lock_dir, safe_label, target_lock_path
 from .config import (
     build_context_doc,
     build_job_summary,
@@ -783,11 +783,11 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
         rows = sum(file_rows)
         total_rows += rows
         log(f"{date}：{len(local_paths)} 个文件，{rows:,} 行 → pt={date}")
-        if args.dry_run:
-            continue
         if rows == 0 and not allow_empty:
             log(f"❌ pt={date} 解析出 0 行，且 target.allow_empty=false，未写库")
             return 1
+        if args.dry_run:
+            continue
         if rows == 0:
             # 写空分区前先看一眼现有分区：把一个本来有数据的分区覆盖成 0 行几乎总是异常
             # （源文件被截断成只剩表头、关键列整列变空被 skip_if_empty 滤光），而"先删再填"
@@ -1013,7 +1013,11 @@ def main(argv: list[str] | None = None) -> int:
 
         try:
             with RunLock(_lock_path(job_path)):  # 同机同一作业互斥；不同作业可并行
-                return run_sync(job, config, args, job_path, bizdate=bizdate, config_path=config_path)
+                if args.dry_run:
+                    return run_sync(job, config, args, job_path, bizdate=bizdate, config_path=config_path)
+                project, table_name = resolve_target(job, config, args)
+                with RunLock(target_lock_path(project, table_name)):
+                    return run_sync(job, config, args, job_path, bizdate=bizdate, config_path=config_path)
         except SystemExit as exc:
             log(f"❌ {_redact_job(job, exc, config)}")
             return 1

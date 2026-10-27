@@ -34,6 +34,23 @@
 > 这两个示例等价于 `clink_settlement_sync/`、`waffo_settlement_sync/` 两个独立脚本，
 > 迁移说明见下方「从旧脚本迁移」。
 
+## 独立使用与部署前准备
+
+本项目可独立从 GitHub 下载并安装，不需要其它 ODS 项目或团队内部服务。支持 Windows、macOS、Linux；使用前需要源端读取权限和目标 MaxCompute 项目的凭证与读写权限。
+
+- Python 3.9+；依赖由 `pip install .` 自动安装。建议为工具创建虚拟环境，或使用 pipx。
+- 请按目标项目的真实地域设置 `maxcompute.endpoint`（可用 `--endpoint` 覆盖）。默认 us-west-1 仅适用于该地域，不能用于任意项目。
+- 业务日默认按 `America/New_York` 的昨天计算；可用 `ODS_BIZDATE_TZ=Asia/Shanghai`、`UTC` 等 IANA 时区名覆盖，也可显式传 `--bizdate`。数据窗口/源文件时区按各自配置设置，不必采用同一地域。
+- 从 `jobs/*.example.json` 复制配置并填入自己的源地址、项目和凭证；真实配置不要提交到 Git。首次接入先运行 `--check` 和 `--dry-run`。
+
+```bash
+git clone https://github.com/sandy-wangzining/sftp2ods.git
+cd sftp2ods
+python -m venv .venv
+# Windows PowerShell：.\.venv\Scripts\python.exe -m pip install .
+.venv/bin/python -m pip install .
+```
+
 ## 安装
 
 ```bash
@@ -184,7 +201,7 @@ DWD 层：按业务口径加工/引用
 | `strict_columns` | true | 每行列数必须等于表头列数（防列错位）；false 时允许行尾少列（按空补齐），多列仍报错 |
 | `empty_as` | `null` | 空串的落库形态：`null`（空串存 NULL）/ `empty`（空串原样存 `''`，兼容既有表口径，见 clink 示例） |
 | `skip_if_empty` | - | 这些列（**目标列名**）值为空的行跳过不入库（如 `["order_id"]`），跳过的行数会打日志（`''` 与 NULL 都算空）。开启 `footer` 时不能指向第一列（合计行也靠「首列为空」识别，二者语义冲突，配置阶段报错） |
-| `footer` | - | 开启合计行处理：首列为空的合计行不写库；`{"sum": ["金额列", ...]}` 会校验「合计 = 入库行之和」（被 `skip_if_empty` 跳过的行不计入），对不上报错（sum 只允许 decimal 列） |
+| `footer` | - | 开启合计行处理：首列为空的合计行不写库；`{"sum": ["金额列", ...]}` 会校验「合计 = 源文件明细之和」（被 `skip_if_empty` 跳过的明细仍计入文件合计，但不写库），对不上报错（sum 只允许 decimal 列） |
 
 `columns` 每项：
 
@@ -363,3 +380,13 @@ MIT（见 [LICENSE](LICENSE)）。
 
 三个项目保持独立安装；SQL 等待、告警和部分脱敏工具维护一份源码并同步，详见
 [公共源码说明](docs/shared-runtime.md)。贡献前请运行 `python tools/sync_common.py --check`。
+
+## 试跑、大字段与并发保护
+
+`--dry-run` 同样检查 `target.allow_empty=false`：只有表头或被过滤成零行的文件会返回 1。试跑不连接数仓，已有分区行数的空覆盖保护仍需正式运行时检查。已有台账命中的日期可被跳过；修改解析配置后需要重新校验历史文件时加 `--force --dry-run`，正式重写用 `--force`。
+
+Tunnel 批次同时按 500 行和约 8MB 有效值字节数切分，读取文件和复用已解析结果两条路径使用相同限制；单行超过批次字节预算时单独成批，单格上限仍在写库前检查。内存还包含 Python 对象和 SDK 缓冲，不承诺整个进程只占 8MB。
+
+正式运行在作业锁之外，还会取得按 `project.table` 归一化的目标表锁。同一用户的三个 ODS 工具、不同虚拟环境和不同配置文件写同一张表时互斥；不同表可并行，争用锁的任务以失败退出。目标锁覆盖台账读取到写后校验，避免同目标的两个作业交错删写。
+
+默认目标锁位于系统临时目录的 `ods-target-locks[-UID]`。多用户、不同 TMPDIR 或容器运行同一目标时，用 `ODS_TARGET_LOCK_DIR` 指向同一固定目录，并确认文件系统提供有效的文件锁。仅设置共享路径不能保证跨主机互斥；推荐固定调度机器。升级前停止旧进程，并更新所有可能写同一目标的工具。原有 `*_LOCK_DIR` 继续只控制各工具的作业锁。

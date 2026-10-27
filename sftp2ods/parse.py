@@ -640,6 +640,16 @@ def read_header(path: Path, encoding: str = "utf-8-sig") -> list[str]:
 # 第一趟解析结果可复用给写库：源文件总大小不超过该值才把行留在内存里，
 # 避免把多 GB 文件的解析结果全载入 RAM；超限时写库再扫一遍文件。
 REUSE_ROWS_MAX_BYTES = 32 * 1024 * 1024
+MAX_BATCH_BYTES = 8_000_000
+
+
+def _cell_bytes(cell) -> int:
+    """Tunnel 值的有效字节数；用于写前校验和按字节切批。"""
+    if cell is None:
+        return 0
+    if isinstance(cell, (bytes, bytearray)):
+        return len(cell)
+    return len(str(cell).encode("utf-8"))
 
 
 def source_bytes(paths: list[Path]) -> int:
@@ -661,13 +671,15 @@ def iter_batches(
     batch_size: int = 500,
     stats: dict | None = None,
     prepared_rows: list | None = None,
+    max_bytes: int = MAX_BATCH_BYTES,
 ):
-    """多个文件按 batch_size 攒批给 Tunnel 写入（Tunnel 按批传，别一行一条发）。
+    """同时按行数和有效值字节数切批；超过字节预算的单行独立成批。
 
     stats 传入时，跳过行/数据行会累计进去（「先数行数」那趟用它统计）。
     prepared_rows 给定时不再读文件，直接切已解析好的行（写库校验/重试可重复调用）。
     """
     batch: list[list] = []
+    size = 0
     rows_iter = prepared_rows if prepared_rows is not None else None
     if rows_iter is None:
 
@@ -677,9 +689,11 @@ def iter_batches(
 
         rows_iter = _from_files()
     for row in rows_iter:
-        batch.append(row)
-        if len(batch) >= batch_size:
+        row_bytes = sum(_cell_bytes(cell) for cell in row)
+        if batch and (len(batch) >= batch_size or size + row_bytes > max_bytes):
             yield batch
-            batch = []
+            batch, size = [], 0
+        batch.append(row)
+        size += row_bytes
     if batch:
         yield batch
