@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 from . import _common
-from .parse import normalize_type
+from .parse import _cell_bytes, normalize_type
 from .utils import ConfigError, log, progress_log, redact, require_identifier, retry_call
 
 try:
@@ -425,18 +425,6 @@ def write_partition(
     if total is not None and written != total:
         raise RuntimeError(f"{table_name} 写入行数异常：计划 {total:,}，实际 {written:,}")
     return written
-
-
-def _cell_bytes(cell) -> int:
-    """一个值的 UTF-8 字节数（None 计 0；Decimal 等按字符串形态计）。"""
-    if cell is None:
-        return 0
-    if isinstance(cell, str):
-        return len(cell.encode("utf-8"))
-    if isinstance(cell, (bytes, bytearray)):
-        # bytes 走 str() 会变成 "b'...'" 转义形态，长度虚增数倍，接近上限的真实数据会被误判超长
-        return len(cell)
-    return len(str(cell).encode("utf-8"))
 
 
 def _partition_literal(partition_value) -> str:
