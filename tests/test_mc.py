@@ -374,38 +374,39 @@ class TestWritePartition(OfflineTestCase):
         return lambda: (batch for batch in [[row] for row in rows])
 
     def test_happy_path(self):
-        table = FakeTable()
-        written = mc_mod.write_partition(
-            FakeOdps(table), table, "demo_project", "ods_demo_di", "20260920", self.factory([["a"], ["b"]]), total=2
-        )
+        table = FakeTable(columns=[("value", "string")])
+        odps = FakeOdps(table, "t")
+        written = mc_mod.write_partition(odps, table, "p", "t", "20260920", self.factory([["a"], ["b"]]), total=2)
         self.assertEqual(written, 2)
-        self.assertEqual(table.deleted, ["pt=20260920"])
-        self.assertEqual(table.created, ["pt=20260920"])
-        # if_exists/if_not_exists 必须是 True：先删再填的幂等性靠它们（漏传会在重跑时报错）
-        self.assertEqual(table.delete_if_exists, [True])
-        self.assertEqual(table.create_if_not_exists, [True])
-        self.assertTrue(table.writers[0].reopen)
+        self.assertEqual(table.deleted, [])
+        self.assertEqual(table.created, [])
+        self.assertEqual(odps.stage.deleted, ["pt=20260920"])
+        self.assertEqual(odps.stage.created, ["pt=20260920"])
+        self.assertEqual(odps.stage.delete_if_exists, [True])
+        self.assertEqual(odps.stage.create_if_not_exists, [True])
+        self.assertTrue(odps.stage.writers[0].reopen)
         self.assertEqual(table.rows_in("20260920"), [["a"], ["b"]])
 
     def test_retry_rebuilds_session_and_batches(self):
-        table = FakeTable()
-        calls = {"n": 0}
+        table = FakeTable(columns=[("value", "string")])
+        odps = FakeOdps(table, "t")
+        calls = []
 
         def factory():
-            calls["n"] += 1
-            if calls["n"] == 1:
-                raise OSError("tunnel down")
-            return (batch for batch in [[["a"], ["b"]]])
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError("source temporarily unavailable")
+            return iter([[["a"], ["b"]]])
 
-        written = mc_mod.write_partition(FakeOdps(table), table, "p", "t", "20260920", factory, total=2, retries=3)
-        self.assertEqual(written, 2)
-        self.assertEqual(calls["n"], 3)  # 第一次校验+失败、第二次校验、第三次写（校验各调一次）
-        self.assertEqual(len(table.writers), 1)
-        self.assertTrue(table.writers[0].reopen)
+        self.assertEqual(mc_mod.write_partition(odps, table, "p", "t", "20260920", factory, total=2), 2)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(table.writers, [])
+        self.assertEqual(len(odps.stage.writers), 1)
+        self.assertTrue(odps.stage.writers[0].reopen)
 
     def test_cell_size_check_scan_once_across_retries(self):
         """校验成功后重试不再全量重扫源数据（记忆化）：写入失败一次时工厂只被多叫一次。"""
-        table = FakeTable()
+        table = FakeTable(columns=[("value", "string")])
         calls = {"n": 0}
 
         def factory():
@@ -414,54 +415,42 @@ class TestWritePartition(OfflineTestCase):
                 raise OSError("tunnel down")
             return (batch for batch in [[["a"], ["b"]]])
 
-        written = mc_mod.write_partition(FakeOdps(table), table, "p", "t", "20260920", factory, total=2, retries=3)
+        written = mc_mod.write_partition(FakeOdps(table, "t"), table, "p", "t", "20260920", factory, total=2, retries=3)
         self.assertEqual(written, 2)
         # 1=校验、2=首次写入(失败)、3=重试写入；校验没有在重试时重扫
         self.assertEqual(calls["n"], 3)
 
     def test_oversized_cell_rejected_before_delete(self):
-        table = FakeTable()
+        table = FakeTable(columns=[("value", "string")])
         big = "x" * (mc_mod.MAX_CELL_BYTES + 1)
         with self.assertRaises(SystemExit):
-            mc_mod.write_partition(FakeOdps(table), table, "p", "t", "20260920", self.factory([[big]]), total=1)
+            mc_mod.write_partition(FakeOdps(table, "t"), table, "p", "t", "20260920", self.factory([[big]]), total=1)
         self.assertEqual(table.deleted, [])  # 超限校验失败发生在任何 DDL 之前
         self.assertEqual(table.writers, [])  # 连写入会话都不该打开
 
     def test_partition_value_whitelist_before_delete(self):
         """与 count_partition 同一套白名单：非法分区值不能先拼进 delete 的 DDL（可能删错分区）。"""
-        table = FakeTable()
+        table = FakeTable(columns=[("value", "string")])
         for bad in ("2026-09-20", "20260920'; drop table x --", ""):
             with self.assertRaises(SystemExit):
-                mc_mod.write_partition(FakeOdps(table), table, "p", "t", bad, self.factory([["a"]]), total=1)
+                mc_mod.write_partition(FakeOdps(table, "t"), table, "p", "t", bad, self.factory([["a"]]), total=1)
         self.assertEqual(table.deleted, [])  # 校验失败发生在任何 DDL 之前
         self.assertEqual(table.writers, [])  # 连写入会话都不该打开
 
     def test_exhausted_retries_marks_partition_dirty(self):
-        table = FakeTable()
-
-        def broken_write(rows):
-            raise OSError("tunnel down")
-
-        original_open = table.open_writer
-
-        def open_writer(partition=None, reopen=False):
-            writer = original_open(partition=partition, reopen=reopen)
-            writer.write = broken_write
-            return writer
-
-        table.open_writer = open_writer
-        with self.assertRaises(RuntimeError) as ctx:
-            mc_mod.write_partition(
-                FakeOdps(table), table, "p", "t", "20260920", self.factory([["a"]]), total=1, retries=2
-            )
-        message = str(ctx.exception)
-        self.assertIn("分区可能已被清空", message)
-        self.assertIn("重跑", message)
+        table = FakeTable(columns=[("value", "string")])
+        table.written["pt=20260920"] = [["old"]]
+        odps = FakeOdps(table, "t")
+        with mock.patch.object(mc_mod, "add_partition", side_effect=RuntimeError("DDL failed")):
+            with self.assertRaisesRegex(RuntimeError, "未提前删除"):
+                mc_mod.write_partition(odps, table, "p", "t", "20260920", self.factory([["new"]]), total=1, retries=1)
+        self.assertEqual(table.rows_in("20260920"), [["old"]])
+        self.assertEqual(table.deleted, [])
 
     def test_count_mismatch(self):
-        table = FakeTable()
+        table = FakeTable(columns=[("value", "string")])
         with self.assertRaises(RuntimeError) as ctx:
-            mc_mod.write_partition(FakeOdps(table), table, "p", "t", "20260920", self.factory([["a"]]), total=5)
+            mc_mod.write_partition(FakeOdps(table, "t"), table, "p", "t", "20260920", self.factory([["a"]]), total=5)
         self.assertIn("写入行数异常", str(ctx.exception))
 
     def test_retry_after_failed_session_does_not_duplicate(self):
@@ -470,7 +459,7 @@ class TestWritePartition(OfflineTestCase):
         替身按 pyodps 语义建模 reopen：reopen=False 会把失败会话的块与本轮一起提交。
         生产代码漏传 reopen=True 时，本用例会看到分区里出现重复行。
         """
-        table = FakeTable()
+        table = FakeTable(columns=[("value", "string")])
         original_open = table.open_writer
         calls = {"n": 0}
 
@@ -489,28 +478,24 @@ class TestWritePartition(OfflineTestCase):
 
         table.open_writer = open_writer
         written = mc_mod.write_partition(
-            FakeOdps(table), table, "p", "t", "20260920", self.factory([["a"], ["b"]]), total=2, retries=3
+            FakeOdps(table, "t"), table, "p", "t", "20260920", self.factory([["a"], ["b"]]), total=2, retries=3
         )
         self.assertEqual(written, 2)
         self.assertEqual(table.rows_in("20260920"), [["a"], ["b"]], "重试复用了失败会话，行被提交了两遍")
 
     def test_partition_ops_use_timeout_protected_ddl(self):
-        """分区增删必须走带超时的 DDL（run_sql），不再调用 pyodps 的 delete/create_partition。"""
-
-        class TableWithoutPyodpsApi(FakeTable):
-            def delete_partition(self, spec, if_exists=False):
-                raise AssertionError("分区删除不该再走 pyodps API（同步、不受 --sql-timeout 保护）")
-
-            def create_partition(self, spec, if_not_exists=False):
-                raise AssertionError("分区创建不该再走 pyodps API（同步、不受 --sql-timeout 保护）")
-
-        table = TableWithoutPyodpsApi()
-        o = FakeOdps(table)
-        written = mc_mod.write_partition(o, table, "p", "t", "20260920", self.factory([["a"]]), total=1)
-        self.assertEqual(written, 1)
-        sqls = "\n".join(o.sql)
-        self.assertIn("drop if exists partition (pt='20260920')", sqls)
-        self.assertIn("add if not exists partition (pt='20260920')", sqls)
+        table = FakeTable(columns=[("value", "string")])
+        odps = FakeOdps(table, "t")
+        with (
+            mock.patch.object(table, "delete_partition", side_effect=AssertionError("unbounded table API")),
+            mock.patch.object(table, "create_partition", side_effect=AssertionError("unbounded table API")),
+        ):
+            self.assertEqual(
+                mc_mod.write_partition(odps, table, "p", "t", "20260920", self.factory([["a"]]), total=1), 1
+            )
+        self.assertTrue(any("drop if exists partition" in sql for sql in odps.sql))
+        self.assertTrue(any("add if not exists partition" in sql for sql in odps.sql))
+        self.assertFalse(any(sql.startswith("alter table p.t ") for sql in odps.sql))
 
     def test_drop_and_add_partition_sql_and_timeout(self):
         """删/建分区的 SQL 形态与 timeout 透传（README 承诺分区增删受 --sql-timeout 保护）。"""
@@ -536,7 +521,7 @@ class TestFakeWriterSessionModel(OfflineTestCase):
     """替身本身的会话语义校准（reopen=True 开新会话 / reopen=False 复用）。"""
 
     def test_reopen_semantics_match_pyodps(self):
-        table = FakeTable()
+        table = FakeTable(columns=[("value", "string")])
         with self.assertRaises(OSError):
             with table.open_writer(partition="pt=20260920", reopen=True) as writer:
                 writer.write([["stale"]])
@@ -545,7 +530,7 @@ class TestFakeWriterSessionModel(OfflineTestCase):
             writer.write([["fresh"]])
         self.assertEqual(table.rows_in("20260920"), [["fresh"]], "reopen=True 应开新会话、丢弃旧块")
 
-        table2 = FakeTable()
+        table2 = FakeTable(columns=[("value", "string")])
         with self.assertRaises(OSError):
             with table2.open_writer(partition="pt=20260920", reopen=True) as writer:
                 writer.write([["stale"]])

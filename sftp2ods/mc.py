@@ -12,10 +12,11 @@ import json
 import os
 import re
 import time
+import uuid
 from pathlib import Path
 
 from . import _common
-from .parse import _cell_bytes, normalize_type
+from .parse import Column, _cell_bytes, normalize_type
 from .utils import ConfigError, log, progress_log, redact, require_identifier, retry_call
 
 try:
@@ -167,7 +168,14 @@ def run_sql_with_timeout(o, sql: str, timeout: int = SQL_TIMEOUT_SECONDS, desc: 
 
 
 def build_table_ddl(
-    project: str, table: str, columns, comment: str = "", stored_as: str = "", lifecycle_days: int | None = None
+    project: str,
+    table: str,
+    columns,
+    comment: str = "",
+    stored_as: str = "",
+    lifecycle_days: int | None = None,
+    *,
+    staging: bool = False,
 ) -> str:
     """宽表 DDL：列展开 + pt 分区。
 
@@ -194,7 +202,8 @@ def build_table_ddl(
     # 反斜杠先转义（同 parse.Column.ddl_comment / _sql_spec）：以 "\\" 结尾的注释
     # 会吃掉收尾引号、破坏 DDL
     table_comment = (comment or "SFTP 文件列展开").replace("\\", "\\\\").replace("'", "''")
-    lines.append(f"tblproperties ('comment' = '{table_comment}')")
+    stage_properties = ", 'lifecycle.deletemeta'='true'" if staging else ""
+    lines.append(f"tblproperties ('comment' = '{table_comment}'{stage_properties})")
     # LIFECYCLE 放在 TBLPROPERTIES 之后：与 api2ods（其示例作业带 lifecycle_days，实际跑过）
     # 以及官方 PK 表语法 `... [TBLPROPERTIES (...)] [LIFECYCLE <days>]` 的顺序一致
     if lifecycle_days is not None:
@@ -226,7 +235,7 @@ def verify_table_schema(table, table_name: str, columns) -> None:
     if getattr(table, "is_virtual_view", False) or getattr(table, "is_materialized_view", False):
         raise SystemExit(f"{table_name} 是视图，不能作为写入目标")
     if getattr(table, "is_transactional", False):
-        raise SystemExit(f"{table_name} 是事务表，本框架按「先删再填普通分区表」写入；请换表名或先 drop 后重建")
+        raise SystemExit(f"{table_name} 是事务表，本框架按「普通分区表暂存后原子发布」写入；请换表名或先 drop 后重建")
     existing, partitions = _table_schema_of(table)
     wanted = [(col.name, normalize_type(col.type)) for col in columns]
     if [name.lower() for name, _ in existing] != [name.lower() for name, _ in wanted]:
@@ -340,26 +349,23 @@ def write_partition(
     retries: int = 3,
     timeout: int = SQL_TIMEOUT_SECONDS,
 ) -> int:
-    """先删再填一个分区（drop DDL → add DDL → Tunnel 写入），整段失败自动重试。
+    """先写独立暂存表并核对，再以单条 INSERT OVERWRITE 发布；正式分区不提前删除。
 
-    - o / project / timeout：分区增删走**带超时的 DDL**（pyodps 的 delete_partition /
-      create_partition 是同步不限时的，云端元数据操作卡住会把整轮任务连同运行锁挂死）；
-    - batches_factory：一个"可重复调用"的函数，每次返回从头开始的「批次迭代器」；
-      用工厂而不是列表，是为了支持失败重试时重新读一遍，同时内存里只留一个批次。
-    - total：预期行数；写完后核对，不一致报错（调用方再与 count(*) 二次校验）。
-    - 单格超过 MAX_CELL_BYTES 直接报错；检查必须在删分区之前——这类值永远写不进去，
-      先删后失败等于白丢一天数据。
+    batches_factory 必须可重复读取；写前大小校验保留。暂存写入失败使用新 Tunnel 会话重试，
+    发布重试复用已核对的数据；发布响应丢失时幂等覆盖，失败残留由生命周期兜底回收。
     """
-    # 与 count_partition 同一套白名单：分区值会拼进 drop/add 的 DDL，未校验的
-    # 字符串（带空格/引号）可能删错分区，报错也指不到点上——同一个参数不能两套标准
+    project = require_identifier(project, "target.project")
+    table_name = require_identifier(table_name, "target.table")
     partition_value = _partition_literal(partition_value)
     spec = f"{PARTITION_COLUMN}={partition_value}"
-    # 每一次重试都是"先删分区、再重新写"：只要删成功过，这个分区就已经不在原位了。
-    # 重试全部失败时，旧数据不会自己回来——必须让调度侧知道"这里可能缺数、要重跑"。
-    deleted_once = False
+    existing, _ = _table_schema_of(table)
+    columns = [Column(header=name, name=name, type=kind, kind=kind.split("(", 1)[0]) for name, kind in existing]
+    if not columns:
+        raise ConfigError("SFTP 目标表必须包含配置的非分区列")
+    verify_table_schema(table, table_name, columns)
+    select_columns = ", ".join(require_identifier(col.name, "目标列名") for col in columns)
 
-    def _check_cell_sizes() -> None:
-        """通读一遍所有行，找出超长单元格；行号从 1 数起，报错里能定位。"""
+    def check_sizes() -> None:
         index = 0
         for rows in batches_factory():
             for row in rows:
@@ -369,62 +375,72 @@ def write_partition(
                     if size > MAX_CELL_BYTES:
                         raise SystemExit(
                             f"第 {index:,} 行有单元格大小 {size:,} 字节，超过单列上限（约 {MAX_CELL_BYTES:,} 字节）；"
-                            f"请检查源文件里是否有超长字段"
+                            "请检查源文件里是否有超长字段"
                         )
 
-    checked_sizes = False
-
-    def _check_cell_sizes_once() -> None:
-        """超长单元格校验（每轮运行只真正扫一遍；失败时下趟重试会再扫）。
-
-        校验仍留在 _do 里（首趟失败可随重试重来、且一定发生在删分区之前），但成功后
-        记下标志：重试时不再把源数据全量重扫一遍（3 次重试 = 3 倍 IO/解析开销）。
-        """
-        nonlocal checked_sizes
-        if checked_sizes:
-            return
-        _check_cell_sizes()
-        checked_sizes = True
-
-    def _do() -> int:
-        """完整的"校验 → 删 → 建 → 写"一趟，交给 retry_call 重试（每趟都从头读数据）。"""
-        nonlocal deleted_once
-        _check_cell_sizes_once()
-        # 先置位再删：删分区的 DDL 可能在服务端已经删掉分区后才抛异常，
-        # 此时 deleted_once=False 会把"分区可能已丢数"的提示吞掉。
-        deleted_once = True
-        drop_partition(o, project, table_name, spec, timeout=timeout)  # 先删：重跑/补数不会叠加
-        add_partition(o, project, table_name, spec, timeout=timeout)
-        # 重试要重新读一遍数据，所以 writer 与 written 都在重试时重置。
-        # reopen=True：不复用上一次失败留下的 Tunnel 上传会话——复用会把上次已上传的块
-        # 与本轮全量一起提交，结果是分区里出现重复行。
-        # Tunnel 的 open_writer/write/commit 是同步 HTTP，线程内无法强制中断；单次调用
-        # 由 pyodps 的 connect/read 超时参数兜底。调度侧请给本作业配 task 超时：Tunnel 侧
-        # 异常时任务会由调度强杀，重跑走重试链路（卡住期间进程不退，但不会静默丢数据）
-        with table.open_writer(partition=spec, reopen=True) as writer:  # Tunnel 写入
-            written = 0
-            for rows in batches_factory():
-                writer.write(rows)
-                written += len(rows)
-                progress_log(f"{table_name} pt={partition_value} 写入", written, "行")
-        return written
-
+    retry_call(check_sizes, attempts=max(1, retries), base_delay=10, desc="写前单格大小检查")
+    stage_name = f"tmp_sftp2ods_{uuid.uuid4().hex}"
+    stage_ddl = build_table_ddl(
+        project, stage_name, columns, "SFTP 暂存数据，校验后发布", lifecycle_days=1, staging=True
+    )
+    verified = published = False
+    written = 0
     try:
-        written = retry_call(
-            _do, attempts=max(1, retries), base_delay=10, desc=f"{table_name} pt={partition_value} 写入"
-        )
-    except Exception as exc:  # noqa: BLE001 - 重试耗尽后统一改写错误信息
-        # KeyboardInterrupt / SystemExit 不经 except Exception，Ctrl+C 的 130 出口不受影响
-        if deleted_once:
+        run_sql_with_timeout(o, stage_ddl, timeout=timeout, desc=f"建暂存表 {stage_name}")
+        stage = o.get_table(f"{project}.{stage_name}")
+        verify_table_schema(stage, stage_name, columns)
+
+        def publish() -> int:
+            nonlocal verified, published, written
+            if not verified:
+                drop_partition(o, project, stage_name, spec, timeout=timeout)
+                add_partition(o, project, stage_name, spec, timeout=timeout)
+                written = 0
+                with stage.open_writer(partition=spec, reopen=True) as writer:
+                    for rows in batches_factory():
+                        writer.write(rows)
+                        written += len(rows)
+                        progress_log(f"{stage_name} pt={partition_value} 暂存", written, "行")
+                if total is not None and written != total:
+                    raise RuntimeError(f"暂存写入行数异常：计划 {total:,}，实际 {written:,}")
+                actual = count_partition(o, project, stage_name, partition_value, timeout=timeout)
+                if actual != written:
+                    raise RuntimeError(f"暂存校验行数不一致：写入 {written:,}，查询 {actual:,}")
+                verified = True
+            run_sql_with_timeout(
+                o,
+                f"insert overwrite table {project}.{table_name} partition ({_sql_spec(spec)}) "
+                f"select {select_columns} from {project}.{stage_name} "
+                f"where {PARTITION_COLUMN} = '{partition_value}'",
+                timeout=timeout,
+                desc=f"发布分区 {table_name} pt={partition_value}",
+            )
+            published = True
+            return written
+
+        try:
+            return retry_call(
+                publish,
+                attempts=max(1, retries),
+                base_delay=10,
+                desc=f"{table_name} pt={partition_value} 暂存/发布",
+            )
+        except Exception as exc:
             raise RuntimeError(
-                f"{table_name} pt={partition_value} 覆盖写入失败，分区可能已被清空或只写入了一部分"
-                f"（覆盖写是「先删再填」，旧数据不会自动恢复）。请重跑本作业把该分区补回；"
-                f"重跑会从头覆盖，不会叠加。原始错误：{exc}"
+                f"{table_name} pt={partition_value} 发布失败；未提前删除正式分区。"
+                f"暂存表 {project}.{stage_name} 已保留（生命周期 1 天）；"
+                f"发布可能已提交，请核对云端实例及正式分区后重跑：{exc}"
             ) from exc
-        raise
-    if total is not None and written != total:
-        raise RuntimeError(f"{table_name} 写入行数异常：计划 {total:,}，实际 {written:,}")
-    return written
+    finally:
+        if published:
+            try:
+                run_sql_with_timeout(
+                    o, f"drop table if exists {project}.{stage_name}", timeout=timeout, desc="清理暂存表"
+                )
+            except Exception as exc:
+                log(f"  警告：暂存表 {project}.{stage_name} 清理失败，将由生命周期回收：{redact(exc)}")
+        else:
+            log(f"  提示：暂存表 {project}.{stage_name}（如已创建）已保留；正式分区未提前删除")
 
 
 def _partition_literal(partition_value) -> str:
