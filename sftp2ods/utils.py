@@ -15,6 +15,7 @@ from pathlib import Path
 from urllib.parse import quote, quote_plus, unquote
 
 from ._common import leaf_strings as _leaf_strings
+from ._common import open_run_lock
 from ._common import webhook_targets as webhook_targets
 from ._common import with_scheme_bare as _with_scheme_bare
 
@@ -220,15 +221,7 @@ class RunLock:
         if fcntl is None and msvcrt is None:
             return self
         try:
-            # "a+" 而不是 "w"：w 会在打开时把文件截断，持锁进程刚写进去的 pid 就被抹掉了
-            # encoding + errors=replace：locale 非 UTF-8 时读写中文主机名不会抛 UnicodeError
-            # POSIX 上 O_NOFOLLOW：锁路径若是符号链接就拒绝跟随（避免被指向别的文件），
-            # 新建时按 0600（与 feishu2ods 的锁同口径）
-            open_kwargs: dict = {"encoding": "utf-8", "errors": "replace"}
-            nofollow = getattr(os, "O_NOFOLLOW", 0)
-            if nofollow:
-                open_kwargs["opener"] = lambda path, flags, _nf=nofollow: os.open(path, flags | _nf, 0o600)
-            self.fh = open(self.path, "a+", **open_kwargs)
+            self.fh = open_run_lock(self.path)
         except (OSError, UnicodeError) as exc:
             raise SystemExit(
                 f"无法创建运行锁文件 {self.path}（{exc}）；请检查该路径所在目录是否存在/可写，或用 --job 指定别处的作业"
@@ -244,7 +237,7 @@ class RunLock:
         if not locked:
             self.fh.close()
             self.fh = None
-            raise SystemExit(f"已有任务在运行（锁文件 {self.path}），本次退出；确认没有任务在跑时可删除该文件后重试。")
+            raise SystemExit(f"已有任务在运行（锁文件 {self.path}），本次退出；请等待持锁进程结束，不要删除锁文件。")
         try:
             # 拿到锁之后才截断+写自己的 pid：拿不到锁时绝不能动内容，
             # 否则每一次被拦下的启动都会把持锁进程的标记清掉
