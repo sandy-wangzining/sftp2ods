@@ -97,7 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
     """命令行参数定义（help 文案就是用户文档的第一入口，改参数时同步改 README）。"""
     parser = argparse.ArgumentParser(
         prog="sftp2ods",
-        description="通用 SFTP 按天文件（CSV/TSV）→ MaxCompute ODS（列展开宽表 + pt 分区，先删再填）",
+        description="通用 SFTP 按天文件（CSV/TSV）→ MaxCompute ODS（列展开宽表 + pt 分区，暂存校验后原子发布）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "常用示例：\n"
@@ -438,7 +438,7 @@ def run_check(job: dict, config: dict, args, job_path: Path, config_path: Path |
 
 
 def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", config_path: Path | None = None) -> int:
-    """正式同步：列目录 → 缺文件核对 → 下文件 → 解析 → 先删再填 pt → 行数校验。"""
+    """正式同步：列目录 → 缺文件核对 → 下文件 → 解析 → 暂存校验后原子发布 pt → 行数校验。"""
     job_name = job.get("job") or job_path.stem
     source_cfg = job.get("source") or {}
     target_cfg = job.get("target") or {}
@@ -587,7 +587,7 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
                     f"**缺少日期**：{shown}（共 {len(missing)} 个）",
                     f"**当前最大**：{max(all_dates)}",
                     f"**预期到**：{range_end}",
-                    "本次已跳过缺失日期、照常同步已有文件，下游任务不受影响；",
+                    "本次将跳过缺失日期并继续处理已有文件；最终写库结果以任务日志和退出码为准；",
                     "缺失日期补产出后下次运行会自动同步，无需人工干预。",
                 ],
                 footer,
@@ -642,26 +642,17 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
     drift_columns: set[str] = set()
 
     def note_extra_headers(file_name: str, extras: list[str]) -> None:
-        new_cols = [name for name in extras if name not in drift_columns]
+        new_cols = [name for name in extras if name not in drift_columns and name not in pending_columns]
         if not new_cols:
             return
-        drift_columns.update(extras)
-        log(f"  ⚠️ {file_name} 表头出现未配置的新增列：{'、'.join(new_cols)}（本次忽略其值、照常入库）")
-        notifier(
-            f"{job_name}：源文件出现新增列",
-            [
-                f"**新增列**：{'、'.join(f'`{safe_label(name)}`' for name in new_cols)}",
-                f"**文件**：`{safe_label(file_name)}`",
-                "本次已忽略新增列、其余数据照常入库。如需入库，请手动处理：",
-                "① ODS 表加列（`ALTER TABLE ... ADD COLUMNS ...`）；",
-                '② 作业 `parse.columns` 补列定义（历史文件可能没有该列时加 `"required": false`）；',
-                "③ 补跑受影响日期（`--force` 或 `--start-date` / `--end-date`）。",
-            ],
-            footer,
-        )
+        pending_columns.update(new_cols)
+        pending_headers.append((file_name, new_cols))
+        log(f"  ⚠️ {file_name} 表头出现未配置的新增列：{'、'.join(new_cols)}（忽略其值，写库结果待核对）")
 
     for date in proc_dates:
         items = files_by_date[date]
+        pending_headers: list[tuple[str, list[str]]] = []
+        pending_columns: set[str] = set()
 
         def done(item, date=date):
             """台账 + 本地文件都齐（大小与修改时间一致）→ 该文件已上传；远端文件更新过会自动重下重写。
@@ -790,7 +781,7 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
             continue
         if rows == 0:
             # 写空分区前先看一眼现有分区：把一个本来有数据的分区覆盖成 0 行几乎总是异常
-            # （源文件被截断成只剩表头、关键列整列变空被 skip_if_empty 滤光），而"先删再填"
+            # （源文件被截断成只剩表头、关键列整列变空被 skip_if_empty 滤光），而"暂存校验后原子发布"
             # 不可逆。零交易的正常场景下分区本来就不存在（查询得 0），不会误伤。
             # --force 是"我知道我在干什么"的显式开关，允许绕过这层保护。
             if not args.force:
@@ -807,7 +798,7 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
                     return 1
             log(f"  警告：pt={date} 解析出 0 行，将写入空分区（源文件不该为空时请检查解析配置）")
 
-        # 即将先删再填：先把该日期已有的台账记录从磁盘作废。否则写库中途失败时，
+        # 发布前先作废旧台账：先把该日期已有的台账记录从磁盘作废。否则写库中途失败时，
         # 旧台账仍写着“已完成”，下一次运行会直接跳过这个可能已经空/缺行的分区。
         stale = {
             key: record
@@ -874,6 +865,21 @@ def run_sync(job: dict, config: dict, args, job_path: Path, bizdate: str = "", c
             return 1
         uploaded += 1
         log(f"  已写入 {project}.{table_name} pt={date}，校验 {verified:,} 行")
+        for file_name, new_cols in pending_headers:
+            notifier(
+                f"{job_name}：源文件出现新增列",
+                [
+                    f"**新增列**：{'、'.join(f'`{safe_label(name)}`' for name in new_cols)}",
+                    f"**文件**：`{safe_label(file_name)}`",
+                    f"**分区**：`pt={date}`，已发布并核对 {verified:,} 行。",
+                    "本次已忽略新增列、其余数据已入库。如需入库新增列，请手动处理：",
+                    "① ODS 表加列（`ALTER TABLE ... ADD COLUMNS ...`）；",
+                    '② 作业 `parse.columns` 补列定义（历史文件缺列时加 `"required": false`）；',
+                    "③ 补跑受影响日期（`--force` 或日期区间）。",
+                ],
+                footer,
+            )
+            drift_columns.update(new_cols)
 
     if args.dry_run:
         log(f"dry-run 完成：{len(proc_dates) - skipped} 个日期，共 {total_rows:,} 行（未写库）")
@@ -1022,7 +1028,7 @@ def main(argv: list[str] | None = None) -> int:
             log(f"❌ {_redact_job(job, exc, config)}")
             return 1
         except KeyboardInterrupt:
-            log("已中断（本次未完成；重跑同一命令即可，先删再填、幂等）")
+            log("已中断（本次未完成；重跑同一命令即可，暂存校验后原子发布、幂等）")
             return 130
     except SystemExit as exc:
         # 准备阶段的配置错（bizdate 畸形、缺块、占位符写错、运行锁拿不到）统一按运行期错误的格式记一笔。

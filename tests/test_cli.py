@@ -160,14 +160,14 @@ class TestSyncHappyPath(CliTestCase):
             self.assertEqual(ledger["report_20260920.csv"]["pt"], "20260920")
             self.assertEqual(ledger["report_20260920.csv"]["size"], len(data))
 
-            deletes = len(world.table.deleted)
+            publications = len(world.table.published)
             downloads = len(world.fake.downloaded)
             self.assertEqual(world.sync(bizdate="20260920"), 0)  # 台账命中，跳过
-            self.assertEqual(len(world.table.deleted), deletes)
+            self.assertEqual(len(world.table.published), publications)
             self.assertEqual(len(world.fake.downloaded), downloads)
 
             self.assertEqual(world.sync(bizdate="20260920", force=True), 0)  # 强制重写
-            self.assertEqual(len(world.table.deleted), deletes + 1)
+            self.assertEqual(len(world.table.published), publications + 1)
             self.assertEqual(len(world.fake.downloaded), downloads)  # 本地文件在，不重下
 
     def test_skip_rechecks_target_partition(self):
@@ -175,10 +175,10 @@ class TestSyncHappyPath(CliTestCase):
         data = report([["o1", "1.50"]])
         with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
             self.assertEqual(world.sync(bizdate="20260920"), 0)
-            deletes = len(world.table.deleted)
+            publications = len(world.table.published)
             world.table.written.pop("pt=20260920", None)  # 模拟分区被手工删除/表重建
             self.assertEqual(world.sync(bizdate="20260920"), 0)
-            self.assertEqual(len(world.table.deleted), deletes + 1)
+            self.assertEqual(len(world.table.published), publications + 1)
             self.assertEqual([r[0] for r in world.table.rows_in("20260920")], ["o1"])
 
     def test_partition_probe_failure_is_clean_error(self):
@@ -186,10 +186,10 @@ class TestSyncHappyPath(CliTestCase):
         data = report([["o1", "1.50"]])
         with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
             self.assertEqual(world.sync(bizdate="20260920"), 0)
-            deletes = len(world.table.deleted)
+            publications = len(world.table.published)
             with mock.patch.object(mc_mod, "partition_exists", side_effect=RuntimeError("metadata 500")):
                 self.assertEqual(world.sync(bizdate="20260920"), 1)
-            self.assertEqual(len(world.table.deleted), deletes)
+            self.assertEqual(len(world.table.published), publications)
             self.assertTrue(any("查询目标分区是否存在失败" in line for line in world.access_logs))
 
     def test_multi_file_same_date_merged(self):
@@ -213,7 +213,7 @@ class TestSyncHappyPath(CliTestCase):
         data = report([["o1", "1.50"]])
         with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
             self.assertEqual(world.sync(bizdate="20260920", dry_run=True), 0)
-            self.assertEqual(world.table.deleted, [])
+            self.assertEqual(world.table.published, [])
             self.assertFalse((world.download_dir / state_mod.STATE_FILE_NAME).exists())
             self.assertTrue(any("dry-run 完成" in line for line in world.access_logs))
 
@@ -227,9 +227,9 @@ class TestSyncRanges(CliTestCase):
         }
         with World(self.tmp, files=files) as world:
             self.assertEqual(world.sync(start_date="2026-09-20", end_date="2026-09-21"), 0)
-            self.assertIn("pt=20260920", world.table.deleted)
-            self.assertIn("pt=20260921", world.table.deleted)
-            self.assertNotIn("pt=20260922", world.table.deleted)
+            self.assertIn("pt=20260920", world.table.published)
+            self.assertIn("pt=20260921", world.table.published)
+            self.assertNotIn("pt=20260922", world.table.published)
 
     def test_explicit_empty_bizdate_is_arg_error(self):
         """显式传空 --bizdate（调度脚本 `--bizdate "$pt"` 且 $pt 未定义）不能按"未指定"
@@ -265,7 +265,7 @@ class TestSyncRanges(CliTestCase):
         with World(self.tmp, files=files) as world:
             self.assertEqual(world.sync(start_date="2026-01-01", end_date="2026-01-31"), 1)
             self.assertTrue(any("没有交集" in str(line) for line in world.access_logs))
-            self.assertEqual(world.table.deleted, [])
+            self.assertEqual(world.table.published, [])
 
     def test_start_date_after_expected_latest_fails(self):
         files = {"/data/report_20260920.csv": report([["o1", "1.00"]])}
@@ -281,7 +281,7 @@ class TestSyncRangeNoOverlap(CliTestCase):
         files = {"/data/report_20200101.csv": report([["o1", "1.00"]])}
         with World(self.tmp, files=files) as world:
             self.assertEqual(world.sync(start_date="2020-01-02", end_date="2020-01-03"), 1)
-            self.assertEqual(world.table.deleted, [], "失败时不应有任何删分区动作")
+            self.assertEqual(world.table.published, [], "失败时不应有任何删分区动作")
             self.assertEqual(world.table.written, {}, "失败时不应写入任何分区")
             self.assertTrue(any("补数区间" in str(line) for line in world.access_logs))
 
@@ -292,22 +292,22 @@ class TestSyncRangeNoOverlap(CliTestCase):
         }
         with World(self.tmp, files=files) as world:
             self.assertEqual(world.sync(start_date="2026-09-20", end_date="2026-09-22"), 0)
-            self.assertEqual(sorted(world.table.deleted), ["pt=20260920", "pt=20260922"])
+            self.assertEqual(sorted(world.table.published), ["pt=20260920", "pt=20260922"])
 
     def test_range_all_uploaded_does_not_false_fail(self):
         """区间内文件都在、只是台账已上传：proc_dates 仍非空，第二次运行不能误判失败。"""
         data = report([["o1", "1.00"]])
         with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
             self.assertEqual(world.sync(start_date="2026-09-20", end_date="2026-09-20"), 0)
-            deletes = len(world.table.deleted)
+            publications = len(world.table.published)
             self.assertEqual(world.sync(start_date="2026-09-20", end_date="2026-09-20"), 0)
-            self.assertEqual(len(world.table.deleted), deletes, "已上传的区间被误判成失败或重写")
+            self.assertEqual(len(world.table.published), publications, "已上传的区间被误判成失败或重写")
 
     def test_range_outside_remote_force_succeeds(self):
         files = {"/data/report_20200101.csv": report([["o1", "1.00"]])}
         with World(self.tmp, files=files) as world:
             self.assertEqual(world.sync(start_date="2020-01-02", end_date="2020-01-03", force=True), 0)
-            self.assertEqual(world.table.deleted, [])
+            self.assertEqual(world.table.published, [])
 
     def test_full_run_without_range_still_warns(self):
         files = {
@@ -328,7 +328,7 @@ class TestSyncGuards(CliTestCase):
         files = {"/data/report_20260920.csv": report([["o1", "1.00"]])}
         with World(self.tmp, files=files) as world:
             self.assertEqual(world.sync(bizdate="20260921"), 1)
-            self.assertEqual(world.table.deleted, [])
+            self.assertEqual(world.table.published, [])
             joined = "\n".join(str(line) for line in world.access_logs)
             self.assertIn("20260921", joined)
             self.assertEqual(len(world.notify_calls), 1)
@@ -339,7 +339,7 @@ class TestSyncGuards(CliTestCase):
         files = {"/data/report_20260920.csv": report([["o1", "1.00"]])}
         with World(self.tmp, files=files) as world:
             self.assertEqual(world.sync(bizdate="20260921", force=True), 0)
-            self.assertEqual(world.table.deleted, [])
+            self.assertEqual(world.table.published, [])
             self.assertTrue(any("没有任何匹配文件" in str(line) for line in world.access_logs))
 
     def test_missing_without_bizdate_still_warns(self):
@@ -363,7 +363,7 @@ class TestSyncGuards(CliTestCase):
         }
         with World(self.tmp, files=files) as world:
             self.assertEqual(world.sync(start_date="2026-09-20", end_date="2026-09-22"), 0)
-            self.assertEqual(sorted(world.table.deleted), ["pt=20260920", "pt=20260922"])
+            self.assertEqual(sorted(world.table.published), ["pt=20260920", "pt=20260922"])
             self.assertEqual(len(world.notify_calls), 1)
             self.assertIn("20260921", "\n".join(world.notify_calls[0]["lines"]))
 
@@ -384,7 +384,7 @@ class TestSyncGuards(CliTestCase):
         }
         with World(self.tmp, files=files) as world:
             self.assertEqual(world.sync(), 0)
-            self.assertEqual(sorted(world.table.deleted), ["pt=20260920", "pt=20260922"])
+            self.assertEqual(sorted(world.table.published), ["pt=20260920", "pt=20260922"])
             self.assertEqual(len(world.notify_calls), 1)
             self.assertIn("缺失", world.notify_calls[0]["title"])
             self.assertIn("20260921", "\n".join(world.notify_calls[0]["lines"]))
@@ -405,7 +405,7 @@ class TestSyncGuards(CliTestCase):
         data = report([["o1", "not-a-number"]])
         with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
             self.assertEqual(world.sync(bizdate="20260920"), 1)
-            self.assertEqual(world.table.deleted, [])
+            self.assertEqual(world.table.published, [])
             self.assertTrue(any("解析失败" in str(line) for line in world.access_logs))
 
     def test_footer_mismatch_before_write(self):
@@ -414,7 +414,7 @@ class TestSyncGuards(CliTestCase):
         data = csv_bytes(HEADERS, [["o1", "1.00"], ["", "9.99"]])
         with World(self.tmp, job=job, files={"/data/report_20260920.csv": data}) as world:
             self.assertEqual(world.sync(bizdate="20260920"), 1)
-            self.assertEqual(world.table.deleted, [])
+            self.assertEqual(world.table.published, [])
             self.assertTrue(any("合计" in str(line) for line in world.access_logs))
 
     def test_zero_rows_writes_empty_partition_by_default(self):
@@ -422,7 +422,7 @@ class TestSyncGuards(CliTestCase):
         with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
             self.assertEqual(world.sync(bizdate="20260920"), 0)
             self.assertEqual(world.table.rows_in("20260920"), [])
-            self.assertIn("pt=20260920", world.table.deleted)
+            self.assertIn("pt=20260920", world.table.published)
 
     def test_zero_rows_rejected_when_allow_empty_false(self):
         job = minimal_job()
@@ -430,7 +430,7 @@ class TestSyncGuards(CliTestCase):
         data = csv_bytes(HEADERS, [])
         with World(self.tmp, job=job, files={"/data/report_20260920.csv": data}) as world:
             self.assertEqual(world.sync(bizdate="20260920"), 1)
-            self.assertEqual(world.table.deleted, [])
+            self.assertEqual(world.table.published, [])
 
     def test_zero_rows_does_not_wipe_existing_partition(self):
         """源文件被截断成只剩表头时，不能把已有分区的数据静默清空（先删再填不可逆）。"""
@@ -456,9 +456,13 @@ class TestSyncGuards(CliTestCase):
             self.assertEqual(world.table.rows_in("20260920"), [])
 
     def test_count_mismatch_detected(self):
-        data = report([["o1", "1.00"]])
-        with World(self.tmp, files={"/data/report_20260920.csv": data}) as world:
-            with mock.patch.object(mc_mod, "count_partition", return_value=0):
+        with World(self.tmp, files={"/data/report_20260920.csv": report([["o1", "1.50"]])}) as world:
+            real_count = mc_mod.count_partition
+
+            def count(o, project, table_name, pt, **kwargs):
+                return 999 if table_name == world.odps.table_name else real_count(o, project, table_name, pt, **kwargs)
+
+            with mock.patch.object(mc_mod, "count_partition", side_effect=count):
                 self.assertEqual(world.sync(bizdate="20260920"), 1)
             self.assertTrue(any("写后校验不一致" in str(line) for line in world.access_logs))
 
@@ -473,9 +477,9 @@ class TestSyncGuards(CliTestCase):
             self.assertIn("report_20260920.csv", ledger)
             ledger.setdefault("report_20260920.csv", {})["project"] = "other_project"
             ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
-            deletes = len(world.table.deleted)
+            publications = len(world.table.published)
             self.assertEqual(world.sync(bizdate="20260920"), 0)
-            self.assertEqual(len(world.table.deleted), deletes + 1)
+            self.assertEqual(len(world.table.published), publications + 1)
 
     def test_corrupted_local_file_is_redownloaded(self):
         """本地文件被改坏但大小没变（台账 md5 对不上）时必须重新下载：
@@ -592,7 +596,7 @@ class TestSyncLedgerCompat(CliTestCase):
             )
             self.assertEqual(world.sync(bizdate="20260920"), 0)
             self.assertEqual(world.fake.downloaded, ["settlements/20260920/detail_20260920_USD.csv"])
-            self.assertEqual(world.table.deleted, ["pt=20260920"])
+            self.assertEqual(world.table.published, ["pt=20260920"])
             record = world.ledger()["20260920/detail_20260920_USD.csv"]
             self.assertIsNotNone(record.get("mtime"))
 
@@ -628,7 +632,7 @@ class TestSyncLedgerCompat(CliTestCase):
             # 台账命中 + 目标分区已存在：本次应跳过（分区存在性由新增的跳过前检查确认）
             world.table.written["pt=20260920"] = [["o1", "1.00"]]
             self.assertEqual(world.sync(bizdate="20260920"), 0)
-            self.assertEqual(world.table.deleted, [])
+            self.assertEqual(world.table.published, [])
             self.assertEqual(world.fake.downloaded, [])
 
     def test_date_dir_new_layout_writes_nested_ledger_key(self):
@@ -708,9 +712,9 @@ class TestLedgerRemoteChanges(CliTestCase):
                 json.loads(ledger_path.read_text(encoding="utf-8")),
                 "写库失败后旧台账必须作废，否则下次会跳过",
             )
-            deletes = len(world.table.deleted)
+            publications = len(world.table.published)
             self.assertEqual(world.sync(bizdate="20260920"), 0)
-            self.assertGreater(len(world.table.deleted), deletes, "下次运行应重新写这个分区")
+            self.assertGreater(len(world.table.published), publications, "下次运行应重新写这个分区")
 
     def test_reappeared_file_is_downloaded_not_reused(self):
         """远端删掉再放回同名同尺寸文件时，不能复用本地旧副本把旧数据写回去。"""
@@ -802,7 +806,7 @@ class TestSyncInterrupt(CliTestCase):
             with mock.patch.object(sftp_mod.SftpSource, "download", boom):
                 rc = cli_mod.main(["--job", str(world.job_path), "--bizdate", "20260920"])
             self.assertEqual(rc, 130)
-            self.assertEqual(world.table.deleted, [], "中断前不应有任何删分区动作")
+            self.assertEqual(world.table.published, [], "中断前不应有任何删分区动作")
             self.assertEqual(world.table.written, {}, "中断前不应写入任何分区")
             self.assertFalse((world.download_dir / state_mod.STATE_FILE_NAME).exists(), "中断不应落台账")
             self.assertTrue(any("已中断" in str(line) for line in world.access_logs))
@@ -818,11 +822,11 @@ class TestSyncInterrupt(CliTestCase):
             with mock.patch.object(parse_mod.ParseSpec, "iter_rows", boom):
                 rc = cli_mod.main(["--job", str(world.job_path), "--bizdate", "20260920"])
             self.assertEqual(rc, 130)
-            self.assertEqual(world.table.deleted, [])
+            self.assertEqual(world.table.published, [])
             self.assertEqual(world.table.written, {})
 
     def test_keyboard_interrupt_during_write_returns_130(self):
-        """写入阶段（先删再填）被 Ctrl+C：rc=130；此刻分区已被删、可能留下空/半截分区。
+        """暂存写入阶段被 Ctrl+C：rc=130，正式分区不发布。
 
         这是现有真实行为——README「行为与保护」第 10 条：写入阶段中断的分区可能不完整，
         重跑同一命令会从头覆盖、幂等自愈。本用例只把真实行为钉死，不改变实现。
@@ -841,7 +845,7 @@ class TestSyncInterrupt(CliTestCase):
             with mock.patch.object(parse_mod, "iter_batches", counting):
                 rc = cli_mod.main(["--job", str(world.job_path), "--bizdate", "20260920"])
             self.assertEqual(rc, 130)
-            self.assertIn("pt=20260920", world.table.deleted, "中断前已执行删分区（先删再填不可逆）")
+            self.assertEqual(world.table.published, [], "中断发生在暂存阶段，正式分区尚未发布")
 
 
 class TestCheck(CliTestCase):
@@ -890,7 +894,7 @@ class TestDefaultBizdateCli(CliTestCase):
             ):
                 rc = cli_mod.main(["--job", str(world.job_path)])
             self.assertEqual(rc, 0)
-            self.assertEqual(sorted(world.table.deleted), ["pt=20260921"])
+            self.assertEqual(sorted(world.table.published), ["pt=20260921"])
             self.assertEqual([r[0] for r in world.table.rows_in("20260921")], ["o2"])
 
     def test_check_without_date_keeps_whole_range_but_renders_default_bizdate(self):
@@ -1019,7 +1023,7 @@ class TestMainEntry(CliTestCase):
             self.assertEqual(rc, 0)
             # 区间补数时 ${bizdate} 仍按默认业务日渲染，不能被调度环境里的 bizdate 顶替
             self.assertEqual(render_job.call_args.args[2], date(2026, 9, 21))
-            self.assertEqual(sorted(world.table.deleted), ["pt=20260920", "pt=20260921"])
+            self.assertEqual(sorted(world.table.published), ["pt=20260920", "pt=20260921"])
 
 
 class TestSyncLedgerKeyMismatch(CliTestCase):
