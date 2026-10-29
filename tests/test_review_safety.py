@@ -103,7 +103,10 @@ class TestAtomicPublication(OfflineTestCase):
             if sql.startswith("insert overwrite"):
                 publications.append(sql)
                 if len(publications) == 1:
-                    raise TimeoutError("response lost after commit")
+                    result.id = "completed-publish"
+                    result.is_successful = mock.Mock(side_effect=TimeoutError("response lost after commit"))
+                    result.is_terminated = mock.Mock(return_value=True)
+                    result.stop = mock.Mock()
             return result
 
         with mock.patch.object(self.odps, "run_sql", side_effect=run_sql):
@@ -118,7 +121,12 @@ class TestAtomicPublication(OfflineTestCase):
 
         def run_sql(sql):
             if sql.startswith("insert overwrite"):
-                raise RuntimeError("publish rejected")
+                result = mock.Mock()
+                result.id = "rejected-publish"
+                result.is_successful.return_value = False
+                result.is_terminated.return_value = True
+                result.wait_for_success.side_effect = RuntimeError("publish rejected")
+                return result
             return original(sql)
 
         with mock.patch.object(self.odps, "run_sql", side_effect=run_sql):
@@ -127,6 +135,35 @@ class TestAtomicPublication(OfflineTestCase):
         self.assert_old_target()
         self.assertEqual(len(self.odps.stage.writers), 1)
         self.assertTrue(self.odps.stages)
+
+    def test_unknown_publication_blocks_retry_and_a_later_writer(self):
+        from sftp2ods import _common
+
+        original = self.odps.run_sql
+        instance = mock.Mock()
+        instance.id = "pending-publish"
+        instance.is_successful.side_effect = ConnectionError("poll failed")
+        instance.is_terminated.return_value = False
+        instance.stop.side_effect = ConnectionError("cancel failed")
+        publications = []
+
+        def run_sql(sql):
+            if sql.startswith("insert overwrite"):
+                publications.append(sql)
+                return instance
+            return original(sql)
+
+        self.odps.get_instance = mock.Mock(return_value=instance)
+        with mock.patch.object(self.odps, "run_sql", side_effect=run_sql):
+            with self.assertRaises(_common.UnresolvedSqlError):
+                self.write()
+            with self.assertRaises(_common.UnresolvedSqlError):
+                self.write()
+        self.assertEqual(len(publications), 1)
+        self.assert_old_target()
+        instance.is_terminated.return_value = True
+        self.assertEqual(self.write(), 2)
+        self.assertEqual(self.table.written["pt=20260920"], self.expected)
 
     def test_cleanup_failure_does_not_fail_published_partition(self):
         original = self.odps.run_sql

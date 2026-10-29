@@ -155,10 +155,17 @@ def connect_odps(
 # =============================================================================
 
 
-def run_sql_with_timeout(o, sql: str, timeout: int = SQL_TIMEOUT_SECONDS, desc: str = "SQL"):
+def run_sql_with_timeout(o, sql: str, timeout: int = SQL_TIMEOUT_SECONDS, desc: str = "SQL", *, publication=None):
     """通过公共实现等待 SQL，保留项目自身的时钟、脱敏日志与超时配置。"""
     return _common.run_sql_with_timeout(
-        o, sql, timeout, desc, clock=time, log=lambda message: log(redact(message)), heartbeat=SQL_HEARTBEAT_SECONDS
+        o,
+        sql,
+        timeout,
+        desc,
+        clock=time,
+        log=lambda message: log(redact(message)),
+        heartbeat=SQL_HEARTBEAT_SECONDS,
+        publication=publication,
     )
 
 
@@ -356,6 +363,7 @@ def write_partition(
     """
     project = require_identifier(project, "target.project")
     table_name = require_identifier(table_name, "target.table")
+    _common.ensure_no_pending_publication(o, project, table_name)
     partition_value = _partition_literal(partition_value)
     spec = f"{PARTITION_COLUMN}={partition_value}"
     existing, _ = _table_schema_of(table)
@@ -414,6 +422,7 @@ def write_partition(
                 f"where {PARTITION_COLUMN} = '{partition_value}'",
                 timeout=timeout,
                 desc=f"发布分区 {table_name} pt={partition_value}",
+                publication=(project, table_name),
             )
             published = True
             return written
@@ -437,7 +446,7 @@ def write_partition(
                 run_sql_with_timeout(
                     o, f"drop table if exists {project}.{stage_name}", timeout=timeout, desc="清理暂存表"
                 )
-            except Exception as exc:
+            except (Exception, _common.UnresolvedSqlError) as exc:
                 log(f"  警告：暂存表 {project}.{stage_name} 清理失败，将由生命周期回收：{redact(exc)}")
         else:
             log(f"  提示：暂存表 {project}.{stage_name}（如已创建）已保留；正式分区未提前删除")

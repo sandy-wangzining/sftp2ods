@@ -46,6 +46,7 @@ class OfflineTestCase(unittest.TestCase):
         env_patcher = mock.patch.dict(os.environ, clear=False)
         env_patcher.start()
         self.addCleanup(env_patcher.stop)
+        os.environ["ODS_TARGET_LOCK_DIR"] = str(Path(lock_root) / "targets")
         for name in ("bizdate", "SKYNET_BIZDATE", "ODS_BIZDATE_TZ"):
             os.environ.pop(name, None)
 
