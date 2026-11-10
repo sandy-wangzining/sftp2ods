@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sftp2ods"
 dynamic = ["version"]
-description = "通用 SFTP 按天文件（CSV/TSV）→ MaxCompute ODS 同步工具（列展开宽表 + pt 分区，先删再填）"
+description = "通用 SFTP 按天文件（CSV/TSV）→ MaxCompute ODS 同步工具（列展开宽表 + pt 分区，暂存校验后原子发布）"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }

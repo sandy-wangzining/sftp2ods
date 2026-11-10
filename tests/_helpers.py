@@ -46,6 +46,7 @@ class OfflineTestCase(unittest.TestCase):
         env_patcher = mock.patch.dict(os.environ, clear=False)
         env_patcher.start()
         self.addCleanup(env_patcher.stop)
+        os.environ["ODS_TARGET_LOCK_DIR"] = str(Path(lock_root) / "targets")
         for name in ("bizdate", "SKYNET_BIZDATE", "ODS_BIZDATE_TZ"):
             os.environ.pop(name, None)
 
@@ -319,6 +320,7 @@ class FakeTable:
         self.written: dict[str, list] = {}
         self.sessions: dict[str, list] = {}  # 未提交（失败会话残留）的块
         self.deleted: list[str] = []
+        self.published: list[str] = []
         self.created: list[str] = []
         self.delete_if_exists: list[bool] = []  # 记录 flag：生产代码漏传 True 时"删不存在的分区"会真报错
         self.create_if_not_exists: list[bool] = []
@@ -396,60 +398,77 @@ class FakeInstance:
 
 
 class FakeOdps:
-    """假 ODPS 客户端：count(*) 从已写入内容现算，分区增删的 DDL 同步到 FakeTable。"""
+    """隔离正式表与暂存表；仅 INSERT OVERWRITE 一次性替换正式分区。"""
 
     def __init__(self, table: FakeTable, table_name: str = "ods_demo_di"):
         self.table = table
         self.table_name = table_name
         self.sql: list[str] = []
+        self.stages = {}
+        self.stage = None
 
     def exist_table(self, name):
-        return str(name).rsplit(".", 1)[-1] == self.table_name
+        short = str(name).rsplit(".", 1)[-1]
+        return short == self.table_name or short in self.stages
 
     def get_table(self, name):
-        # 生产代码用全限定名（project.table）取表：核对时剥掉 project 前缀，
-        # 保留"点名错就报错"的守护作用
         short = str(name).rsplit(".", 1)[-1]
+        if short in self.stages:
+            return self.stages[short]
         if short != self.table_name:
             raise AssertionError(f"unexpected table: {name}")
         return self.table
 
     def run_sql(self, sql):
         self.sql.append(sql)
-        # 大小写/空格容错：判定别绑死 "count(*)" 的字面写法
-        if "count(" in sql.lower().replace(" ", ""):
-            # 正则容错空格/大小写：判定里已经 replace(" ","") + lower()，解析也按同口径，
-            # 否则 `pt='x'`（无空格）这类合法 SQL 会以误导性的 AssertionError 失败
-            match = re.search(r"pt\s*=\s*'([^']*)'", sql, re.I)
-            if match is None:
-                # 解析不出来时静默返回 0 会把"SQL 形态变了"伪装成"数据没写进去"，
-                # 断言会以误导性的形式失败——显式炸出来
-                raise AssertionError(f"fake 无法解析 count 语句里的分区值：{sql!r}")
-            pt = match.group(1)
-            rows = self.table.written.get(f"pt={pt}", [])
-            return FakeInstance(rows=[{"cnt": len(rows)}])
-        # 分区增删走带超时的 DDL（生产不再用 pyodps 的 delete/create_partition）：
-        # 替身按同样的语义更新 FakeTable（deleted/created/if_exists/if_not_exists + 内容），
-        # 这样"测试里的 table.deleted/created 断言"仍能反映真实行为
-        match = re.search(
-            r"(drop\s+if\s+exists|add\s+if\s+not\s+exists)\s+partition\s*\(\s*pt\s*=\s*'([^']*)'\s*\)",
+        create = re.match(r"create table if not exists ([\w.]+)", sql, re.I)
+        if create and create.group(1).rsplit(".", 1)[-1].startswith("tmp_sftp2ods_"):
+            name = create.group(1).rsplit(".", 1)[-1]
+            partition_names = {col.name for col in self.table.table_schema.partitions}
+            self.stage = FakeTable(
+                columns=[
+                    (col.name, col.type) for col in self.table.table_schema.columns if col.name not in partition_names
+                ]
+            )
+            self.stages[name] = self.stage
+            return FakeInstance()
+        drop = re.match(r"drop table if exists ([\w.]+)", sql, re.I)
+        if drop:
+            self.stages.pop(drop.group(1).rsplit(".", 1)[-1], None)
+            return FakeInstance()
+        publication = re.match(
+            r"insert overwrite table ([\w.]+) partition \(pt='([^']+)'\) select (.+?) from ([\w.]+) where",
             sql,
             re.I,
         )
-        if match:
-            spec = f"pt={match.group(2)}"
-            # 直接更新 FakeTable 的状态（不调用它的 delete_partition/create_partition）：
-            # 那两个方法在测试里被用来**证明**生产代码没再走 pyodps 表 API
-            if match.group(1).lower().startswith("drop"):
-                self.table.deleted.append(spec)
-                self.table.delete_if_exists.append(True)
-                self.table.written.pop(spec, None)
+        if publication:
+            target = self.get_table(publication.group(1))
+            stage = self.get_table(publication.group(4))
+            target.published.append(f"pt={publication.group(2)}")
+            target.written[f"pt={publication.group(2)}"] = [
+                list(row) for row in stage.written.get(f"pt={publication.group(2)}", [])
+            ]
+            return FakeInstance()
+        if "count(" in sql.lower().replace(" ", ""):
+            partition = re.search(r"pt\s*=\s*'([^']*)'", sql, re.I)
+            source = re.search(r"\bfrom\s+([\w.]+)", sql, re.I)
+            if partition is None or source is None:
+                raise AssertionError(f"fake 无法解析 count：{sql!r}")
+            table = self.get_table(source.group(1))
+            return FakeInstance(rows=[{"cnt": len(table.written.get(f"pt={partition.group(1)}", []))}])
+        partition = re.search(
+            r"alter table ([\w.]+) (drop\s+if\s+exists|add\s+if\s+not\s+exists)\s+partition\s*\(\s*pt\s*=\s*'([^']*)'\s*\)",
+            sql,
+            re.I,
+        )
+        if partition:
+            table = self.get_table(partition.group(1))
+            spec = f"pt={partition.group(3)}"
+            if partition.group(2).lower().startswith("drop"):
+                table.deleted.append(spec)
+                table.delete_if_exists.append(True)
+                table.written.pop(spec, None)
             else:
-                self.table.created.append(spec)
-                self.table.create_if_not_exists.append(True)
-        elif "partition" in sql.lower() and ("drop" in sql.lower() or "add" in sql.lower()):
-            # 像分区增删 DDL 却解析不出来（生产换写法/引号类型）：静默返回空实例会把
-            # "fake 过时"伪装成"生产没删分区/没建分区"，用例以误导性原因失败——
-            # 与上面对 count 分支的处理同口径，显式炸出来
-            raise AssertionError(f"fake 无法解析分区 DDL：{sql!r}")
+                table.created.append(spec)
+                table.create_if_not_exists.append(True)
         return FakeInstance()
